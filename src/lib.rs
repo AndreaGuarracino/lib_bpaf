@@ -15,10 +15,129 @@ use lib_tracepoints::{
     cigar_to_variable_tracepoints, ComplexityMetric, MixedRepresentation, TracepointType,
 };
 use log::{debug, error, info};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+// ============================================================================
+// COMPRESSION STRATEGY
+// ============================================================================
+
+/// Compression strategy for binary PAF format
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionStrategy {
+    /// Delta (FastGA-aware) + Varint + Zstd level 3
+    /// - FastGA: raw num_differences values (naturally small)
+    /// - Standard: delta-encoded query_bases
+    Varint,
+    /// No delta encoding + Varint + Zstd level 3
+    /// - All types: raw first values (test if delta hurts compression)
+    VarintRaw,
+    /// Delta (FastGA-aware) + Huffman + Zstd
+    /// - FastGA: raw num_differences (exploits natural skew)
+    /// - Standard: delta-encoded query_bases
+    Huffman,
+    /// No delta encoding + Huffman + Zstd
+    /// - All types: raw first values (maximum entropy coding)
+    HuffmanRaw,
+    /// Hybrid: Delta + Varint + Byte-Huffman + Zstd
+    /// - Encodes integers with varint (produces bytes)
+    /// - Then applies Huffman on byte distribution
+    /// - Tests if byte-level Huffman helps Zstd
+    VarintHuffman,
+    /// Hybrid: Raw + Varint + Byte-Huffman + Zstd
+    /// - No delta, varint on raw values
+    /// - Then byte-level Huffman
+    VarintHuffmanRaw,
+    /// Analyze data distribution and auto-select best strategy
+    /// - Measures top 3 symbol coverage
+    /// - High skew (>60%): Huffman
+    /// - Flat distribution: Varint
+    /// - Compares delta vs raw for Huffman decision
+    Smart,
+}
+
+impl CompressionStrategy {
+    /// Parse strategy from string
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "varint" => Ok(CompressionStrategy::Varint),
+            "varint-raw" => Ok(CompressionStrategy::VarintRaw),
+            "huffman" => Ok(CompressionStrategy::Huffman),
+            "huffman-raw" => Ok(CompressionStrategy::HuffmanRaw),
+            "varint-huffman" => Ok(CompressionStrategy::VarintHuffman),
+            "varint-huffman-raw" => Ok(CompressionStrategy::VarintHuffmanRaw),
+            "smart" => Ok(CompressionStrategy::Smart),
+            _ => Err(format!("Unknown compression strategy: {}", s)),
+        }
+    }
+
+    /// Get all available strategies
+    pub fn variants() -> &'static [&'static str] {
+        &["varint", "varint-raw", "huffman", "huffman-raw", "varint-huffman", "varint-huffman-raw", "smart"]
+    }
+
+    /// Convert to strategy code for file header
+    fn to_code(&self) -> u8 {
+        match self {
+            CompressionStrategy::Varint => 0,
+            CompressionStrategy::VarintRaw => 1,
+            CompressionStrategy::Huffman => 2,
+            CompressionStrategy::HuffmanRaw => 3,
+            CompressionStrategy::VarintHuffman => 4,
+            CompressionStrategy::VarintHuffmanRaw => 5,
+            CompressionStrategy::Smart => unreachable!("Smart strategy should be resolved before writing"),
+        }
+    }
+
+    /// Parse from strategy code
+    fn from_code(code: u8) -> io::Result<Self> {
+        match code {
+            0 => Ok(CompressionStrategy::Varint),
+            1 => Ok(CompressionStrategy::VarintRaw),
+            2 => Ok(CompressionStrategy::Huffman),
+            3 => Ok(CompressionStrategy::HuffmanRaw),
+            4 => Ok(CompressionStrategy::VarintHuffman),
+            5 => Ok(CompressionStrategy::VarintHuffmanRaw),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("Unknown strategy code: {}", code))),
+        }
+    }
+
+    /// Check if strategy requires Huffman codecs
+    fn requires_codecs(&self) -> bool {
+        matches!(self,
+            CompressionStrategy::Huffman |
+            CompressionStrategy::HuffmanRaw |
+            CompressionStrategy::VarintHuffman |
+            CompressionStrategy::VarintHuffmanRaw
+        )
+    }
+
+    /// Check if strategy uses delta encoding
+    fn uses_delta(&self) -> bool {
+        matches!(self,
+            CompressionStrategy::Varint |
+            CompressionStrategy::Huffman |
+            CompressionStrategy::VarintHuffman
+        )
+    }
+}
+
+impl std::fmt::Display for CompressionStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompressionStrategy::Varint => write!(f, "varint"),
+            CompressionStrategy::VarintRaw => write!(f, "varint-raw"),
+            CompressionStrategy::Huffman => write!(f, "huffman"),
+            CompressionStrategy::HuffmanRaw => write!(f, "huffman-raw"),
+            CompressionStrategy::VarintHuffman => write!(f, "varint-huffman"),
+            CompressionStrategy::VarintHuffmanRaw => write!(f, "varint-huffman-raw"),
+            CompressionStrategy::Smart => write!(f, "smart"),
+        }
+    }
+}
 
 // ============================================================================
 // VARINT ENCODING (LEB128)
@@ -72,11 +191,370 @@ fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
 }
 
 // ============================================================================
+// HUFFMAN CODING
+// ============================================================================
+
+/// Huffman tree node
+#[derive(Clone)]
+enum HuffmanNode {
+    Leaf { value: i64, frequency: u64 },
+    Internal { left: Box<HuffmanNode>, right: Box<HuffmanNode>, frequency: u64 },
+}
+
+impl HuffmanNode {
+    fn frequency(&self) -> u64 {
+        match self {
+            Self::Leaf { frequency, .. } => *frequency,
+            Self::Internal { frequency, .. } => *frequency,
+        }
+    }
+}
+
+impl Eq for HuffmanNode {}
+impl PartialEq for HuffmanNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.frequency() == other.frequency()
+    }
+}
+impl Ord for HuffmanNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.frequency().cmp(&self.frequency()) // Reverse for min-heap
+    }
+}
+impl PartialOrd for HuffmanNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Variable-length bit string (for backwards compatibility reading)
+#[derive(Clone, Debug)]
+struct BitString {
+    bits: Vec<bool>,
+}
+
+/// Huffman tree for decoding (backwards compatibility only)
+#[derive(Clone)]
+struct HuffmanTree {
+    root: HuffmanNode,
+    encode_table: HashMap<i64, BitString>,
+}
+
+impl HuffmanTree {
+    fn decode(&self, bits: &mut BitReader) -> io::Result<i64> {
+        let mut node = &self.root;
+        loop {
+            match node {
+                HuffmanNode::Leaf { value, .. } => return Ok(*value),
+                HuffmanNode::Internal { left, right, .. } => {
+                    let bit = bits.read_bit()?;
+                    node = if bit { right } else { left };
+                }
+            }
+        }
+    }
+
+    fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let num_symbols = read_varint(reader)? as usize;
+        let mut encode_table = HashMap::new();
+
+        for _ in 0..num_symbols {
+            let zigzag = read_varint(reader)?;
+            let value = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+
+            let mut len_buf = [0u8; 1];
+            reader.read_exact(&mut len_buf)?;
+            let bit_len = len_buf[0] as usize;
+
+            let num_bytes = (bit_len + 7) / 8;
+            let mut bytes = vec![0u8; num_bytes];
+            reader.read_exact(&mut bytes)?;
+
+            let mut bits = Vec::with_capacity(bit_len);
+            for i in 0..bit_len {
+                let byte_idx = i / 8;
+                let bit_idx = 7 - (i % 8);
+                bits.push((bytes[byte_idx] >> bit_idx) & 1 == 1);
+            }
+
+            encode_table.insert(value, BitString { bits });
+        }
+
+        let root = rebuild_tree(&encode_table);
+        Ok(Self { root, encode_table })
+    }
+
+    fn num_symbols(&self) -> usize {
+        self.encode_table.len()
+    }
+}
+
+fn rebuild_tree(encode_table: &HashMap<i64, BitString>) -> HuffmanNode {
+    if encode_table.len() == 1 {
+        let (&value, _) = encode_table.iter().next().unwrap();
+        return HuffmanNode::Leaf { value, frequency: 1 };
+    }
+
+    let mut root = HuffmanNode::Internal {
+        frequency: 0,
+        left: Box::new(HuffmanNode::Leaf { value: 0, frequency: 0 }),
+        right: Box::new(HuffmanNode::Leaf { value: 0, frequency: 0 }),
+    };
+
+    for (&value, code) in encode_table {
+        let mut node = &mut root;
+        for (i, &bit) in code.bits.iter().enumerate() {
+            let is_last = i == code.bits.len() - 1;
+            match node {
+                HuffmanNode::Internal { left, right, .. } => {
+                    let child = if bit { right.as_mut() } else { left.as_mut() };
+                    if is_last {
+                        *child = HuffmanNode::Leaf { value, frequency: 1 };
+                        break;
+                    } else {
+                        if matches!(child, HuffmanNode::Leaf { .. }) {
+                            *child = HuffmanNode::Internal {
+                                frequency: 0,
+                                left: Box::new(HuffmanNode::Leaf { value: 0, frequency: 0 }),
+                                right: Box::new(HuffmanNode::Leaf { value: 0, frequency: 0 }),
+                            };
+                        }
+                        node = child;
+                    }
+                }
+                _ => panic!("Unexpected leaf node in tree traversal"),
+            }
+        }
+    }
+    root
+}
+
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    byte_pos: usize,
+    bit_pos: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, byte_pos: 0, bit_pos: 0 }
+    }
+
+    fn read_bit(&mut self) -> io::Result<bool> {
+        if self.byte_pos >= self.bytes.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "BitReader: end of stream"));
+        }
+        let bit = (self.bytes[self.byte_pos] >> (7 - self.bit_pos)) & 1 == 1;
+        self.bit_pos += 1;
+        if self.bit_pos == 8 {
+            self.byte_pos += 1;
+            self.bit_pos = 0;
+        }
+        Ok(bit)
+    }
+}
+
+impl HuffmanTree {
+    /// Build Huffman tree from value frequencies
+    fn build(frequencies: &HashMap<i64, u64>) -> Result<Self, String> {
+        if frequencies.is_empty() {
+            return Err("Cannot build Huffman tree from empty frequency map".to_string());
+        }
+
+        use std::collections::BinaryHeap;
+
+        let mut heap: BinaryHeap<HuffmanNode> = frequencies
+            .iter()
+            .map(|(&value, &frequency)| HuffmanNode::Leaf { value, frequency })
+            .collect();
+
+        while heap.len() > 1 {
+            let left = heap.pop().unwrap();
+            let right = heap.pop().unwrap();
+            let combined_freq = left.frequency() + right.frequency();
+            heap.push(HuffmanNode::Internal {
+                left: Box::new(left),
+                right: Box::new(right),
+                frequency: combined_freq,
+            });
+        }
+
+        let root = heap.pop().unwrap();
+        let encode_table = Self::generate_code_table(&root);
+
+        // Debug: log code length statistics
+        let code_lengths: Vec<usize> = encode_table.values().map(|bs| bs.bits.len()).collect();
+        if !code_lengths.is_empty() {
+            let min_len = *code_lengths.iter().min().unwrap();
+            let max_len = *code_lengths.iter().max().unwrap();
+            let avg_len = code_lengths.iter().sum::<usize>() as f64 / code_lengths.len() as f64;
+            debug!("  Code lengths: min={}, max={}, avg={:.2}", min_len, max_len, avg_len);
+        }
+
+        Ok(Self { root, encode_table })
+    }
+
+    /// Generate code table from Huffman tree
+    fn generate_code_table(node: &HuffmanNode) -> HashMap<i64, BitString> {
+        let mut table = HashMap::new();
+        Self::generate_codes_recursive(node, Vec::new(), &mut table);
+        table
+    }
+
+    fn generate_codes_recursive(
+        node: &HuffmanNode,
+        current_code: Vec<bool>,
+        table: &mut HashMap<i64, BitString>,
+    ) {
+        match node {
+            HuffmanNode::Leaf { value, .. } => {
+                let bits = if current_code.is_empty() {
+                    vec![false] // Single symbol gets code "0"
+                } else {
+                    current_code
+                };
+                table.insert(*value, BitString { bits });
+            }
+            HuffmanNode::Internal { left, right, .. } => {
+                let mut left_code = current_code.clone();
+                left_code.push(false);
+                Self::generate_codes_recursive(left, left_code, table);
+
+                let mut right_code = current_code;
+                right_code.push(true);
+                Self::generate_codes_recursive(right, right_code, table);
+            }
+        }
+    }
+
+    /// Encode a value to bit sequence
+    fn encode(&self, value: i64) -> Result<&BitString, String> {
+        self.encode_table
+            .get(&value)
+            .ok_or_else(|| format!("Value {} not in Huffman code table", value))
+    }
+
+    /// Write Huffman tree to file
+    fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        write_varint(writer, self.encode_table.len() as u64)?;
+
+        for (&value, code) in &self.encode_table {
+            // Zigzag encode signed value
+            let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+            write_varint(writer, zigzag)?;
+
+            // Write bit length
+            writer.write_all(&[code.bits.len() as u8])?;
+
+            // Pack bits into bytes
+            let num_bytes = (code.bits.len() + 7) / 8;
+            let mut bytes = vec![0u8; num_bytes];
+            for (i, &bit) in code.bits.iter().enumerate() {
+                if bit {
+                    bytes[i / 8] |= 1 << (7 - (i % 8));
+                }
+            }
+            writer.write_all(&bytes)?;
+        }
+
+        Ok(())
+    }
+}
+
+struct BitWriter {
+    bytes: Vec<u8>,
+    current_byte: u8,
+    bit_pos: u8,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            current_byte: 0,
+            bit_pos: 0,
+        }
+    }
+
+    fn write_bit(&mut self, bit: bool) {
+        if bit {
+            self.current_byte |= 1 << (7 - self.bit_pos);
+        }
+        self.bit_pos += 1;
+        if self.bit_pos == 8 {
+            self.bytes.push(self.current_byte);
+            self.current_byte = 0;
+            self.bit_pos = 0;
+        }
+    }
+
+    fn write_bits(&mut self, bits: &[bool]) {
+        for &bit in bits {
+            self.write_bit(bit);
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.bit_pos > 0 {
+            self.bytes.push(self.current_byte);
+        }
+        self.bytes
+    }
+}
+
+/// Adaptive codec for encoding/decoding with Huffman
+#[derive(Clone)]
+struct AdaptiveCodec {
+    huffman_tree: Option<HuffmanTree>,
+}
+
+impl AdaptiveCodec {
+    /// Build codec from value frequencies
+    fn build(frequencies: &HashMap<i64, u64>) -> Result<Self, String> {
+        if frequencies.is_empty() {
+            return Err("Cannot build codec from empty frequency map".to_string());
+        }
+        let huffman_tree = HuffmanTree::build(frequencies)?;
+        Ok(Self {
+            huffman_tree: Some(huffman_tree),
+        })
+    }
+
+    /// Encode a value
+    fn encode(&self, value: i64) -> Result<&BitString, String> {
+        self.huffman_tree.as_ref().unwrap().encode(value)
+    }
+
+    fn decode(&self, bits: &mut BitReader) -> io::Result<i64> {
+        self.huffman_tree.as_ref().unwrap().decode(bits)
+    }
+
+    fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let huffman_tree = HuffmanTree::read(reader)?;
+        Ok(Self {
+            huffman_tree: Some(huffman_tree),
+        })
+    }
+
+    fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.huffman_tree.as_ref().unwrap().write(writer)
+    }
+
+    fn num_symbols(&self) -> usize {
+        self.huffman_tree
+            .as_ref()
+            .map(|t| t.num_symbols())
+            .unwrap_or(0)
+    }
+}
+
+// ============================================================================
 // BINARY PAF FORMAT
 // ============================================================================
 
 const BINARY_MAGIC: &[u8; 4] = b"BPAF";
 const FLAG_COMPRESSED: u8 = 0x01;
+const FLAG_ADAPTIVE: u8 = 0x02;
 
 /// Binary PAF header
 #[derive(Debug)]
@@ -295,6 +773,28 @@ impl AlignmentRecord {
         Ok(())
     }
 
+    fn write_raw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        write_varint(writer, self.query_name_id)?;
+        write_varint(writer, self.query_start)?;
+        write_varint(writer, self.query_end)?;
+        writer.write_all(&[self.strand as u8])?;
+        write_varint(writer, self.target_name_id)?;
+        write_varint(writer, self.target_start)?;
+        write_varint(writer, self.target_end)?;
+        write_varint(writer, self.residue_matches)?;
+        write_varint(writer, self.alignment_block_len)?;
+        writer.write_all(&[self.mapping_quality])?;
+        writer.write_all(&[self.tp_type.to_u8()])?;
+        writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
+        write_varint(writer, self.max_complexity)?;
+        self.write_tracepoints_raw(writer)?;
+        write_varint(writer, self.tags.len() as u64)?;
+        for tag in &self.tags {
+            tag.write(writer)?;
+        }
+        Ok(())
+    }
+
     fn write_tracepoints<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
@@ -302,27 +802,98 @@ impl AlignmentRecord {
                 if tps.is_empty() {
                     return Ok(());
                 }
-                let (positions, scores): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
-                let pos_deltas = delta_encode(&positions);
+                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
 
-                let mut pos_buf = Vec::with_capacity(pos_deltas.len() * 2);
-                let mut score_buf = Vec::with_capacity(scores.len() * 2);
+                // FastGA-aware delta encoding:
+                // - FastGA: num_differences are naturally small, use raw values
+                // - Standard: query_bases are incremental, use delta encoding
+                let use_delta = !matches!(self.tp_type, TracepointType::Fastga);
+                let first_vals_encoded = if use_delta {
+                    delta_encode(&first_vals)
+                } else {
+                    first_vals.iter().map(|&v| v as i64).collect()
+                };
 
-                for &delta in &pos_deltas {
-                    let zigzag = ((delta << 1) ^ (delta >> 63)) as u64;
-                    write_varint(&mut pos_buf, zigzag)?;
+                let mut first_val_buf = Vec::with_capacity(first_vals_encoded.len() * 2);
+                let mut second_val_buf = Vec::with_capacity(second_vals.len() * 2);
+
+                for &val in &first_vals_encoded {
+                    let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                    write_varint(&mut first_val_buf, zigzag)?;
                 }
-                for &score in &scores {
-                    write_varint(&mut score_buf, score)?;
+                for &val in &second_vals {
+                    write_varint(&mut second_val_buf, val)?;
                 }
 
-                let pos_compressed = zstd::encode_all(&pos_buf[..], 3)?;
-                let score_compressed = zstd::encode_all(&score_buf[..], 3)?;
+                let first_compressed = zstd::encode_all(&first_val_buf[..], 3)?;
+                let second_compressed = zstd::encode_all(&second_val_buf[..], 3)?;
 
-                write_varint(writer, pos_compressed.len() as u64)?;
-                writer.write_all(&pos_compressed)?;
-                write_varint(writer, score_compressed.len() as u64)?;
-                writer.write_all(&score_compressed)?;
+                write_varint(writer, first_compressed.len() as u64)?;
+                writer.write_all(&first_compressed)?;
+                write_varint(writer, second_compressed.len() as u64)?;
+                writer.write_all(&second_compressed)?;
+            }
+            TracepointData::Variable(tps) => {
+                write_varint(writer, tps.len() as u64)?;
+                for (a, b_opt) in tps {
+                    write_varint(writer, *a)?;
+                    if let Some(b) = b_opt {
+                        writer.write_all(&[1])?;
+                        write_varint(writer, *b)?;
+                    } else {
+                        writer.write_all(&[0])?;
+                    }
+                }
+            }
+            TracepointData::Mixed(items) => {
+                write_varint(writer, items.len() as u64)?;
+                for item in items {
+                    match item {
+                        MixedTracepointItem::Tracepoint(a, b) => {
+                            writer.write_all(&[0])?;
+                            write_varint(writer, *a)?;
+                            write_varint(writer, *b)?;
+                        }
+                        MixedTracepointItem::CigarOp(len, op) => {
+                            writer.write_all(&[1])?;
+                            write_varint(writer, *len)?;
+                            writer.write_all(&[*op as u8])?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write tracepoints WITHOUT delta encoding (for raw strategies)
+    fn write_tracepoints_raw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        match &self.tracepoints {
+            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
+                write_varint(writer, tps.len() as u64)?;
+                if tps.is_empty() {
+                    return Ok(());
+                }
+                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
+
+                // No delta encoding - use raw values for all types
+                let mut first_val_buf = Vec::with_capacity(first_vals.len() * 2);
+                let mut second_val_buf = Vec::with_capacity(second_vals.len() * 2);
+
+                for &val in &first_vals {
+                    write_varint(&mut first_val_buf, val)?;
+                }
+                for &val in &second_vals {
+                    write_varint(&mut second_val_buf, val)?;
+                }
+
+                let first_compressed = zstd::encode_all(&first_val_buf[..], 3)?;
+                let second_compressed = zstd::encode_all(&second_val_buf[..], 3)?;
+
+                write_varint(writer, first_compressed.len() as u64)?;
+                writer.write_all(&first_compressed)?;
+                write_varint(writer, second_compressed.len() as u64)?;
+                writer.write_all(&second_compressed)?;
             }
             TracepointData::Variable(tps) => {
                 write_varint(writer, tps.len() as u64)?;
@@ -429,13 +1000,21 @@ impl AlignmentRecord {
                 let score_buf = zstd::decode_all(&score_compressed[..])?;
 
                 let mut pos_reader = &pos_buf[..];
-                let mut pos_deltas = Vec::with_capacity(num_items);
+                let mut pos_values = Vec::with_capacity(num_items);
                 for _ in 0..num_items {
                     let zigzag = read_varint(&mut pos_reader)?;
-                    let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                    pos_deltas.push(delta);
+                    let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                    pos_values.push(val);
                 }
-                let positions = delta_decode(&pos_deltas);
+
+                // Version 1 (Varint) uses FastGA-aware delta encoding
+                let positions: Vec<u64> = if matches!(tp_type, TracepointType::Fastga) {
+                    // FastGA: raw values (no delta)
+                    pos_values.iter().map(|&v| v as u64).collect()
+                } else {
+                    // Standard: delta-encoded
+                    delta_decode(&pos_values)
+                };
 
                 let mut score_reader = &score_buf[..];
                 let mut scores = Vec::with_capacity(num_items);
@@ -577,23 +1156,36 @@ fn open_paf_reader(input_path: &str) -> io::Result<Box<dyn BufRead>> {
     if input_path == "-" {
         Ok(Box::new(BufReader::new(io::stdin())))
     } else if input_path.ends_with(".gz") || input_path.ends_with(".bgz") {
-        let file = File::open(input_path)?;
+        let file = File::open(input_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to open input file '{}': {}", input_path, e),
+            )
+        })?;
         let decoder = MultiGzDecoder::new(file);
         Ok(Box::new(BufReader::new(decoder)))
     } else {
-        Ok(Box::new(BufReader::new(File::open(input_path)?)))
+        let file = File::open(input_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to open input file '{}': {}", input_path, e),
+            )
+        })?;
+        Ok(Box::new(BufReader::new(file)))
     }
 }
 
 /// Encode PAF with CIGAR to binary with tracepoints
+/// Encode CIGAR to tracepoints and write binary format
 pub fn encode_cigar_to_binary(
     input_path: &str,
     output_path: &str,
     tp_type: &TracepointType,
     max_complexity: usize,
     complexity_metric: &ComplexityMetric,
+    strategy: CompressionStrategy,
 ) -> io::Result<()> {
-    info!("Encoding CIGAR to tracepoints and writing binary format...");
+    info!("Encoding CIGAR with {} strategy...", strategy);
 
     let input = open_paf_reader(input_path)?;
     let mut string_table = StringTable::new();
@@ -619,11 +1211,116 @@ pub fn encode_cigar_to_binary(
         }
     }
 
-    write_binary(output_path, &records, &string_table)?;
-    debug!(
-        "Encoded {} records ({} unique names)",
+    match strategy {
+        CompressionStrategy::Varint => {
+            write_binary(output_path, &records, &string_table)?;
+        }
+        CompressionStrategy::VarintRaw => {
+            write_binary_raw(output_path, &records, &string_table)?;
+        }
+        CompressionStrategy::Huffman => {
+            info!("Training Huffman codecs from {} records (FastGA-aware delta)...", records.len());
+            let (first_val_codec, second_val_codec) = train_codecs_from_records(&records)?;
+            info!(
+                "Codecs trained: {} first_val symbols, {} second_val symbols",
+                first_val_codec.num_symbols(),
+                second_val_codec.num_symbols()
+            );
+            write_binary_adaptive(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+        }
+        CompressionStrategy::HuffmanRaw => {
+            info!("Training Huffman codecs from {} records (no delta)...", records.len());
+            let (first_val_codec, second_val_codec) = train_codecs_from_records_raw(&records)?;
+            info!(
+                "Codecs trained: {} first_val symbols, {} second_val symbols",
+                first_val_codec.num_symbols(),
+                second_val_codec.num_symbols()
+            );
+            write_binary_adaptive_raw(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+        }
+        CompressionStrategy::VarintHuffman => {
+            info!("Training byte-level Huffman codecs from {} records (varint+huffman hybrid)...", records.len());
+            let (first_val_codec, second_val_codec) = train_codecs_from_bytes(&records)?;
+            info!(
+                "Byte codecs trained: {} first_val byte symbols, {} second_val byte symbols",
+                first_val_codec.num_symbols(),
+                second_val_codec.num_symbols()
+            );
+            write_binary_varint_huffman(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+        }
+        CompressionStrategy::VarintHuffmanRaw => {
+            info!("Training byte-level Huffman codecs from {} records (varint+huffman-raw hybrid)...", records.len());
+            let (first_val_codec, second_val_codec) = train_codecs_from_bytes_raw(&records)?;
+            info!(
+                "Byte codecs trained: {} first_val byte symbols, {} second_val byte symbols",
+                first_val_codec.num_symbols(),
+                second_val_codec.num_symbols()
+            );
+            write_binary_varint_huffman_raw(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+        }
+        CompressionStrategy::Smart => {
+            // Analyze data and select optimal strategy
+            let result = analyze_and_select_strategy(&records)?;
+            let selected_strategy = result.strategy;
+            let cached_codecs = result.codecs;
+
+            // Use selected strategy with cached codecs (if applicable)
+            match selected_strategy {
+                CompressionStrategy::Varint => {
+                    write_binary(output_path, &records, &string_table)?;
+                }
+                CompressionStrategy::VarintRaw => {
+                    write_binary_raw(output_path, &records, &string_table)?;
+                }
+                CompressionStrategy::Huffman => {
+                    let (first_val_codec, second_val_codec) = cached_codecs.expect("Huffman strategy should have cached codecs");
+                    info!(
+                        "Using cached codecs: {} first_val symbols, {} second_val symbols",
+                        first_val_codec.num_symbols(),
+                        second_val_codec.num_symbols()
+                    );
+                    write_binary_adaptive(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+                }
+                CompressionStrategy::HuffmanRaw => {
+                    let (first_val_codec, second_val_codec) = cached_codecs.expect("HuffmanRaw strategy should have cached codecs");
+                    info!(
+                        "Using cached codecs: {} first_val symbols, {} second_val symbols",
+                        first_val_codec.num_symbols(),
+                        second_val_codec.num_symbols()
+                    );
+                    write_binary_adaptive_raw(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+                }
+                CompressionStrategy::VarintHuffman => {
+                    let (first_val_codec, second_val_codec) = cached_codecs.expect("VarintHuffman strategy should have cached codecs");
+                    info!(
+                        "Using cached byte codecs: {} first_val symbols, {} second_val symbols",
+                        first_val_codec.num_symbols(),
+                        second_val_codec.num_symbols()
+                    );
+                    write_binary_varint_huffman(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+                }
+                CompressionStrategy::VarintHuffmanRaw => {
+                    let (first_val_codec, second_val_codec) = cached_codecs.expect("VarintHuffmanRaw strategy should have cached codecs");
+                    info!(
+                        "Using cached byte codecs: {} first_val symbols, {} second_val symbols",
+                        first_val_codec.num_symbols(),
+                        second_val_codec.num_symbols()
+                    );
+                    write_binary_varint_huffman_raw(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+                }
+                CompressionStrategy::Smart => {
+                    // Should never happen, but prevent infinite recursion
+                    unreachable!("Smart strategy should not select itself")
+                }
+            }
+        }
+    }
+
+    info!(
+        "Encoded {} records ({} unique names) with {} strategy",
         records.len(),
-        string_table.len()
+        string_table.len(),
+        strategy
     );
     Ok(())
 }
@@ -632,14 +1329,15 @@ pub fn encode_cigar_to_binary(
 pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Decompressing {} to text format...", input_path);
 
-    let input = File::open(input_path)?;
+    let input = File::open(input_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to open input file '{}': {}", input_path, e),
+        )
+    })?;
     let mut reader = BufReader::new(input);
 
     let header = BinaryPafHeader::read(&mut reader)?;
-    debug!(
-        "Reading {} records ({} unique names)",
-        header.num_records, header.num_strings
-    );
 
     if header.version != 1 {
         return Err(io::Error::new(
@@ -648,10 +1346,28 @@ pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
         ));
     }
 
-    decompress_default(reader, output_path, &header)
+    let strategy = CompressionStrategy::from_code(header.flags)?;
+    info!(
+        "Reading {} records ({} unique names) [{}]",
+        header.num_records, header.num_strings, strategy
+    );
+
+    match strategy {
+        CompressionStrategy::Varint => decompress_varint(reader, output_path, &header),
+        CompressionStrategy::VarintRaw => decompress_varint_raw(reader, output_path, &header),
+        CompressionStrategy::Huffman => decompress_huffman(reader, output_path, &header),
+        CompressionStrategy::HuffmanRaw => decompress_huffman_raw(reader, output_path, &header),
+        CompressionStrategy::VarintHuffman => decompress_varint_huffman_hybrid(reader, output_path, &header),
+        CompressionStrategy::VarintHuffmanRaw => decompress_varint_huffman_raw_hybrid(reader, output_path, &header),
+        CompressionStrategy::Smart => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Smart strategy should not be stored in file",
+        )),
+    }
 }
 
-fn decompress_default<R: Read>(
+// Version 1: Varint with FastGA-aware delta encoding
+fn decompress_varint<R: Read>(
     mut reader: R,
     output_path: &str,
     header: &BinaryPafHeader,
@@ -662,16 +1378,447 @@ fn decompress_default<R: Read>(
     }
     let string_table = StringTable::read(&mut reader)?;
     write_paf_output(output_path, &records, &string_table)?;
-    debug!("Decompressed {} records", header.num_records);
+    info!("Decompressed {} records", header.num_records);
     Ok(())
+}
+
+// Version 2: Huffman with FastGA-aware delta encoding
+fn decompress_huffman<R: Read>(
+    mut reader: R,
+    output_path: &str,
+    header: &BinaryPafHeader,
+) -> io::Result<()> {
+    let first_val_codec = AdaptiveCodec::read(&mut reader)?;
+    let second_val_codec = AdaptiveCodec::read(&mut reader)?;
+    info!(
+        "Codecs: {} pos symbols, {} score symbols",
+        first_val_codec.num_symbols(),
+        second_val_codec.num_symbols()
+    );
+
+    let mut records = Vec::with_capacity(header.num_records as usize);
+    for _ in 0..header.num_records {
+        records.push(read_record_huffman(&mut reader, &first_val_codec, &second_val_codec, true)?);
+    }
+    let string_table = StringTable::read(&mut reader)?;
+    write_paf_output(output_path, &records, &string_table)?;
+    info!("Decompressed {} records", header.num_records);
+    Ok(())
+}
+
+// Version 3: Huffman without delta encoding
+fn decompress_huffman_raw<R: Read>(
+    mut reader: R,
+    output_path: &str,
+    header: &BinaryPafHeader,
+) -> io::Result<()> {
+    let first_val_codec = AdaptiveCodec::read(&mut reader)?;
+    let second_val_codec = AdaptiveCodec::read(&mut reader)?;
+    let mut records = Vec::with_capacity(header.num_records as usize);
+    for _ in 0..header.num_records {
+        records.push(read_record_huffman(&mut reader, &first_val_codec, &second_val_codec, false)?);
+    }
+    let string_table = StringTable::read(&mut reader)?;
+    write_paf_output(output_path, &records, &string_table)?;
+    info!("Decompressed {} records", header.num_records);
+    Ok(())
+}
+
+// Version 4: Varint without delta encoding
+fn decompress_varint_raw<R: Read>(
+    mut reader: R,
+    output_path: &str,
+    header: &BinaryPafHeader,
+) -> io::Result<()> {
+    let mut records = Vec::with_capacity(header.num_records as usize);
+    for _ in 0..header.num_records {
+        records.push(read_record_varint(&mut reader, false)?);
+    }
+    let string_table = StringTable::read(&mut reader)?;
+    write_paf_output(output_path, &records, &string_table)?;
+    info!("Decompressed {} records", header.num_records);
+    Ok(())
+}
+
+// Version 5: Varint+Huffman hybrid with delta
+fn decompress_varint_huffman_hybrid<R: Read>(
+    mut reader: R,
+    output_path: &str,
+    header: &BinaryPafHeader,
+) -> io::Result<()> {
+    let first_val_codec = AdaptiveCodec::read(&mut reader)?;
+    let second_val_codec = AdaptiveCodec::read(&mut reader)?;
+    let mut records = Vec::with_capacity(header.num_records as usize);
+    for _ in 0..header.num_records {
+        records.push(read_record_varint_huffman(&mut reader, &first_val_codec, &second_val_codec, true)?);
+    }
+    let string_table = StringTable::read(&mut reader)?;
+    write_paf_output(output_path, &records, &string_table)?;
+    info!("Decompressed {} records", header.num_records);
+    Ok(())
+}
+
+// Version 6: Varint+Huffman hybrid without delta
+fn decompress_varint_huffman_raw_hybrid<R: Read>(
+    mut reader: R,
+    output_path: &str,
+    header: &BinaryPafHeader,
+) -> io::Result<()> {
+    let first_val_codec = AdaptiveCodec::read(&mut reader)?;
+    let second_val_codec = AdaptiveCodec::read(&mut reader)?;
+    let mut records = Vec::with_capacity(header.num_records as usize);
+    for _ in 0..header.num_records {
+        records.push(read_record_varint_huffman(&mut reader, &first_val_codec, &second_val_codec, false)?);
+    }
+    let string_table = StringTable::read(&mut reader)?;
+    write_paf_output(output_path, &records, &string_table)?;
+    info!("Decompressed {} records", header.num_records);
+    Ok(())
+}
+
+fn read_record_huffman<R: Read>(
+    reader: &mut R,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+    fastga_aware_delta: bool,
+) -> io::Result<AlignmentRecord> {
+    let query_name_id = read_varint(reader)?;
+    let query_start = read_varint(reader)?;
+    let query_end = read_varint(reader)?;
+    let mut strand_buf = [0u8; 1];
+    reader.read_exact(&mut strand_buf)?;
+    let strand = strand_buf[0] as char;
+    let target_name_id = read_varint(reader)?;
+    let target_start = read_varint(reader)?;
+    let target_end = read_varint(reader)?;
+    let residue_matches = read_varint(reader)?;
+    let alignment_block_len = read_varint(reader)?;
+    let mut mapq_buf = [0u8; 1];
+    reader.read_exact(&mut mapq_buf)?;
+    let mapping_quality = mapq_buf[0];
+    let mut tp_type_buf = [0u8; 1];
+    reader.read_exact(&mut tp_type_buf)?;
+    let tp_type = TracepointType::from_u8(tp_type_buf[0])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut metric_buf = [0u8; 1];
+    reader.read_exact(&mut metric_buf)?;
+    let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
+    let max_complexity = read_varint(reader)?;
+
+    let num_items = read_varint(reader)? as usize;
+    let tracepoints = if num_items == 0 {
+        match tp_type {
+            TracepointType::Standard => TracepointData::Standard(Vec::new()),
+            _ => TracepointData::Fastga(Vec::new()),
+        }
+    } else {
+        let pos_len = read_varint(reader)? as usize;
+        let mut pos_compressed = vec![0u8; pos_len];
+        reader.read_exact(&mut pos_compressed)?;
+        let score_len = read_varint(reader)? as usize;
+        let mut score_compressed = vec![0u8; score_len];
+        reader.read_exact(&mut score_compressed)?;
+
+        let pos_bytes = zstd::decode_all(&pos_compressed[..])?;
+        let score_bytes = zstd::decode_all(&score_compressed[..])?;
+
+        let mut pos_reader = BitReader::new(&pos_bytes);
+        let mut pos_values = Vec::with_capacity(num_items);
+        for _ in 0..num_items {
+            pos_values.push(first_val_codec.decode(&mut pos_reader)?);
+        }
+
+        // Apply delta decoding based on strategy and tracepoint type
+        let positions: Vec<u64> = if fastga_aware_delta {
+            // FastGA-aware: only delta-decode for Standard, use raw for FastGA
+            if matches!(tp_type, TracepointType::Fastga) {
+                pos_values.iter().map(|&v| v as u64).collect()
+            } else {
+                delta_decode(&pos_values)
+            }
+        } else {
+            // Raw strategy: never delta-decode
+            pos_values.iter().map(|&v| v as u64).collect()
+        };
+
+        let mut score_reader = BitReader::new(&score_bytes);
+        let mut scores = Vec::with_capacity(num_items);
+        for _ in 0..num_items {
+            scores.push(second_val_codec.decode(&mut score_reader)? as u64);
+        }
+
+        let tps: Vec<(u64, u64)> = positions.into_iter().zip(scores).collect();
+        match tp_type {
+            TracepointType::Standard => TracepointData::Standard(tps),
+            _ => TracepointData::Fastga(tps),
+        }
+    };
+
+    let num_tags = read_varint(reader)? as usize;
+    let mut tags = Vec::with_capacity(num_tags);
+    for _ in 0..num_tags {
+        tags.push(Tag::read(reader)?);
+    }
+
+    Ok(AlignmentRecord {
+        query_name_id,
+        query_start,
+        query_end,
+        strand,
+        target_name_id,
+        target_start,
+        target_end,
+        residue_matches,
+        alignment_block_len,
+        mapping_quality,
+        tp_type,
+        complexity_metric,
+        max_complexity,
+        tracepoints,
+        tags,
+    })
+}
+
+// Read record for version 4 (VarintRaw) - always use raw values, no delta
+fn read_record_varint<R: Read>(
+    reader: &mut R,
+    _use_delta: bool, // Parameter for consistency, always false for VarintRaw
+) -> io::Result<AlignmentRecord> {
+    // Read PAF fields (same as version 1)
+    let query_name_id = read_varint(reader)?;
+    let query_start = read_varint(reader)?;
+    let query_end = read_varint(reader)?;
+    let mut strand_buf = [0u8; 1];
+    reader.read_exact(&mut strand_buf)?;
+    let strand = strand_buf[0] as char;
+    let target_name_id = read_varint(reader)?;
+    let target_start = read_varint(reader)?;
+    let target_end = read_varint(reader)?;
+    let residue_matches = read_varint(reader)?;
+    let alignment_block_len = read_varint(reader)?;
+    let mut mapq_buf = [0u8; 1];
+    reader.read_exact(&mut mapq_buf)?;
+    let mapping_quality = mapq_buf[0];
+    let mut tp_type_buf = [0u8; 1];
+    reader.read_exact(&mut tp_type_buf)?;
+    let tp_type = TracepointType::from_u8(tp_type_buf[0])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut metric_buf = [0u8; 1];
+    reader.read_exact(&mut metric_buf)?;
+    let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
+    let max_complexity = read_varint(reader)?;
+
+    // Read tracepoints (raw, no delta)
+    let tracepoints = read_tracepoints_raw(reader, tp_type)?;
+
+    let num_tags = read_varint(reader)? as usize;
+    let mut tags = Vec::with_capacity(num_tags);
+    for _ in 0..num_tags {
+        tags.push(Tag::read(reader)?);
+    }
+
+    Ok(AlignmentRecord {
+        query_name_id,
+        query_start,
+        query_end,
+        strand,
+        target_name_id,
+        target_start,
+        target_end,
+        residue_matches,
+        alignment_block_len,
+        mapping_quality,
+        tp_type,
+        complexity_metric,
+        max_complexity,
+        tracepoints,
+        tags,
+    })
+}
+
+// Read tracepoints without delta encoding (version 4)
+fn read_tracepoints_raw<R: Read>(
+    reader: &mut R,
+    tp_type: TracepointType,
+) -> io::Result<TracepointData> {
+    let num_items = read_varint(reader)? as usize;
+    if num_items == 0 {
+        return Ok(match tp_type {
+            TracepointType::Standard => TracepointData::Standard(Vec::new()),
+            _ => TracepointData::Fastga(Vec::new()),
+        });
+    }
+
+    let pos_len = read_varint(reader)? as usize;
+    let mut pos_compressed = vec![0u8; pos_len];
+    reader.read_exact(&mut pos_compressed)?;
+    let score_len = read_varint(reader)? as usize;
+    let mut score_compressed = vec![0u8; score_len];
+    reader.read_exact(&mut score_compressed)?;
+
+    let pos_buf = zstd::decode_all(&pos_compressed[..])?;
+    let score_buf = zstd::decode_all(&score_compressed[..])?;
+
+    // Read raw varint values (no zigzag, no delta)
+    let mut pos_reader = &pos_buf[..];
+    let mut positions = Vec::with_capacity(num_items);
+    for _ in 0..num_items {
+        positions.push(read_varint(&mut pos_reader)?);
+    }
+
+    let mut score_reader = &score_buf[..];
+    let mut scores = Vec::with_capacity(num_items);
+    for _ in 0..num_items {
+        scores.push(read_varint(&mut score_reader)?);
+    }
+
+    let tps: Vec<(u64, u64)> = positions.into_iter().zip(scores).collect();
+    Ok(match tp_type {
+        TracepointType::Standard => TracepointData::Standard(tps),
+        _ => TracepointData::Fastga(tps),
+    })
+}
+
+// Read record for versions 5 & 6 (VarintHuffman variants)
+fn read_record_varint_huffman<R: Read>(
+    reader: &mut R,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+    fastga_aware_delta: bool,
+) -> io::Result<AlignmentRecord> {
+    // Same PAF field reading as Huffman
+    let query_name_id = read_varint(reader)?;
+    let query_start = read_varint(reader)?;
+    let query_end = read_varint(reader)?;
+    let mut strand_buf = [0u8; 1];
+    reader.read_exact(&mut strand_buf)?;
+    let strand = strand_buf[0] as char;
+    let target_name_id = read_varint(reader)?;
+    let target_start = read_varint(reader)?;
+    let target_end = read_varint(reader)?;
+    let residue_matches = read_varint(reader)?;
+    let alignment_block_len = read_varint(reader)?;
+    let mut mapq_buf = [0u8; 1];
+    reader.read_exact(&mut mapq_buf)?;
+    let mapping_quality = mapq_buf[0];
+    let mut tp_type_buf = [0u8; 1];
+    reader.read_exact(&mut tp_type_buf)?;
+    let tp_type = TracepointType::from_u8(tp_type_buf[0])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut metric_buf = [0u8; 1];
+    reader.read_exact(&mut metric_buf)?;
+    let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
+    let max_complexity = read_varint(reader)?;
+
+    let num_items = read_varint(reader)? as usize;
+    let tracepoints = if num_items == 0 {
+        match tp_type {
+            TracepointType::Standard => TracepointData::Standard(Vec::new()),
+            _ => TracepointData::Fastga(Vec::new()),
+        }
+    } else {
+        // Varint+Huffman: varint → bytes → Huffman → zstd
+        let pos_len = read_varint(reader)? as usize;
+        let mut pos_compressed = vec![0u8; pos_len];
+        reader.read_exact(&mut pos_compressed)?;
+        let score_len = read_varint(reader)? as usize;
+        let mut score_compressed = vec![0u8; score_len];
+        reader.read_exact(&mut score_compressed)?;
+
+        let pos_bytes = zstd::decode_all(&pos_compressed[..])?;
+        let score_bytes = zstd::decode_all(&score_compressed[..])?;
+
+        // Decode bytes with Huffman - decode until no more data
+        let mut pos_reader = BitReader::new(&pos_bytes);
+        let mut pos_byte_values = Vec::new();
+        loop {
+            match first_val_codec.decode(&mut pos_reader) {
+                Ok(byte_val) => pos_byte_values.push(byte_val as u8),
+                Err(_) => break,
+            }
+        }
+
+        // Decode varint from bytes (zigzag for v5, plain for v6)
+        let mut byte_reader = &pos_byte_values[..];
+        let mut pos_values = Vec::with_capacity(num_items);
+        for _ in 0..num_items {
+            if fastga_aware_delta {
+                // Version 5: zigzag encoding
+                let zigzag = read_varint(&mut byte_reader)?;
+                let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                pos_values.push(val);
+            } else {
+                // Version 6: plain varint
+                pos_values.push(read_varint(&mut byte_reader)? as i64);
+            }
+        }
+
+        // Apply delta based on strategy
+        let positions: Vec<u64> = if fastga_aware_delta {
+            if matches!(tp_type, TracepointType::Fastga) {
+                pos_values.iter().map(|&v| v as u64).collect()
+            } else {
+                delta_decode(&pos_values)
+            }
+        } else {
+            pos_values.iter().map(|&v| v as u64).collect()
+        };
+
+        // Decode second values - decode until no more data
+        let mut score_reader = BitReader::new(&score_bytes);
+        let mut score_byte_values = Vec::new();
+        loop {
+            match second_val_codec.decode(&mut score_reader) {
+                Ok(byte_val) => score_byte_values.push(byte_val as u8),
+                Err(_) => break,
+            }
+        }
+
+        let mut byte_reader = &score_byte_values[..];
+        let mut scores = Vec::with_capacity(num_items);
+        for _ in 0..num_items {
+            scores.push(read_varint(&mut byte_reader)?);
+        }
+
+        let tps: Vec<(u64, u64)> = positions.into_iter().zip(scores).collect();
+        match tp_type {
+            TracepointType::Standard => TracepointData::Standard(tps),
+            _ => TracepointData::Fastga(tps),
+        }
+    };
+
+    let num_tags = read_varint(reader)? as usize;
+    let mut tags = Vec::with_capacity(num_tags);
+    for _ in 0..num_tags {
+        tags.push(Tag::read(reader)?);
+    }
+
+    Ok(AlignmentRecord {
+        query_name_id,
+        query_start,
+        query_end,
+        strand,
+        target_name_id,
+        target_start,
+        target_end,
+        residue_matches,
+        alignment_block_len,
+        mapping_quality,
+        tp_type,
+        complexity_metric,
+        max_complexity,
+        tracepoints,
+        tags,
+    })
 }
 
 /// Compress PAF with tracepoints to binary format
 ///
 /// Uses delta encoding + varint + zstd compression for optimal balance
 /// of speed and compression ratio on genomic alignment data.
-pub fn compress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
-    info!("Compressing PAF with tracepoints to binary format...");
+/// Compress PAF with tracepoints to binary format
+pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionStrategy) -> io::Result<()> {
+    info!("Compressing PAF with {} strategy...", strategy);
 
     let input = open_paf_reader(input_path)?;
     let mut string_table = StringTable::new();
@@ -691,29 +1838,1263 @@ pub fn compress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
         }
     }
 
-    write_binary(output_path, &records, &string_table)?;
-    debug!(
-        "Compressed {} records ({} unique names)",
+    match strategy {
+        CompressionStrategy::Varint => {
+            write_binary(output_path, &records, &string_table)?;
+        }
+        CompressionStrategy::VarintRaw => {
+            write_binary_raw(output_path, &records, &string_table)?;
+        }
+        CompressionStrategy::Huffman => {
+            info!("Training Huffman codecs from {} records (FastGA-aware delta)...", records.len());
+            let (first_val_codec, second_val_codec) = train_codecs_from_records(&records)?;
+            info!(
+                "Codecs trained: {} first_val symbols, {} second_val symbols",
+                first_val_codec.num_symbols(),
+                second_val_codec.num_symbols()
+            );
+            write_binary_adaptive(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+        }
+        CompressionStrategy::HuffmanRaw => {
+            info!("Training Huffman codecs from {} records (no delta)...", records.len());
+            let (first_val_codec, second_val_codec) = train_codecs_from_records_raw(&records)?;
+            info!(
+                "Codecs trained: {} first_val symbols, {} second_val symbols",
+                first_val_codec.num_symbols(),
+                second_val_codec.num_symbols()
+            );
+            write_binary_adaptive_raw(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+        }
+        CompressionStrategy::VarintHuffman => {
+            info!("Training byte-level Huffman codecs from {} records (varint+huffman hybrid)...", records.len());
+            let (first_val_codec, second_val_codec) = train_codecs_from_bytes(&records)?;
+            info!(
+                "Byte codecs trained: {} first_val byte symbols, {} second_val byte symbols",
+                first_val_codec.num_symbols(),
+                second_val_codec.num_symbols()
+            );
+            write_binary_varint_huffman(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+        }
+        CompressionStrategy::VarintHuffmanRaw => {
+            info!("Training byte-level Huffman codecs from {} records (varint+huffman-raw hybrid)...", records.len());
+            let (first_val_codec, second_val_codec) = train_codecs_from_bytes_raw(&records)?;
+            info!(
+                "Byte codecs trained: {} first_val byte symbols, {} second_val byte symbols",
+                first_val_codec.num_symbols(),
+                second_val_codec.num_symbols()
+            );
+            write_binary_varint_huffman_raw(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+        }
+        CompressionStrategy::Smart => {
+            // Analyze data and select optimal strategy
+            let result = analyze_and_select_strategy(&records)?;
+            let selected_strategy = result.strategy;
+            let cached_codecs = result.codecs;
+
+            // Use selected strategy with cached codecs (if applicable)
+            match selected_strategy {
+                CompressionStrategy::Varint => {
+                    write_binary(output_path, &records, &string_table)?;
+                }
+                CompressionStrategy::VarintRaw => {
+                    write_binary_raw(output_path, &records, &string_table)?;
+                }
+                CompressionStrategy::Huffman => {
+                    let (first_val_codec, second_val_codec) = cached_codecs.expect("Huffman strategy should have cached codecs");
+                    info!(
+                        "Using cached codecs: {} first_val symbols, {} second_val symbols",
+                        first_val_codec.num_symbols(),
+                        second_val_codec.num_symbols()
+                    );
+                    write_binary_adaptive(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+                }
+                CompressionStrategy::HuffmanRaw => {
+                    let (first_val_codec, second_val_codec) = cached_codecs.expect("HuffmanRaw strategy should have cached codecs");
+                    info!(
+                        "Using cached codecs: {} first_val symbols, {} second_val symbols",
+                        first_val_codec.num_symbols(),
+                        second_val_codec.num_symbols()
+                    );
+                    write_binary_adaptive_raw(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+                }
+                CompressionStrategy::VarintHuffman => {
+                    let (first_val_codec, second_val_codec) = cached_codecs.expect("VarintHuffman strategy should have cached codecs");
+                    info!(
+                        "Using cached byte codecs: {} first_val symbols, {} second_val symbols",
+                        first_val_codec.num_symbols(),
+                        second_val_codec.num_symbols()
+                    );
+                    write_binary_varint_huffman(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+                }
+                CompressionStrategy::VarintHuffmanRaw => {
+                    let (first_val_codec, second_val_codec) = cached_codecs.expect("VarintHuffmanRaw strategy should have cached codecs");
+                    info!(
+                        "Using cached byte codecs: {} first_val symbols, {} second_val symbols",
+                        first_val_codec.num_symbols(),
+                        second_val_codec.num_symbols()
+                    );
+                    write_binary_varint_huffman_raw(output_path, &records, &string_table, &first_val_codec, &second_val_codec)?;
+                }
+                CompressionStrategy::Smart => {
+                    // Should never happen, but prevent infinite recursion
+                    unreachable!("Smart strategy should not select itself")
+                }
+            }
+        }
+    }
+
+    info!(
+        "Compressed {} records ({} unique names) with {} strategy",
         records.len(),
-        string_table.len()
+        string_table.len(),
+        strategy
     );
+    Ok(())
+}
+
+/// Train Huffman codecs from alignment records
+///
+/// Tracepoint pairs are:
+/// - Standard/Mixed/Variable: (query_bases, target_bases)
+/// - FastGA: (num_differences, target_bases)
+///
+/// Compression strategy:
+/// - First value: delta encoded (difference from previous first value)
+/// - Second value: raw value (target_bases in all types)
+fn train_codecs_from_records(
+    records: &[AlignmentRecord],
+) -> io::Result<(AdaptiveCodec, AdaptiveCodec)> {
+    let mut first_val_frequencies: HashMap<i64, u64> = HashMap::new();
+    let mut second_val_frequencies: HashMap<i64, u64> = HashMap::new();
+
+    // Collect frequencies from all records
+    for record in records {
+        let tracepoints = match &record.tracepoints {
+            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+            _ => continue,
+        };
+
+        if tracepoints.is_empty() {
+            continue;
+        }
+
+        // FastGA-aware delta encoding:
+        // - FastGA: num_differences are naturally small, use raw values
+        // - Standard: query_bases are incremental, use delta encoding
+        let use_delta = !matches!(record.tp_type, TracepointType::Fastga);
+
+        if use_delta {
+            // Delta encoding for Standard type
+            let mut prev_first = 0i64;
+            for &(first_val, second_val) in tracepoints {
+                let delta = first_val as i64 - prev_first;
+                *first_val_frequencies.entry(delta).or_insert(0) += 1;
+                prev_first = first_val as i64;
+
+                *second_val_frequencies.entry(second_val as i64).or_insert(0) += 1;
+            }
+        } else {
+            // Raw values for FastGA type
+            for &(first_val, second_val) in tracepoints {
+                *first_val_frequencies.entry(first_val as i64).or_insert(0) += 1;
+                *second_val_frequencies.entry(second_val as i64).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if first_val_frequencies.is_empty() || second_val_frequencies.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No tracepoint data found for training codecs",
+        ));
+    }
+
+    // Debug: log frequency distribution statistics
+    debug!("First value delta statistics:");
+    debug!("  Unique symbols: {}", first_val_frequencies.len());
+    let first_total: u64 = first_val_frequencies.values().sum();
+    let mut first_sorted: Vec<_> = first_val_frequencies.iter().collect();
+    first_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    if let Some((val, freq)) = first_sorted.first() {
+        debug!("  Most frequent: {} ({}x, {:.2}%)", val, freq, (**freq as f64 / first_total as f64) * 100.0);
+    }
+    if first_sorted.len() >= 3 {
+        let top3_freq: u64 = first_sorted.iter().take(3).map(|(_, f)| **f).sum();
+        debug!("  Top 3 symbols: {:.2}% of data", (top3_freq as f64 / first_total as f64) * 100.0);
+    }
+
+    debug!("Second value statistics:");
+    debug!("  Unique symbols: {}", second_val_frequencies.len());
+    let second_total: u64 = second_val_frequencies.values().sum();
+    let mut second_sorted: Vec<_> = second_val_frequencies.iter().collect();
+    second_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    if let Some((val, freq)) = second_sorted.first() {
+        debug!("  Most frequent: {} ({}x, {:.2}%)", val, freq, (**freq as f64 / second_total as f64) * 100.0);
+    }
+    if second_sorted.len() >= 3 {
+        let top3_freq: u64 = second_sorted.iter().take(3).map(|(_, f)| **f).sum();
+        debug!("  Top 3 symbols: {:.2}% of data", (top3_freq as f64 / second_total as f64) * 100.0);
+    }
+
+    let first_val_codec = AdaptiveCodec::build(&first_val_frequencies)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let second_val_codec = AdaptiveCodec::build(&second_val_frequencies)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    // Debug: calculate bit usage efficiency
+    let first_theoretical_bits = (first_val_frequencies.len() as f64).log2().ceil();
+    let mut first_weighted_bits = 0.0;
+    if let Some(ref tree) = first_val_codec.huffman_tree {
+        for (val, freq) in &first_val_frequencies {
+            if let Some(code) = tree.encode_table.get(val) {
+                first_weighted_bits += code.bits.len() as f64 * (*freq as f64);
+            }
+        }
+    }
+    let first_avg_bits = first_weighted_bits / first_total as f64;
+    debug!("  Theoretical bits/symbol: {:.2}", first_theoretical_bits);
+    debug!("  Huffman bits/symbol: {:.2}", first_avg_bits);
+    debug!("  Bit efficiency: {:.1}%", (first_avg_bits / first_theoretical_bits) * 100.0);
+
+    let second_theoretical_bits = (second_val_frequencies.len() as f64).log2().ceil();
+    let mut second_weighted_bits = 0.0;
+    if let Some(ref tree) = second_val_codec.huffman_tree {
+        for (val, freq) in &second_val_frequencies {
+            if let Some(code) = tree.encode_table.get(val) {
+                second_weighted_bits += code.bits.len() as f64 * (*freq as f64);
+            }
+        }
+    }
+    let second_avg_bits = second_weighted_bits / second_total as f64;
+    debug!("  Theoretical bits/symbol: {:.2}", second_theoretical_bits);
+    debug!("  Huffman bits/symbol: {:.2}", second_avg_bits);
+    debug!("  Bit efficiency: {:.1}%", (second_avg_bits / second_theoretical_bits) * 100.0);
+
+    Ok((first_val_codec, second_val_codec))
+}
+
+/// Train Huffman codecs from alignment records (NO delta encoding)
+///
+/// Compression strategy:
+/// - First value: raw value (no delta)
+/// - Second value: raw value (target_bases in all types)
+fn train_codecs_from_records_raw(
+    records: &[AlignmentRecord],
+) -> io::Result<(AdaptiveCodec, AdaptiveCodec)> {
+    let mut first_val_frequencies: HashMap<i64, u64> = HashMap::new();
+    let mut second_val_frequencies: HashMap<i64, u64> = HashMap::new();
+
+    // Collect frequencies from all records
+    for record in records {
+        let tracepoints = match &record.tracepoints {
+            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+            _ => continue,
+        };
+
+        if tracepoints.is_empty() {
+            continue;
+        }
+
+        // No delta encoding - use raw values for all types
+        for &(first_val, second_val) in tracepoints {
+            *first_val_frequencies.entry(first_val as i64).or_insert(0) += 1;
+            *second_val_frequencies.entry(second_val as i64).or_insert(0) += 1;
+        }
+    }
+
+    if first_val_frequencies.is_empty() || second_val_frequencies.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No tracepoint data found for training codecs",
+        ));
+    }
+
+    // Debug: log frequency distribution statistics
+    debug!("First value (raw) statistics:");
+    debug!("  Unique symbols: {}", first_val_frequencies.len());
+    let first_total: u64 = first_val_frequencies.values().sum();
+    let mut first_sorted: Vec<_> = first_val_frequencies.iter().collect();
+    first_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    if let Some((val, freq)) = first_sorted.first() {
+        debug!("  Most frequent: {} ({}x, {:.2}%)", val, freq, (**freq as f64 / first_total as f64) * 100.0);
+    }
+    if first_sorted.len() >= 3 {
+        let top3_freq: u64 = first_sorted.iter().take(3).map(|(_, f)| **f).sum();
+        debug!("  Top 3 symbols: {:.2}% of data", (top3_freq as f64 / first_total as f64) * 100.0);
+    }
+
+    debug!("Second value statistics:");
+    debug!("  Unique symbols: {}", second_val_frequencies.len());
+    let second_total: u64 = second_val_frequencies.values().sum();
+    let mut second_sorted: Vec<_> = second_val_frequencies.iter().collect();
+    second_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    if let Some((val, freq)) = second_sorted.first() {
+        debug!("  Most frequent: {} ({}x, {:.2}%)", val, freq, (**freq as f64 / second_total as f64) * 100.0);
+    }
+    if second_sorted.len() >= 3 {
+        let top3_freq: u64 = second_sorted.iter().take(3).map(|(_, f)| **f).sum();
+        debug!("  Top 3 symbols: {:.2}% of data", (top3_freq as f64 / second_total as f64) * 100.0);
+    }
+
+    let first_val_codec = AdaptiveCodec::build(&first_val_frequencies)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let second_val_codec = AdaptiveCodec::build(&second_val_frequencies)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    // Debug: calculate bit usage efficiency
+    let first_theoretical_bits = (first_val_frequencies.len() as f64).log2().ceil();
+    let mut first_weighted_bits = 0.0;
+    if let Some(ref tree) = first_val_codec.huffman_tree {
+        for (val, freq) in &first_val_frequencies {
+            if let Some(code) = tree.encode_table.get(val) {
+                first_weighted_bits += code.bits.len() as f64 * (*freq as f64);
+            }
+        }
+    }
+    let first_avg_bits = first_weighted_bits / first_total as f64;
+    debug!("  Theoretical bits/symbol: {:.2}", first_theoretical_bits);
+    debug!("  Huffman bits/symbol: {:.2}", first_avg_bits);
+    debug!("  Bit efficiency: {:.1}%", (first_avg_bits / first_theoretical_bits) * 100.0);
+
+    let second_theoretical_bits = (second_val_frequencies.len() as f64).log2().ceil();
+    let mut second_weighted_bits = 0.0;
+    if let Some(ref tree) = second_val_codec.huffman_tree {
+        for (val, freq) in &second_val_frequencies {
+            if let Some(code) = tree.encode_table.get(val) {
+                second_weighted_bits += code.bits.len() as f64 * (*freq as f64);
+            }
+        }
+    }
+    let second_avg_bits = second_weighted_bits / second_total as f64;
+    debug!("  Theoretical bits/symbol: {:.2}", second_theoretical_bits);
+    debug!("  Huffman bits/symbol: {:.2}", second_avg_bits);
+    debug!("  Bit efficiency: {:.1}%", (second_avg_bits / second_theoretical_bits) * 100.0);
+
+    Ok((first_val_codec, second_val_codec))
+}
+
+/// Train byte-level Huffman codecs by varint encoding first, then Huffman on bytes
+///
+/// Pipeline: Delta/Raw → Varint → Byte frequencies → Byte-level Huffman
+/// Compression strategy:
+/// - First value: FastGA-aware (delta for Standard, raw for FastGA)
+/// - Second value: raw target_bases
+/// - Huffman trained on byte distribution (0-255) from varint output
+fn train_codecs_from_bytes(
+    records: &[AlignmentRecord],
+) -> io::Result<(AdaptiveCodec, AdaptiveCodec)> {
+    let mut first_val_byte_frequencies: HashMap<i64, u64> = HashMap::new();
+    let mut second_val_byte_frequencies: HashMap<i64, u64> = HashMap::new();
+
+    // Collect byte frequencies by varint encoding all values
+    for record in records {
+        let tracepoints = match &record.tracepoints {
+            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+            _ => continue,
+        };
+
+        if tracepoints.is_empty() {
+            continue;
+        }
+
+        // FastGA-aware delta encoding
+        let use_delta = !matches!(record.tp_type, TracepointType::Fastga);
+
+        // Encode first values to bytes
+        let first_vals: Vec<u64> = tracepoints.iter().map(|&(v, _)| v).collect();
+        let first_vals_encoded: Vec<i64> = if use_delta {
+            delta_encode(&first_vals)
+        } else {
+            first_vals.iter().map(|&v| v as i64).collect()
+        };
+
+        // Varint encode and collect byte frequencies
+        for val in first_vals_encoded {
+            let mut buf = Vec::new();
+            let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+            write_varint(&mut buf, zigzag).unwrap();
+            for byte in buf {
+                *first_val_byte_frequencies.entry(byte as i64).or_insert(0) += 1;
+            }
+        }
+
+        // Encode second values (always raw)
+        for &(_, val) in tracepoints {
+            let mut buf = Vec::new();
+            write_varint(&mut buf, val).unwrap();
+            for byte in buf {
+                *second_val_byte_frequencies.entry(byte as i64).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if first_val_byte_frequencies.is_empty() || second_val_byte_frequencies.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No tracepoint data found for training byte codecs",
+        ));
+    }
+
+    // Debug: log byte frequency distribution statistics
+    debug!("First value byte statistics (after varint):");
+    debug!("  Unique byte symbols: {}", first_val_byte_frequencies.len());
+    let first_total: u64 = first_val_byte_frequencies.values().sum();
+    let mut first_sorted: Vec<_> = first_val_byte_frequencies.iter().collect();
+    first_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    if let Some((val, freq)) = first_sorted.first() {
+        debug!("  Most frequent: 0x{:02X} ({}x, {:.2}%)", val, freq, (**freq as f64 / first_total as f64) * 100.0);
+    }
+    if first_sorted.len() >= 3 {
+        let top3_freq: u64 = first_sorted.iter().take(3).map(|(_, f)| **f).sum();
+        debug!("  Top 3 bytes: {:.2}% of data", (top3_freq as f64 / first_total as f64) * 100.0);
+    }
+
+    debug!("Second value byte statistics (after varint):");
+    debug!("  Unique byte symbols: {}", second_val_byte_frequencies.len());
+    let second_total: u64 = second_val_byte_frequencies.values().sum();
+    let mut second_sorted: Vec<_> = second_val_byte_frequencies.iter().collect();
+    second_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    if let Some((val, freq)) = second_sorted.first() {
+        debug!("  Most frequent: 0x{:02X} ({}x, {:.2}%)", val, freq, (**freq as f64 / second_total as f64) * 100.0);
+    }
+    if second_sorted.len() >= 3 {
+        let top3_freq: u64 = second_sorted.iter().take(3).map(|(_, f)| **f).sum();
+        debug!("  Top 3 bytes: {:.2}% of data", (top3_freq as f64 / second_total as f64) * 100.0);
+    }
+
+    let first_val_codec = AdaptiveCodec::build(&first_val_byte_frequencies)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let second_val_codec = AdaptiveCodec::build(&second_val_byte_frequencies)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    Ok((first_val_codec, second_val_codec))
+}
+
+/// Train byte-level Huffman codecs (NO delta encoding)
+///
+/// Pipeline: Raw → Varint → Byte frequencies → Byte-level Huffman
+fn train_codecs_from_bytes_raw(
+    records: &[AlignmentRecord],
+) -> io::Result<(AdaptiveCodec, AdaptiveCodec)> {
+    let mut first_val_byte_frequencies: HashMap<i64, u64> = HashMap::new();
+    let mut second_val_byte_frequencies: HashMap<i64, u64> = HashMap::new();
+
+    // Collect byte frequencies by varint encoding all raw values
+    for record in records {
+        let tracepoints = match &record.tracepoints {
+            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+            _ => continue,
+        };
+
+        if tracepoints.is_empty() {
+            continue;
+        }
+
+        // Encode all values as raw (no delta)
+        for &(first_val, second_val) in tracepoints {
+            // First value as raw
+            let mut buf = Vec::new();
+            write_varint(&mut buf, first_val).unwrap();
+            for byte in buf {
+                *first_val_byte_frequencies.entry(byte as i64).or_insert(0) += 1;
+            }
+
+            // Second value as raw
+            let mut buf = Vec::new();
+            write_varint(&mut buf, second_val).unwrap();
+            for byte in buf {
+                *second_val_byte_frequencies.entry(byte as i64).or_insert(0) += 1;
+            }
+        }
+    }
+
+    if first_val_byte_frequencies.is_empty() || second_val_byte_frequencies.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "No tracepoint data found for training byte codecs",
+        ));
+    }
+
+    // Debug: log byte frequency distribution statistics
+    debug!("First value byte statistics (raw, after varint):");
+    debug!("  Unique byte symbols: {}", first_val_byte_frequencies.len());
+    let first_total: u64 = first_val_byte_frequencies.values().sum();
+    let mut first_sorted: Vec<_> = first_val_byte_frequencies.iter().collect();
+    first_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    if let Some((val, freq)) = first_sorted.first() {
+        debug!("  Most frequent: 0x{:02X} ({}x, {:.2}%)", val, freq, (**freq as f64 / first_total as f64) * 100.0);
+    }
+    if first_sorted.len() >= 3 {
+        let top3_freq: u64 = first_sorted.iter().take(3).map(|(_, f)| **f).sum();
+        debug!("  Top 3 bytes: {:.2}% of data", (top3_freq as f64 / first_total as f64) * 100.0);
+    }
+
+    debug!("Second value byte statistics (raw, after varint):");
+    debug!("  Unique byte symbols: {}", second_val_byte_frequencies.len());
+    let second_total: u64 = second_val_byte_frequencies.values().sum();
+    let mut second_sorted: Vec<_> = second_val_byte_frequencies.iter().collect();
+    second_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    if let Some((val, freq)) = second_sorted.first() {
+        debug!("  Most frequent: 0x{:02X} ({}x, {:.2}%)", val, freq, (**freq as f64 / second_total as f64) * 100.0);
+    }
+    if second_sorted.len() >= 3 {
+        let top3_freq: u64 = second_sorted.iter().take(3).map(|(_, f)| **f).sum();
+        debug!("  Top 3 bytes: {:.2}% of data", (top3_freq as f64 / second_total as f64) * 100.0);
+    }
+
+    let first_val_codec = AdaptiveCodec::build(&first_val_byte_frequencies)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let second_val_codec = AdaptiveCodec::build(&second_val_byte_frequencies)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    Ok((first_val_codec, second_val_codec))
+}
+
+/// Analyze data distribution and select optimal compression strategy
+///
+/// Tests all 6 strategies by actually compressing the data and measuring size
+/// Result from Smart strategy selection
+struct SmartStrategyResult {
+    strategy: CompressionStrategy,
+    codecs: Option<(AdaptiveCodec, AdaptiveCodec)>,
+}
+
+/// Returns the strategy that produces the smallest compressed output
+/// For Huffman-based strategies, also returns the trained codecs to avoid re-training
+fn analyze_and_select_strategy(
+    records: &[AlignmentRecord],
+) -> io::Result<SmartStrategyResult> {
+    use std::io::Cursor;
+
+    info!("Smart: Testing all 6 compression strategies...");
+
+    // Test each strategy by encoding to memory
+    let strategies = vec![
+        CompressionStrategy::Varint,
+        CompressionStrategy::VarintRaw,
+        CompressionStrategy::Huffman,
+        CompressionStrategy::HuffmanRaw,
+        CompressionStrategy::VarintHuffman,
+        CompressionStrategy::VarintHuffmanRaw,
+    ];
+
+    let mut results: Vec<(CompressionStrategy, usize, Option<(AdaptiveCodec, AdaptiveCodec)>)> = Vec::new();
+
+    for strategy in strategies {
+        // Create a temporary in-memory buffer
+        let mut buffer = Cursor::new(Vec::new());
+
+        // Encode tracepoints only (the main compressible data)
+        // For Huffman strategies, also capture the trained codecs
+        let result: io::Result<(usize, Option<(AdaptiveCodec, AdaptiveCodec)>)> = match strategy {
+            CompressionStrategy::Varint | CompressionStrategy::VarintRaw => {
+                // Encode with varint (matching real writer: separate first/second compression)
+                for record in records {
+                    let tracepoints = match &record.tracepoints {
+                        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+                        _ => continue,
+                    };
+
+                    if tracepoints.is_empty() {
+                        continue;
+                    }
+
+                    let first_vals: Vec<u64> = tracepoints.iter().map(|&(v, _)| v).collect();
+
+                    // Encode first values
+                    let mut first_val_buf = Vec::new();
+                    if strategy == CompressionStrategy::Varint {
+                        // Varint: FastGA-aware delta encoding with zigzag
+                        let use_delta = !matches!(record.tp_type, TracepointType::Fastga);
+                        let first_vals_encoded: Vec<i64> = if use_delta {
+                            delta_encode(&first_vals)
+                        } else {
+                            first_vals.iter().map(|&v| v as i64).collect()
+                        };
+                        for val in first_vals_encoded {
+                            let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                            write_varint(&mut first_val_buf, zigzag)?;
+                        }
+                    } else {
+                        // VarintRaw: raw values, no zigzag
+                        for &val in &first_vals {
+                            write_varint(&mut first_val_buf, val)?;
+                        }
+                    }
+                    let first_compressed = zstd::encode_all(&first_val_buf[..], 3)?;
+                    write_varint(&mut buffer, first_compressed.len() as u64)?;
+                    buffer.write_all(&first_compressed)?;
+
+                    // Encode second values
+                    let mut second_val_buf = Vec::new();
+                    for &(_, val) in tracepoints {
+                        write_varint(&mut second_val_buf, val)?;
+                    }
+                    let second_compressed = zstd::encode_all(&second_val_buf[..], 3)?;
+                    write_varint(&mut buffer, second_compressed.len() as u64)?;
+                    buffer.write_all(&second_compressed)?;
+                }
+                Ok((buffer.into_inner().len(), None))
+            }
+            CompressionStrategy::Huffman | CompressionStrategy::HuffmanRaw => {
+                // Train and encode with integer-level Huffman
+                let (first_codec, second_codec) = if strategy == CompressionStrategy::Huffman {
+                    train_codecs_from_records(records)?
+                } else {
+                    train_codecs_from_records_raw(records)?
+                };
+
+                // Include codec serialization overhead in size calculation
+                first_codec.write(&mut buffer)?;
+                second_codec.write(&mut buffer)?;
+
+                for record in records {
+                    let tracepoints = match &record.tracepoints {
+                        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+                        _ => continue,
+                    };
+
+                    let use_delta = strategy == CompressionStrategy::Huffman && !matches!(record.tp_type, TracepointType::Fastga);
+
+                    let first_vals: Vec<u64> = tracepoints.iter().map(|&(v, _)| v).collect();
+                    let first_vals_encoded: Vec<i64> = if use_delta {
+                        delta_encode(&first_vals)
+                    } else {
+                        first_vals.iter().map(|&v| v as i64).collect()
+                    };
+
+                    let mut first_writer = BitWriter::new();
+                    for val in first_vals_encoded {
+                        let code = first_codec.encode(val).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        first_writer.write_bits(&code.bits);
+                    }
+                    let first_bytes = first_writer.finish();
+                    let first_compressed = zstd::encode_all(&first_bytes[..], 3)?;
+                    write_varint(&mut buffer, first_compressed.len() as u64)?;
+                    buffer.write_all(&first_compressed)?;
+
+                    let mut second_writer = BitWriter::new();
+                    for &(_, val) in tracepoints {
+                        let code = second_codec.encode(val as i64).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        second_writer.write_bits(&code.bits);
+                    }
+                    let second_bytes = second_writer.finish();
+                    let second_compressed = zstd::encode_all(&second_bytes[..], 3)?;
+                    write_varint(&mut buffer, second_compressed.len() as u64)?;
+                    buffer.write_all(&second_compressed)?;
+                }
+                Ok((buffer.into_inner().len(), Some((first_codec, second_codec))))
+            }
+            CompressionStrategy::VarintHuffman | CompressionStrategy::VarintHuffmanRaw => {
+                // Train and encode with byte-level Huffman
+                let (first_codec, second_codec) = if strategy == CompressionStrategy::VarintHuffman {
+                    train_codecs_from_bytes(records)?
+                } else {
+                    train_codecs_from_bytes_raw(records)?
+                };
+
+                // Include codec serialization overhead in size calculation
+                first_codec.write(&mut buffer)?;
+                second_codec.write(&mut buffer)?;
+
+                for record in records {
+                    let tracepoints = match &record.tracepoints {
+                        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+                        _ => continue,
+                    };
+
+                    let use_delta = strategy == CompressionStrategy::VarintHuffman && !matches!(record.tp_type, TracepointType::Fastga);
+
+                    let first_vals: Vec<u64> = tracepoints.iter().map(|&(v, _)| v).collect();
+
+                    let mut first_bytes_buf = Vec::new();
+                    if strategy == CompressionStrategy::VarintHuffman {
+                        // VarintHuffman: use zigzag encoding (for both delta and raw)
+                        let first_vals_encoded: Vec<i64> = if use_delta {
+                            delta_encode(&first_vals)
+                        } else {
+                            first_vals.iter().map(|&v| v as i64).collect()
+                        };
+                        for val in first_vals_encoded {
+                            let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                            write_varint(&mut first_bytes_buf, zigzag)?;
+                        }
+                    } else {
+                        // VarintHuffmanRaw: no zigzag, plain varint on raw u64
+                        for &val in &first_vals {
+                            write_varint(&mut first_bytes_buf, val)?;
+                        }
+                    }
+
+                    let mut first_writer = BitWriter::new();
+                    for byte in first_bytes_buf {
+                        let code = first_codec.encode(byte as i64).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        first_writer.write_bits(&code.bits);
+                    }
+                    let first_bytes = first_writer.finish();
+                    let first_compressed = zstd::encode_all(&first_bytes[..], 3)?;
+                    write_varint(&mut buffer, first_compressed.len() as u64)?;
+                    buffer.write_all(&first_compressed)?;
+
+                    let mut second_bytes_buf = Vec::new();
+                    for &(_, val) in tracepoints {
+                        write_varint(&mut second_bytes_buf, val)?;
+                    }
+
+                    let mut second_writer = BitWriter::new();
+                    for byte in second_bytes_buf {
+                        let code = second_codec.encode(byte as i64).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        second_writer.write_bits(&code.bits);
+                    }
+                    let second_bytes = second_writer.finish();
+                    let second_compressed = zstd::encode_all(&second_bytes[..], 3)?;
+                    write_varint(&mut buffer, second_compressed.len() as u64)?;
+                    buffer.write_all(&second_compressed)?;
+                }
+                Ok((buffer.into_inner().len(), Some((first_codec, second_codec))))
+            }
+            CompressionStrategy::Smart => {
+                unreachable!("Smart should not test itself")
+            }
+        };
+
+        match result {
+            Ok((size, codecs)) => {
+                info!("Smart: {} → {} bytes", strategy, size);
+                results.push((strategy, size, codecs));
+            }
+            Err(e) => {
+                debug!("Smart: {} failed: {}", strategy, e);
+            }
+        }
+    }
+
+    // Find the strategy with minimum size
+    if let Some((best_strategy, best_size, best_codecs)) = results.iter().min_by_key(|(_, size, _)| size) {
+        info!("Smart: Selected {} ({} bytes, best compression)", best_strategy, best_size);
+        Ok(SmartStrategyResult {
+            strategy: *best_strategy,
+            codecs: best_codecs.clone(),
+        })
+    } else {
+        // Fallback to Varint if all strategies failed
+        info!("Smart: All strategies failed, defaulting to Varint");
+        Ok(SmartStrategyResult {
+            strategy: CompressionStrategy::Varint,
+            codecs: None,
+        })
+    }
+}
+
+/// Write records to binary PAF format with Huffman encoding
+fn write_binary_adaptive(
+    output_path: &str,
+    records: &[AlignmentRecord],
+    string_table: &StringTable,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+) -> io::Result<()> {
+    let output = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
+    let mut writer = BufWriter::new(output);
+
+    let header = BinaryPafHeader {
+        version: 1,
+        flags: CompressionStrategy::Huffman.to_code(),
+        num_records: records.len() as u64,
+        num_strings: string_table.len() as u64,
+    };
+
+    header.write(&mut writer)?;
+
+    // Write codecs
+    first_val_codec.write(&mut writer)?;
+    second_val_codec.write(&mut writer)?;
+
+    // Write records
+    for record in records {
+        write_record_adaptive(&mut writer, record, first_val_codec, second_val_codec)?;
+    }
+
+    // Write string table
+    string_table.write(&mut writer)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write single record with Huffman encoding
+fn write_record_adaptive<W: Write>(
+    writer: &mut W,
+    record: &AlignmentRecord,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+) -> io::Result<()> {
+    // Write core PAF fields
+    write_varint(writer, record.query_name_id)?;
+    write_varint(writer, record.query_start)?;
+    write_varint(writer, record.query_end)?;
+    writer.write_all(&[record.strand as u8])?;
+    write_varint(writer, record.target_name_id)?;
+    write_varint(writer, record.target_start)?;
+    write_varint(writer, record.target_end)?;
+    write_varint(writer, record.residue_matches)?;
+    write_varint(writer, record.alignment_block_len)?;
+    writer.write_all(&[record.mapping_quality])?;
+    writer.write_all(&[record.tp_type.to_u8()])?;
+    writer.write_all(&[complexity_metric_to_u8(&record.complexity_metric)])?;
+    write_varint(writer, record.max_complexity)?;
+
+    // Get tracepoints
+    let empty_vec = Vec::new();
+    let tracepoints = match &record.tracepoints {
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+        _ => &empty_vec,
+    };
+
+    write_varint(writer, tracepoints.len() as u64)?;
+
+    if !tracepoints.is_empty() {
+        // FastGA-aware delta encoding:
+        // - FastGA: num_differences are naturally small, use raw values
+        // - Standard: query_bases are incremental, use delta encoding
+        let use_delta = !matches!(record.tp_type, TracepointType::Fastga);
+
+        // Encode first values with Huffman
+        let mut first_val_writer = BitWriter::new();
+        let first_vals: Vec<u64> = tracepoints.iter().map(|&(v, _)| v).collect();
+        let first_vals_encoded: Vec<i64> = if use_delta {
+            delta_encode(&first_vals)
+        } else {
+            first_vals.iter().map(|&v| v as i64).collect()
+        };
+
+        for val in first_vals_encoded {
+            let code = first_val_codec
+                .encode(val)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            first_val_writer.write_bits(&code.bits);
+        }
+        let first_val_bytes = first_val_writer.finish();
+        let first_val_compressed = zstd::encode_all(&first_val_bytes[..], 3)?;
+        write_varint(writer, first_val_compressed.len() as u64)?;
+        writer.write_all(&first_val_compressed)?;
+
+        // Encode second values with Huffman
+        let mut second_val_writer = BitWriter::new();
+        for &(_, val) in tracepoints {
+            let code = second_val_codec
+                .encode(val as i64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            second_val_writer.write_bits(&code.bits);
+        }
+        let second_val_bytes = second_val_writer.finish();
+        let second_val_compressed = zstd::encode_all(&second_val_bytes[..], 3)?;
+        write_varint(writer, second_val_compressed.len() as u64)?;
+        writer.write_all(&second_val_compressed)?;
+    }
+
+    // Write tags
+    write_varint(writer, record.tags.len() as u64)?;
+    for tag in &record.tags {
+        tag.write(writer)?;
+    }
+
+    Ok(())
+}
+
+/// Write single record with Huffman encoding (NO delta encoding)
+fn write_record_adaptive_raw<W: Write>(
+    writer: &mut W,
+    record: &AlignmentRecord,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+) -> io::Result<()> {
+    // Write core PAF fields
+    write_varint(writer, record.query_name_id)?;
+    write_varint(writer, record.query_start)?;
+    write_varint(writer, record.query_end)?;
+    writer.write_all(&[record.strand as u8])?;
+    write_varint(writer, record.target_name_id)?;
+    write_varint(writer, record.target_start)?;
+    write_varint(writer, record.target_end)?;
+    write_varint(writer, record.residue_matches)?;
+    write_varint(writer, record.alignment_block_len)?;
+    writer.write_all(&[record.mapping_quality])?;
+    writer.write_all(&[record.tp_type.to_u8()])?;
+    writer.write_all(&[complexity_metric_to_u8(&record.complexity_metric)])?;
+    write_varint(writer, record.max_complexity)?;
+
+    // Get tracepoints
+    let empty_vec = Vec::new();
+    let tracepoints = match &record.tracepoints {
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+        _ => &empty_vec,
+    };
+
+    write_varint(writer, tracepoints.len() as u64)?;
+
+    if !tracepoints.is_empty() {
+        // No delta encoding - use raw values for all types
+        let mut first_val_writer = BitWriter::new();
+        for &(val, _) in tracepoints {
+            let code = first_val_codec
+                .encode(val as i64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            first_val_writer.write_bits(&code.bits);
+        }
+        let first_val_bytes = first_val_writer.finish();
+        let first_val_compressed = zstd::encode_all(&first_val_bytes[..], 3)?;
+        write_varint(writer, first_val_compressed.len() as u64)?;
+        writer.write_all(&first_val_compressed)?;
+
+        // Encode second values with Huffman
+        let mut second_val_writer = BitWriter::new();
+        for &(_, val) in tracepoints {
+            let code = second_val_codec
+                .encode(val as i64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            second_val_writer.write_bits(&code.bits);
+        }
+        let second_val_bytes = second_val_writer.finish();
+        let second_val_compressed = zstd::encode_all(&second_val_bytes[..], 3)?;
+        write_varint(writer, second_val_compressed.len() as u64)?;
+        writer.write_all(&second_val_compressed)?;
+    }
+
+    // Write tags
+    write_varint(writer, record.tags.len() as u64)?;
+    for tag in &record.tags {
+        tag.write(writer)?;
+    }
+
+    Ok(())
+}
+
+/// Write binary with Huffman encoding (NO delta encoding)
+fn write_binary_adaptive_raw(
+    output_path: &str,
+    records: &[AlignmentRecord],
+    string_table: &StringTable,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+) -> io::Result<()> {
+    let output = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
+    let mut writer = BufWriter::new(output);
+
+    let header = BinaryPafHeader {
+        version: 1,
+        flags: CompressionStrategy::HuffmanRaw.to_code(),
+        num_records: records.len() as u64,
+        num_strings: string_table.len() as u64,
+    };
+
+    header.write(&mut writer)?;
+
+    // Write codecs
+    first_val_codec.write(&mut writer)?;
+    second_val_codec.write(&mut writer)?;
+
+    // Write records
+    for record in records {
+        write_record_adaptive_raw(&mut writer, record, first_val_codec, second_val_codec)?;
+    }
+
+    // Write string table
+    string_table.write(&mut writer)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write records with hybrid varint+Huffman compression
+///
+/// Pipeline: Delta/Raw → Varint → Byte-level Huffman → Zstd
+/// Format version 5 = varint-huffman hybrid
+fn write_binary_varint_huffman(
+    output_path: &str,
+    records: &[AlignmentRecord],
+    string_table: &StringTable,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+) -> io::Result<()> {
+    let output = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
+    let mut writer = BufWriter::new(output);
+
+    let header = BinaryPafHeader {
+        version: 1,
+        flags: CompressionStrategy::VarintHuffman.to_code(),
+        num_records: records.len() as u64,
+        num_strings: string_table.len() as u64,
+    };
+
+    header.write(&mut writer)?;
+
+    // Write codecs
+    first_val_codec.write(&mut writer)?;
+    second_val_codec.write(&mut writer)?;
+
+    // Write records
+    for record in records {
+        write_record_varint_huffman(&mut writer, record, first_val_codec, second_val_codec)?;
+    }
+
+    // Write string table
+    string_table.write(&mut writer)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write single record with varint+Huffman hybrid encoding
+fn write_record_varint_huffman<W: Write>(
+    writer: &mut W,
+    record: &AlignmentRecord,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+) -> io::Result<()> {
+    // Write core PAF fields
+    write_varint(writer, record.query_name_id)?;
+    write_varint(writer, record.query_start)?;
+    write_varint(writer, record.query_end)?;
+    writer.write_all(&[record.strand as u8])?;
+    write_varint(writer, record.target_name_id)?;
+    write_varint(writer, record.target_start)?;
+    write_varint(writer, record.target_end)?;
+    write_varint(writer, record.residue_matches)?;
+    write_varint(writer, record.alignment_block_len)?;
+    writer.write_all(&[record.mapping_quality])?;
+    writer.write_all(&[record.tp_type.to_u8()])?;
+    writer.write_all(&[complexity_metric_to_u8(&record.complexity_metric)])?;
+    write_varint(writer, record.max_complexity)?;
+
+    // Get tracepoints
+    let empty_vec = Vec::new();
+    let tracepoints = match &record.tracepoints {
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+        _ => &empty_vec,
+    };
+
+    write_varint(writer, tracepoints.len() as u64)?;
+
+    if !tracepoints.is_empty() {
+        // FastGA-aware delta encoding
+        let use_delta = !matches!(record.tp_type, TracepointType::Fastga);
+
+        // Encode first values: delta/raw → varint → bytes
+        let first_vals: Vec<u64> = tracepoints.iter().map(|&(v, _)| v).collect();
+        let first_vals_encoded: Vec<i64> = if use_delta {
+            delta_encode(&first_vals)
+        } else {
+            first_vals.iter().map(|&v| v as i64).collect()
+        };
+
+        // Varint encode to bytes
+        let mut first_val_bytes_buf = Vec::new();
+        for val in first_vals_encoded {
+            let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+            write_varint(&mut first_val_bytes_buf, zigzag)?;
+        }
+
+        // Apply byte-level Huffman on varint output
+        let mut first_val_writer = BitWriter::new();
+        for byte in first_val_bytes_buf {
+            let code = first_val_codec
+                .encode(byte as i64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            first_val_writer.write_bits(&code.bits);
+        }
+        let first_val_bytes = first_val_writer.finish();
+        let first_val_compressed = zstd::encode_all(&first_val_bytes[..], 3)?;
+        write_varint(writer, first_val_compressed.len() as u64)?;
+        writer.write_all(&first_val_compressed)?;
+
+        // Encode second values: raw → varint → bytes
+        let mut second_val_bytes_buf = Vec::new();
+        for &(_, val) in tracepoints {
+            write_varint(&mut second_val_bytes_buf, val)?;
+        }
+
+        // Apply byte-level Huffman on varint output
+        let mut second_val_writer = BitWriter::new();
+        for byte in second_val_bytes_buf {
+            let code = second_val_codec
+                .encode(byte as i64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            second_val_writer.write_bits(&code.bits);
+        }
+        let second_val_bytes = second_val_writer.finish();
+        let second_val_compressed = zstd::encode_all(&second_val_bytes[..], 3)?;
+        write_varint(writer, second_val_compressed.len() as u64)?;
+        writer.write_all(&second_val_compressed)?;
+    }
+
+    // Write tags
+    write_varint(writer, record.tags.len() as u64)?;
+    for tag in &record.tags {
+        tag.write(writer)?;
+    }
+
+    Ok(())
+}
+
+/// Write records with hybrid varint+Huffman compression (NO delta encoding)
+///
+/// Pipeline: Raw → Varint → Byte-level Huffman → Zstd
+/// Format version 6 = varint-huffman-raw hybrid
+fn write_binary_varint_huffman_raw(
+    output_path: &str,
+    records: &[AlignmentRecord],
+    string_table: &StringTable,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+) -> io::Result<()> {
+    let output = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
+    let mut writer = BufWriter::new(output);
+
+    let header = BinaryPafHeader {
+        version: 1,
+        flags: CompressionStrategy::VarintHuffmanRaw.to_code(),
+        num_records: records.len() as u64,
+        num_strings: string_table.len() as u64,
+    };
+
+    header.write(&mut writer)?;
+
+    // Write codecs
+    first_val_codec.write(&mut writer)?;
+    second_val_codec.write(&mut writer)?;
+
+    // Write records
+    for record in records {
+        write_record_varint_huffman_raw(&mut writer, record, first_val_codec, second_val_codec)?;
+    }
+
+    // Write string table
+    string_table.write(&mut writer)?;
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write single record with varint+Huffman hybrid encoding (NO delta)
+fn write_record_varint_huffman_raw<W: Write>(
+    writer: &mut W,
+    record: &AlignmentRecord,
+    first_val_codec: &AdaptiveCodec,
+    second_val_codec: &AdaptiveCodec,
+) -> io::Result<()> {
+    // Write core PAF fields
+    write_varint(writer, record.query_name_id)?;
+    write_varint(writer, record.query_start)?;
+    write_varint(writer, record.query_end)?;
+    writer.write_all(&[record.strand as u8])?;
+    write_varint(writer, record.target_name_id)?;
+    write_varint(writer, record.target_start)?;
+    write_varint(writer, record.target_end)?;
+    write_varint(writer, record.residue_matches)?;
+    write_varint(writer, record.alignment_block_len)?;
+    writer.write_all(&[record.mapping_quality])?;
+    writer.write_all(&[record.tp_type.to_u8()])?;
+    writer.write_all(&[complexity_metric_to_u8(&record.complexity_metric)])?;
+    write_varint(writer, record.max_complexity)?;
+
+    // Get tracepoints
+    let empty_vec = Vec::new();
+    let tracepoints = match &record.tracepoints {
+        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps,
+        _ => &empty_vec,
+    };
+
+    write_varint(writer, tracepoints.len() as u64)?;
+
+    if !tracepoints.is_empty() {
+        // Encode first values: raw → varint → bytes (NO delta)
+        let mut first_val_bytes_buf = Vec::new();
+        for &(val, _) in tracepoints {
+            write_varint(&mut first_val_bytes_buf, val)?;
+        }
+
+        // Apply byte-level Huffman on varint output
+        let mut first_val_writer = BitWriter::new();
+        for byte in first_val_bytes_buf {
+            let code = first_val_codec
+                .encode(byte as i64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            first_val_writer.write_bits(&code.bits);
+        }
+        let first_val_bytes = first_val_writer.finish();
+        let first_val_compressed = zstd::encode_all(&first_val_bytes[..], 3)?;
+        write_varint(writer, first_val_compressed.len() as u64)?;
+        writer.write_all(&first_val_compressed)?;
+
+        // Encode second values: raw → varint → bytes
+        let mut second_val_bytes_buf = Vec::new();
+        for &(_, val) in tracepoints {
+            write_varint(&mut second_val_bytes_buf, val)?;
+        }
+
+        // Apply byte-level Huffman on varint output
+        let mut second_val_writer = BitWriter::new();
+        for byte in second_val_bytes_buf {
+            let code = second_val_codec
+                .encode(byte as i64)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            second_val_writer.write_bits(&code.bits);
+        }
+        let second_val_bytes = second_val_writer.finish();
+        let second_val_compressed = zstd::encode_all(&second_val_bytes[..], 3)?;
+        write_varint(writer, second_val_compressed.len() as u64)?;
+        writer.write_all(&second_val_compressed)?;
+    }
+
+    // Write tags
+    write_varint(writer, record.tags.len() as u64)?;
+    for tag in &record.tags {
+        tag.write(writer)?;
+    }
+
     Ok(())
 }
 
 /// Write records to binary PAF format
 ///
-/// Uses delta encoding, varint, and zstd compression for efficient storage.
+/// Uses FastGA-aware delta encoding, varint, and zstd compression for efficient storage.
 fn write_binary(
     output_path: &str,
     records: &[AlignmentRecord],
     string_table: &StringTable,
 ) -> io::Result<()> {
-    let output = File::create(output_path)?;
+    let output = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
     let mut writer = BufWriter::new(output);
 
     let header = BinaryPafHeader {
         version: 1,
-        flags: FLAG_COMPRESSED,
+        flags: CompressionStrategy::Varint.to_code(),
         num_records: records.len() as u64,
         num_strings: string_table.len() as u64,
     };
@@ -721,6 +3102,37 @@ fn write_binary(
     header.write(&mut writer)?;
     for record in records {
         record.write(&mut writer)?;
+    }
+    string_table.write(&mut writer)?;
+    Ok(())
+}
+
+/// Write records to binary PAF format (NO delta encoding)
+///
+/// Uses raw values, varint, and zstd compression.
+fn write_binary_raw(
+    output_path: &str,
+    records: &[AlignmentRecord],
+    string_table: &StringTable,
+) -> io::Result<()> {
+    let output = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
+    let mut writer = BufWriter::new(output);
+
+    let header = BinaryPafHeader {
+        version: 1,
+        flags: CompressionStrategy::VarintRaw.to_code(),
+        num_records: records.len() as u64,
+        num_strings: string_table.len() as u64,
+    };
+
+    header.write(&mut writer)?;
+    for record in records {
+        record.write_raw(&mut writer)?;
     }
     string_table.write(&mut writer)?;
     Ok(())
@@ -734,7 +3146,12 @@ fn write_paf_output(
     let output: Box<dyn Write> = if output_path == "-" {
         Box::new(io::stdout())
     } else {
-        Box::new(File::create(output_path)?)
+        Box::new(File::create(output_path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to create output file '{}': {}", output_path, e),
+            )
+        })?)
     };
     let mut writer = BufWriter::new(output);
 
@@ -1215,18 +3632,27 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
 
     let mut offsets = Vec::with_capacity(header.num_records as usize);
 
+    // Skip codecs if adaptive format
+    let strategy = CompressionStrategy::from_code(header.flags)?;
+    if strategy.requires_codecs() {
+        // Skip position codec
+        AdaptiveCodec::read(&mut file)?;
+        // Skip score codec
+        AdaptiveCodec::read(&mut file)?;
+    }
+
     // Record offset of each record
     for _ in 0..header.num_records {
         offsets.push(file.stream_position()?);
-        skip_record(&mut file)?;
+        skip_record(&mut file, strategy.requires_codecs())?;
     }
 
-    debug!("Index built: {} records", offsets.len());
+    info!("Index built: {} records", offsets.len());
     Ok(BpafIndex { offsets })
 }
 
 /// Skip a record without parsing (for building index)
-fn skip_record<R: Read + Seek>(reader: &mut R) -> io::Result<()> {
+fn skip_record<R: Read + Seek>(reader: &mut R, _is_adaptive: bool) -> io::Result<()> {
     // Skip core PAF fields (varints)
     read_varint(reader)?; // query_name_id
     read_varint(reader)?; // query_start
@@ -1285,6 +3711,9 @@ pub struct BpafReader {
     index: BpafIndex,
     header: BinaryPafHeader,
     string_table: StringTable,
+    // Adaptive format codecs (if applicable)
+    first_val_codec: Option<AdaptiveCodec>,
+    second_val_codec: Option<AdaptiveCodec>,
 }
 
 impl BpafReader {
@@ -1308,6 +3737,16 @@ impl BpafReader {
         let mut file = File::open(bpaf_path)?;
         let header = BinaryPafHeader::read(&mut file)?;
 
+        // Load codecs if strategy requires them
+        let strategy = CompressionStrategy::from_code(header.flags)?;
+        let (first_val_codec, second_val_codec) = if strategy.requires_codecs() {
+            let pos = AdaptiveCodec::read(&mut file)?;
+            let score = AdaptiveCodec::read(&mut file)?;
+            (Some(pos), Some(score))
+        } else {
+            (None, None)
+        };
+
         // Lazy-load string table only when needed (expensive for large files)
         let string_table = StringTable::new();
 
@@ -1316,6 +3755,8 @@ impl BpafReader {
             index,
             header,
             string_table,
+            first_val_codec,
+            second_val_codec,
         })
     }
 
@@ -1331,6 +3772,16 @@ impl BpafReader {
         let mut file = File::open(bpaf_path)?;
         let header = BinaryPafHeader::read(&mut file)?;
 
+        // Load codecs if strategy requires them
+        let strategy = CompressionStrategy::from_code(header.flags)?;
+        let (first_val_codec, second_val_codec) = if strategy.requires_codecs() {
+            let pos = AdaptiveCodec::read(&mut file)?;
+            let score = AdaptiveCodec::read(&mut file)?;
+            (Some(pos), Some(score))
+        } else {
+            (None, None)
+        };
+
         // Empty index - not used for offset-based access
         let index = BpafIndex {
             offsets: Vec::new(),
@@ -1342,6 +3793,8 @@ impl BpafReader {
             index,
             header,
             string_table,
+            first_val_codec,
+            second_val_codec,
         })
     }
 
@@ -1356,7 +3809,7 @@ impl BpafReader {
             self.file.seek(SeekFrom::Start(
                 self.index.offsets[self.index.offsets.len() - 1],
             ))?;
-            skip_record(&mut self.file)?;
+            skip_record(&mut self.file, self.header.flags & FLAG_ADAPTIVE != 0)?;
         }
 
         self.string_table = StringTable::read(&mut self.file)?;
@@ -1411,13 +3864,48 @@ impl BpafReader {
     /// Get alignment record by file offset (for impg compatibility)
     pub fn get_alignment_record_at_offset(&mut self, offset: u64) -> io::Result<AlignmentRecord> {
         self.file.seek(SeekFrom::Start(offset))?;
-        AlignmentRecord::read(&mut self.file)
+
+        let strategy = CompressionStrategy::from_code(self.header.flags)?;
+        match strategy {
+            CompressionStrategy::Varint => AlignmentRecord::read(&mut self.file),
+            CompressionStrategy::VarintRaw => read_record_varint(&mut self.file, false),
+            CompressionStrategy::Huffman => read_record_huffman(
+                &mut self.file,
+                self.first_val_codec.as_ref().unwrap(),
+                self.second_val_codec.as_ref().unwrap(),
+                true,
+            ),
+            CompressionStrategy::HuffmanRaw => read_record_huffman(
+                &mut self.file,
+                self.first_val_codec.as_ref().unwrap(),
+                self.second_val_codec.as_ref().unwrap(),
+                false,
+            ),
+            CompressionStrategy::VarintHuffman => read_record_varint_huffman(
+                &mut self.file,
+                self.first_val_codec.as_ref().unwrap(),
+                self.second_val_codec.as_ref().unwrap(),
+                true,
+            ),
+            CompressionStrategy::VarintHuffmanRaw => read_record_varint_huffman(
+                &mut self.file,
+                self.first_val_codec.as_ref().unwrap(),
+                self.second_val_codec.as_ref().unwrap(),
+                false,
+            ),
+            CompressionStrategy::Smart => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Smart strategy should not be stored in file",
+            )),
+        }
     }
 
     /// Get tracepoints only (optimized) - O(1) random access by record ID
     /// Returns: (tracepoints, tp_type, complexity_metric, max_complexity)
     ///
-    /// Optimized for tracepoint-only access - skips unnecessary fields
+    /// Optimized for tracepoint-only access:
+    /// - Default compression: skips unnecessary fields
+    /// - Adaptive compression: reads full record but avoids field extraction overhead
     pub fn get_tracepoints(
         &mut self,
         record_id: u64,
@@ -1447,34 +3935,72 @@ impl BpafReader {
     ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
         self.file.seek(SeekFrom::Start(offset))?;
 
-        // Skip fields we don't need
-        read_varint(&mut self.file)?; // query_name_id - SKIP
-        read_varint(&mut self.file)?; // query_start - SKIP
-        read_varint(&mut self.file)?; // query_end - SKIP
-        self.file.seek(SeekFrom::Current(1))?; // strand - SKIP
-        read_varint(&mut self.file)?; // target_name_id - SKIP
-        read_varint(&mut self.file)?; // target_start - SKIP
-        read_varint(&mut self.file)?; // target_end - SKIP
-        read_varint(&mut self.file)?; // residue_matches - SKIP
-        read_varint(&mut self.file)?; // alignment_block_len - SKIP
-        self.file.seek(SeekFrom::Current(1))?; // mapping_quality - SKIP
+        let strategy = CompressionStrategy::from_code(self.header.flags)?;
+        if strategy.requires_codecs() {
+            // Codec-based strategies - must read full record
+            let record = match strategy {
+                CompressionStrategy::Huffman => read_record_huffman(
+                    &mut self.file,
+                    self.first_val_codec.as_ref().unwrap(),
+                    self.second_val_codec.as_ref().unwrap(),
+                    true,
+                ),
+                CompressionStrategy::HuffmanRaw => read_record_huffman(
+                    &mut self.file,
+                    self.first_val_codec.as_ref().unwrap(),
+                    self.second_val_codec.as_ref().unwrap(),
+                    false,
+                ),
+                CompressionStrategy::VarintHuffman => read_record_varint_huffman(
+                    &mut self.file,
+                    self.first_val_codec.as_ref().unwrap(),
+                    self.second_val_codec.as_ref().unwrap(),
+                    true,
+                ),
+                CompressionStrategy::VarintHuffmanRaw => read_record_varint_huffman(
+                    &mut self.file,
+                    self.first_val_codec.as_ref().unwrap(),
+                    self.second_val_codec.as_ref().unwrap(),
+                    false,
+                ),
+                _ => unreachable!("Strategy should require codecs"),
+            }?;
+            Ok((
+                record.tracepoints,
+                record.tp_type,
+                record.complexity_metric,
+                record.max_complexity,
+            ))
+        } else {
+            // Varint-only strategies - can skip fields
+            read_varint(&mut self.file)?; // query_name_id - SKIP
+            read_varint(&mut self.file)?; // query_start - SKIP
+            read_varint(&mut self.file)?; // query_end - SKIP
+            self.file.seek(SeekFrom::Current(1))?; // strand - SKIP
+            read_varint(&mut self.file)?; // target_name_id - SKIP
+            read_varint(&mut self.file)?; // target_start - SKIP
+            read_varint(&mut self.file)?; // target_end - SKIP
+            read_varint(&mut self.file)?; // residue_matches - SKIP
+            read_varint(&mut self.file)?; // alignment_block_len - SKIP
+            self.file.seek(SeekFrom::Current(1))?; // mapping_quality - SKIP
 
-        // Read only what we need
-        let mut tp_type_buf = [0u8; 1];
-        self.file.read_exact(&mut tp_type_buf)?;
-        let tp_type = TracepointType::from_u8(tp_type_buf[0])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            // Read only what we need
+            let mut tp_type_buf = [0u8; 1];
+            self.file.read_exact(&mut tp_type_buf)?;
+            let tp_type = TracepointType::from_u8(tp_type_buf[0])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let mut metric_buf = [0u8; 1];
-        self.file.read_exact(&mut metric_buf)?;
-        let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
+            let mut metric_buf = [0u8; 1];
+            self.file.read_exact(&mut metric_buf)?;
+            let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
 
-        let max_complexity = read_varint(&mut self.file)?;
+            let max_complexity = read_varint(&mut self.file)?;
 
-        // Read tracepoints
-        let tracepoints = AlignmentRecord::read_tracepoints(&mut self.file, tp_type)?;
+            // Read tracepoints
+            let tracepoints = AlignmentRecord::read_tracepoints(&mut self.file, tp_type)?;
 
-        Ok((tracepoints, tp_type, complexity_metric, max_complexity))
+            Ok((tracepoints, tp_type, complexity_metric, max_complexity))
+        }
     }
 
     /// Iterator over all records (sequential access)
