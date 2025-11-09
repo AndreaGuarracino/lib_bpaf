@@ -826,7 +826,7 @@ fn parse_paf_with_cigar(
         }
         TracepointType::Mixed => {
             let tps = cigar_to_mixed_tracepoints(cigar, max_complexity, *complexity_metric);
-            TracepointData::Mixed(tps.iter().map(|item| MixedTracepointItem::from(item)).collect())
+            TracepointData::Mixed(tps.iter().map(MixedTracepointItem::from).collect())
         }
         TracepointType::Variable => {
             let tps = cigar_to_variable_tracepoints(cigar, max_complexity, *complexity_metric);
