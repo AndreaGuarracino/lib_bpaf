@@ -4,7 +4,7 @@ Efficient binary storage and random access for genomic sequence alignments with 
 
 ## Features
 
-- **Fast compression**: Delta encoding + varint + zstd (6x compression ratio, ~1min for 4GB)
+- **Fast compression**: Delta encoding + varint + zstd
 - **O(1) random access**: External index for instant record lookup
 - **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
 - **String deduplication**: Shared sequence name table
