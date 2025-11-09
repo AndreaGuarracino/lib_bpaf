@@ -34,28 +34,6 @@ pub enum CompressionStrategy {
     /// No delta encoding + Varint + Zstd level 3
     /// - All types: raw first values (test if delta hurts compression)
     VarintRaw,
-    /// Delta (FastGA-aware) + Huffman + Zstd
-    /// - FastGA: raw num_differences (exploits natural skew)
-    /// - Standard: delta-encoded query_bases
-    Huffman,
-    /// No delta encoding + Huffman + Zstd
-    /// - All types: raw first values (maximum entropy coding)
-    HuffmanRaw,
-    /// Hybrid: Delta + Varint + Byte-Huffman + Zstd
-    /// - Encodes integers with varint (produces bytes)
-    /// - Then applies Huffman on byte distribution
-    /// - Tests if byte-level Huffman helps Zstd
-    VarintHuffman,
-    /// Hybrid: Raw + Varint + Byte-Huffman + Zstd
-    /// - No delta, varint on raw values
-    /// - Then byte-level Huffman
-    VarintHuffmanRaw,
-    /// Analyze data distribution and auto-select best strategy
-    /// - Measures top 3 symbol coverage
-    /// - High skew (>60%): Huffman
-    /// - Flat distribution: Varint
-    /// - Compares delta vs raw for Huffman decision
-    Smart,
 }
 
 impl CompressionStrategy {
@@ -64,18 +42,16 @@ impl CompressionStrategy {
         match s.to_lowercase().as_str() {
             "varint" => Ok(CompressionStrategy::Varint),
             "varint-raw" => Ok(CompressionStrategy::VarintRaw),
-            "huffman" => Ok(CompressionStrategy::Huffman),
-            "huffman-raw" => Ok(CompressionStrategy::HuffmanRaw),
-            "varint-huffman" => Ok(CompressionStrategy::VarintHuffman),
-            "varint-huffman-raw" => Ok(CompressionStrategy::VarintHuffmanRaw),
-            "smart" => Ok(CompressionStrategy::Smart),
-            _ => Err(format!("Unknown compression strategy: {}", s)),
+            _ => Err(format!(
+                "Unsupported compression strategy '{}'. Only 'varint' and 'varint-raw' are supported.",
+                s
+            )),
         }
     }
 
     /// Get all available strategies
     pub fn variants() -> &'static [&'static str] {
-        &["varint", "varint-raw", "huffman", "huffman-raw", "varint-huffman", "varint-huffman-raw", "smart"]
+        &["varint", "varint-raw"]
     }
 
     /// Convert to strategy code for file header
@@ -83,11 +59,6 @@ impl CompressionStrategy {
         match self {
             CompressionStrategy::Varint => 0,
             CompressionStrategy::VarintRaw => 1,
-            CompressionStrategy::Huffman => 2,
-            CompressionStrategy::HuffmanRaw => 3,
-            CompressionStrategy::VarintHuffman => 4,
-            CompressionStrategy::VarintHuffmanRaw => 5,
-            CompressionStrategy::Smart => unreachable!("Smart strategy should be resolved before writing"),
         }
     }
 
@@ -96,22 +67,14 @@ impl CompressionStrategy {
         match code {
             0 => Ok(CompressionStrategy::Varint),
             1 => Ok(CompressionStrategy::VarintRaw),
-            2 => Ok(CompressionStrategy::Huffman),
-            3 => Ok(CompressionStrategy::HuffmanRaw),
-            4 => Ok(CompressionStrategy::VarintHuffman),
-            5 => Ok(CompressionStrategy::VarintHuffmanRaw),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("Unknown strategy code: {}", code))),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "Unsupported compression strategy code: {}. This file may have been compressed with an unsupported strategy (huffman, smart, etc). Only varint (0) and varint-raw (1) are supported.",
+                    code
+                ),
+            )),
         }
-    }
-
-
-    /// Check if strategy uses delta encoding
-    fn uses_delta(&self) -> bool {
-        matches!(self,
-            CompressionStrategy::Varint |
-            CompressionStrategy::Huffman |
-            CompressionStrategy::VarintHuffman
-        )
     }
 }
 
@@ -120,11 +83,6 @@ impl std::fmt::Display for CompressionStrategy {
         match self {
             CompressionStrategy::Varint => write!(f, "varint"),
             CompressionStrategy::VarintRaw => write!(f, "varint-raw"),
-            CompressionStrategy::Huffman => write!(f, "huffman"),
-            CompressionStrategy::HuffmanRaw => write!(f, "huffman-raw"),
-            CompressionStrategy::VarintHuffman => write!(f, "varint-huffman"),
-            CompressionStrategy::VarintHuffmanRaw => write!(f, "varint-huffman-raw"),
-            CompressionStrategy::Smart => write!(f, "smart"),
         }
     }
 }
@@ -186,8 +144,6 @@ fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
 // ============================================================================
 
 const BINARY_MAGIC: &[u8; 4] = b"BPAF";
-const FLAG_COMPRESSED: u8 = 0x01;
-const FLAG_ADAPTIVE: u8 = 0x02;
 
 /// Binary PAF header
 #[derive(Debug)]
@@ -384,7 +340,7 @@ fn delta_decode(deltas: &[i64]) -> Vec<u64> {
 }
 
 impl AlignmentRecord {
-    fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    fn write<W: Write>(&self, writer: &mut W, use_delta: bool) -> io::Result<()> {
         write_varint(writer, self.query_name_id)?;
         write_varint(writer, self.query_start)?;
         write_varint(writer, self.query_end)?;
@@ -398,29 +354,11 @@ impl AlignmentRecord {
         writer.write_all(&[self.tp_type.to_u8()])?;
         writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
         write_varint(writer, self.max_complexity)?;
-        self.write_tracepoints(writer)?;
-        write_varint(writer, self.tags.len() as u64)?;
-        for tag in &self.tags {
-            tag.write(writer)?;
+        if use_delta {
+            self.write_tracepoints(writer)?;
+        } else {
+            self.write_tracepoints_raw(writer)?;
         }
-        Ok(())
-    }
-
-    fn write_raw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        write_varint(writer, self.query_name_id)?;
-        write_varint(writer, self.query_start)?;
-        write_varint(writer, self.query_end)?;
-        writer.write_all(&[self.strand as u8])?;
-        write_varint(writer, self.target_name_id)?;
-        write_varint(writer, self.target_start)?;
-        write_varint(writer, self.target_end)?;
-        write_varint(writer, self.residue_matches)?;
-        write_varint(writer, self.alignment_block_len)?;
-        writer.write_all(&[self.mapping_quality])?;
-        writer.write_all(&[self.tp_type.to_u8()])?;
-        writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
-        write_varint(writer, self.max_complexity)?;
-        self.write_tracepoints_raw(writer)?;
         write_varint(writer, self.tags.len() as u64)?;
         for tag in &self.tags {
             tag.write(writer)?;
@@ -844,20 +782,7 @@ pub fn encode_cigar_to_binary(
         }
     }
 
-    match strategy {
-        CompressionStrategy::Varint => {
-            write_binary(output_path, &records, &string_table)?;
-        }
-        CompressionStrategy::VarintRaw => {
-            write_binary_raw(output_path, &records, &string_table)?;
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Unsupported compression strategy: {}. Only Varint and VarintRaw are supported.", strategy),
-            ));
-        }
-    }
+    write_binary(output_path, &records, &string_table, strategy)?;
 
     info!(
         "Encoded {} records ({} unique names) with {} strategy",
@@ -895,42 +820,24 @@ pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
         header.num_records, header.num_strings, strategy
     );
 
-    match strategy {
-        CompressionStrategy::Varint => decompress_varint(reader, output_path, &header),
-        CompressionStrategy::VarintRaw => decompress_varint_raw(reader, output_path, &header),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("Unsupported compression strategy: {}. Only Varint and VarintRaw are supported.", strategy),
-        )),
-    }
+    let use_delta = matches!(strategy, CompressionStrategy::Varint);
+    decompress_varint(reader, output_path, &header, use_delta)
 }
 
-// Version 1: Varint with FastGA-aware delta encoding
+/// Decompress varint-encoded records
 fn decompress_varint<R: Read>(
     mut reader: R,
     output_path: &str,
     header: &BinaryPafHeader,
+    use_delta: bool,
 ) -> io::Result<()> {
     let mut records = Vec::with_capacity(header.num_records as usize);
     for _ in 0..header.num_records {
-        records.push(AlignmentRecord::read(&mut reader)?);
-    }
-    let string_table = StringTable::read(&mut reader)?;
-    write_paf_output(output_path, &records, &string_table)?;
-    info!("Decompressed {} records", header.num_records);
-    Ok(())
-}
-
-
-// Version 4: Varint without delta encoding
-fn decompress_varint_raw<R: Read>(
-    mut reader: R,
-    output_path: &str,
-    header: &BinaryPafHeader,
-) -> io::Result<()> {
-    let mut records = Vec::with_capacity(header.num_records as usize);
-    for _ in 0..header.num_records {
-        records.push(read_record_varint(&mut reader, false)?);
+        if use_delta {
+            records.push(AlignmentRecord::read(&mut reader)?);
+        } else {
+            records.push(read_record_varint(&mut reader, false)?);
+        }
     }
     let string_table = StringTable::read(&mut reader)?;
     write_paf_output(output_path, &records, &string_table)?;
@@ -1067,20 +974,7 @@ pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionSt
         }
     }
 
-    match strategy {
-        CompressionStrategy::Varint => {
-            write_binary(output_path, &records, &string_table)?;
-        }
-        CompressionStrategy::VarintRaw => {
-            write_binary_raw(output_path, &records, &string_table)?;
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Unsupported compression strategy: {}. Only Varint and VarintRaw are supported.", strategy),
-            ));
-        }
-    }
+    write_binary(output_path, &records, &string_table, strategy)?;
 
     info!(
         "Compressed {} records ({} unique names) with {} strategy",
@@ -1091,12 +985,12 @@ pub fn compress_paf(input_path: &str, output_path: &str, strategy: CompressionSt
     Ok(())
 }
 
-///
-/// Uses FastGA-aware delta encoding, varint, and zstd compression for efficient storage.
+/// Write records to binary PAF format
 fn write_binary(
     output_path: &str,
     records: &[AlignmentRecord],
     string_table: &StringTable,
+    strategy: CompressionStrategy,
 ) -> io::Result<()> {
     let output = File::create(output_path).map_err(|e| {
         io::Error::new(
@@ -1108,45 +1002,15 @@ fn write_binary(
 
     let header = BinaryPafHeader {
         version: 1,
-        flags: CompressionStrategy::Varint.to_code(),
+        flags: strategy.to_code(),
         num_records: records.len() as u64,
         num_strings: string_table.len() as u64,
     };
 
+    let use_delta = matches!(strategy, CompressionStrategy::Varint);
     header.write(&mut writer)?;
     for record in records {
-        record.write(&mut writer)?;
-    }
-    string_table.write(&mut writer)?;
-    Ok(())
-}
-
-/// Write records to binary PAF format (NO delta encoding)
-///
-/// Uses raw values, varint, and zstd compression.
-fn write_binary_raw(
-    output_path: &str,
-    records: &[AlignmentRecord],
-    string_table: &StringTable,
-) -> io::Result<()> {
-    let output = File::create(output_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("Failed to create output file '{}': {}", output_path, e),
-        )
-    })?;
-    let mut writer = BufWriter::new(output);
-
-    let header = BinaryPafHeader {
-        version: 1,
-        flags: CompressionStrategy::VarintRaw.to_code(),
-        num_records: records.len() as u64,
-        num_strings: string_table.len() as u64,
-    };
-
-    header.write(&mut writer)?;
-    for record in records {
-        record.write_raw(&mut writer)?;
+        record.write(&mut writer, use_delta)?;
     }
     string_table.write(&mut writer)?;
     Ok(())
@@ -1790,7 +1654,7 @@ impl BpafReader {
             self.file.seek(SeekFrom::Start(
                 self.index.offsets[self.index.offsets.len() - 1],
             ))?;
-            skip_record(&mut self.file, self.header.flags & FLAG_ADAPTIVE != 0)?;
+            skip_record(&mut self.file, false)?;
         }
 
         self.string_table = StringTable::read(&mut self.file)?;
@@ -1850,10 +1714,6 @@ impl BpafReader {
         match strategy {
             CompressionStrategy::Varint => AlignmentRecord::read(&mut self.file),
             CompressionStrategy::VarintRaw => read_record_varint(&mut self.file, false),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Unsupported compression strategy: {}. Only Varint and VarintRaw are supported.", strategy),
-            )),
         }
     }
 
