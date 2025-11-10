@@ -27,53 +27,89 @@ use std::path::Path;
 /// Compression strategy for binary PAF format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionStrategy {
-    /// Delta (FastGA-aware) + Varint + Zstd level 3
-    /// - FastGA: raw num_differences values (naturally small)
-    /// - Standard: delta-encoded query_bases
-    Varint,
-    /// No delta encoding + Varint + Zstd level 3
-    /// - All types: raw first values (test if delta hurts compression)
-    VarintRaw,
+    /// Automatic encoding decision + Zstd
+    /// - Analyze first 1000 records to decide delta vs raw encoding
+    /// - Configurable compression level (max 22, default: 3)
+    Automatic(i32),
+    /// Raw encoding (no delta) + Varint + Zstd
+    /// - No delta encoding, stores absolute values
+    /// - Configurable compression level (max 22, default: 3)
+    VarintZstd(i32),
+    /// Delta encoding + Varint + Zstd
+    /// - Always uses delta encoding for tracepoints
+    /// - Works well when values are naturally small or monotonic
+    /// - Configurable compression level (max 22, default: 3)
+    DeltaVarintZstd(i32),
 }
 
 impl CompressionStrategy {
-    /// Parse strategy from string
+    /// Parse strategy from string (format: "strategy" or "strategy,level")
     pub fn from_str(s: &str) -> Result<Self, String> {
-        match s.to_lowercase().as_str() {
-            "varint" => Ok(CompressionStrategy::Varint),
-            "varint-raw" => Ok(CompressionStrategy::VarintRaw),
+        let parts: Vec<&str> = s.split(',').collect();
+        let strategy_name = parts[0].to_lowercase();
+        let compression_level = if parts.len() > 1 {
+            parts[1].trim().parse::<i32>().map_err(|_| {
+                format!("Invalid compression level '{}'. Must be a number between 1 and 22.", parts[1])
+            })?
+        } else {
+            3 // Default compression level
+        };
+
+        // Validate compression level range
+        if compression_level < 1 || compression_level > 22 {
+            return Err(format!(
+                "Compression level {} is out of range. Must be between 1 and 22.",
+                compression_level
+            ));
+        }
+
+        match strategy_name.as_str() {
+            "automatic" => Ok(CompressionStrategy::Automatic(compression_level)),
+            "varint-zstd" => Ok(CompressionStrategy::VarintZstd(compression_level)),
+            "delta-varint-zstd" => Ok(CompressionStrategy::DeltaVarintZstd(compression_level)),
             _ => Err(format!(
-                "Unsupported compression strategy '{}'. Only 'varint' and 'varint-raw' are supported.",
-                s
+                "Unsupported compression strategy '{}'. Supported: 'automatic', 'varint-zstd', 'delta-varint-zstd'.",
+                strategy_name
             )),
         }
     }
 
     /// Get all available strategies
     pub fn variants() -> &'static [&'static str] {
-        &["varint", "varint-raw"]
+        &["automatic", "varint-zstd", "delta-varint-zstd"]
     }
 
     /// Convert to strategy code for file header
     fn to_code(&self) -> u8 {
         match self {
-            CompressionStrategy::Varint => 0,
-            CompressionStrategy::VarintRaw => 1,
+            CompressionStrategy::Automatic(_) => 0,
+            CompressionStrategy::VarintZstd(_) => 1,
+            CompressionStrategy::DeltaVarintZstd(_) => 2,
         }
     }
 
     /// Parse from strategy code
     fn from_code(code: u8) -> io::Result<Self> {
         match code {
-            0 => Ok(CompressionStrategy::Varint),
-            1 => Ok(CompressionStrategy::VarintRaw),
+            0 => Ok(CompressionStrategy::Automatic(3)),
+            1 => Ok(CompressionStrategy::VarintZstd(3)),
+            2 => Ok(CompressionStrategy::DeltaVarintZstd(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
-                    "Unsupported compression strategy code: {}. This file may have been compressed with an unsupported strategy (huffman, smart, etc). Only varint (0) and varint-raw (1) are supported.",
+                    "Unsupported compression strategy code: {}. Supported codes: 0=automatic, 1=varint-zstd, 2=delta-varint-zstd.",
                     code
                 ),
             )),
+        }
+    }
+
+    /// Get zstd compression level for this strategy
+    pub fn zstd_level(&self) -> i32 {
+        match self {
+            CompressionStrategy::Automatic(level) => *level,
+            CompressionStrategy::VarintZstd(level) => *level,
+            CompressionStrategy::DeltaVarintZstd(level) => *level,
         }
     }
 }
@@ -81,8 +117,27 @@ impl CompressionStrategy {
 impl std::fmt::Display for CompressionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CompressionStrategy::Varint => write!(f, "varint"),
-            CompressionStrategy::VarintRaw => write!(f, "varint-raw"),
+            CompressionStrategy::Automatic(level) => {
+                if *level == 3 {
+                    write!(f, "automatic")
+                } else {
+                    write!(f, "automatic,{}", level)
+                }
+            }
+            CompressionStrategy::VarintZstd(level) => {
+                if *level == 3 {
+                    write!(f, "varint-zstd")
+                } else {
+                    write!(f, "varint-zstd,{}", level)
+                }
+            }
+            CompressionStrategy::DeltaVarintZstd(level) => {
+                if *level == 3 {
+                    write!(f, "delta-varint-zstd")
+                } else {
+                    write!(f, "delta-varint-zstd,{}", level)
+                }
+            }
         }
     }
 }
@@ -155,6 +210,46 @@ pub struct BinaryPafHeader {
 }
 
 impl BinaryPafHeader {
+    /// Create header with strategy and optional automatic encoding flags
+    fn new(
+        num_records: u64,
+        num_strings: u64,
+        strategy: CompressionStrategy,
+        use_delta_first: bool,
+        use_delta_second: bool,
+    ) -> Self {
+        let mut flags = strategy.to_code() & 0x07; // Strategy in bits 0-2
+        if matches!(strategy, CompressionStrategy::Automatic(_)) {
+            if use_delta_first {
+                flags |= 0x08; // Bit 3
+            }
+            if use_delta_second {
+                flags |= 0x10; // Bit 4
+            }
+        }
+        Self {
+            version: 1,
+            flags,
+            num_records,
+            num_strings,
+        }
+    }
+
+    /// Get compression strategy from flags
+    fn strategy(&self) -> io::Result<CompressionStrategy> {
+        CompressionStrategy::from_code(self.flags & 0x07)
+    }
+
+    /// Get delta encoding flag for first values (Automatic mode only)
+    fn use_delta_first(&self) -> bool {
+        (self.flags & 0x08) != 0
+    }
+
+    /// Get delta encoding flag for second values (Automatic mode only)
+    fn use_delta_second(&self) -> bool {
+        (self.flags & 0x10) != 0
+    }
+
     fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(BINARY_MAGIC)?;
         writer.write_all(&[self.version, self.flags])?;
@@ -339,8 +434,96 @@ fn delta_decode(deltas: &[i64]) -> Vec<u64> {
     values
 }
 
+/// Lightweight heuristic analysis - samples records and uses statistics
+/// Returns (use_delta_first, use_delta_second)
+fn analyze_smart_light_compression(records: &[AlignmentRecord]) -> (bool, bool) {
+    const SAMPLE_SIZE: usize = 1000;
+
+    let mut all_first_vals = Vec::new();
+    let mut all_second_vals = Vec::new();
+
+    // Sample first N records (or all if fewer)
+    let sample_count = records.len().min(SAMPLE_SIZE);
+    for record in records.iter().take(sample_count) {
+        if let TracepointData::Standard(tps) | TracepointData::Fastga(tps) = &record.tracepoints {
+            for (first, second) in tps {
+                all_first_vals.push(*first);
+                all_second_vals.push(*second);
+            }
+        }
+    }
+
+    if all_first_vals.is_empty() {
+        return (false, false);
+    }
+
+    // Analyze first_values
+    let use_delta_first = should_use_delta(&all_first_vals);
+    let use_delta_second = should_use_delta(&all_second_vals);
+
+    info!(
+        "Automatic analysis: sampled {} records, {} tracepoints - first_values: use_delta={}, second_values: use_delta={}",
+        sample_count,
+        all_first_vals.len(),
+        use_delta_first,
+        use_delta_second
+    );
+
+    (use_delta_first, use_delta_second)
+}
+
+/// Heuristic to decide if delta encoding is beneficial
+fn should_use_delta(values: &[u64]) -> bool {
+    if values.len() < 2 {
+        return false;
+    }
+
+    // Check monotonicity and delta statistics
+    let mut monotonic = true;
+    let mut total_delta: u64 = 0;
+    let mut max_delta: i64 = 0;
+    let mut negative_count = 0;
+
+    for i in 1..values.len() {
+        let delta = values[i] as i64 - values[i - 1] as i64;
+
+        if delta < 0 {
+            monotonic = false;
+            negative_count += 1;
+        }
+
+        total_delta += delta.abs() as u64;
+        max_delta = max_delta.max(delta.abs());
+    }
+
+    // Average delta magnitude
+    let avg_delta = total_delta / (values.len() - 1) as u64;
+
+    // Average raw value
+    let avg_value = values.iter().sum::<u64>() / values.len() as u64;
+
+    // Heuristic: Use delta if:
+    // 1. Values are mostly monotonic (< 10% negative deltas)
+    // 2. Average delta is significantly smaller than average value (< 50%)
+    // 3. Max delta is not too large (< 10x average)
+
+    let negative_ratio = negative_count as f64 / (values.len() - 1) as f64;
+    let delta_ratio = avg_delta as f64 / avg_value.max(1) as f64;
+    let max_delta_ratio = max_delta as f64 / avg_delta.max(1) as f64;
+
+    let use_delta = monotonic
+        || (negative_ratio < 0.1 && delta_ratio < 0.5 && max_delta_ratio < 10.0);
+
+    debug!(
+        "Delta heuristic: mono={}, neg_ratio={:.2}, delta_ratio={:.2}, max_ratio={:.2} -> {}",
+        monotonic, negative_ratio, delta_ratio, max_delta_ratio, use_delta
+    );
+
+    use_delta
+}
+
 impl AlignmentRecord {
-    fn write<W: Write>(&self, writer: &mut W, use_delta: bool) -> io::Result<()> {
+    fn write<W: Write>(&self, writer: &mut W, use_delta: bool, strategy: CompressionStrategy) -> io::Result<()> {
         write_varint(writer, self.query_name_id)?;
         write_varint(writer, self.query_start)?;
         write_varint(writer, self.query_end)?;
@@ -355,9 +538,9 @@ impl AlignmentRecord {
         writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
         write_varint(writer, self.max_complexity)?;
         if use_delta {
-            self.write_tracepoints(writer)?;
+            self.write_tracepoints(writer, strategy)?;
         } else {
-            self.write_tracepoints_raw(writer)?;
+            self.write_tracepoints_raw(writer, strategy)?;
         }
         write_varint(writer, self.tags.len() as u64)?;
         for tag in &self.tags {
@@ -366,7 +549,35 @@ impl AlignmentRecord {
         Ok(())
     }
 
-    fn write_tracepoints<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    fn write_automatic<W: Write>(
+        &self,
+        writer: &mut W,
+        use_delta_first: bool,
+        use_delta_second: bool,
+        strategy: CompressionStrategy,
+    ) -> io::Result<()> {
+        write_varint(writer, self.query_name_id)?;
+        write_varint(writer, self.query_start)?;
+        write_varint(writer, self.query_end)?;
+        writer.write_all(&[self.strand as u8])?;
+        write_varint(writer, self.target_name_id)?;
+        write_varint(writer, self.target_start)?;
+        write_varint(writer, self.target_end)?;
+        write_varint(writer, self.residue_matches)?;
+        write_varint(writer, self.alignment_block_len)?;
+        writer.write_all(&[self.mapping_quality])?;
+        writer.write_all(&[self.tp_type.to_u8()])?;
+        writer.write_all(&[complexity_metric_to_u8(&self.complexity_metric)])?;
+        write_varint(writer, self.max_complexity)?;
+        self.write_tracepoints_automatic(writer, use_delta_first, use_delta_second, strategy)?;
+        write_varint(writer, self.tags.len() as u64)?;
+        for tag in &self.tags {
+            tag.write(writer)?;
+        }
+        Ok(())
+    }
+
+    fn write_tracepoints<W: Write>(&self, writer: &mut W, strategy: CompressionStrategy) -> io::Result<()> {
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 write_varint(writer, tps.len() as u64)?;
@@ -375,7 +586,7 @@ impl AlignmentRecord {
                 }
                 let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
 
-                // FastGA-aware delta encoding:
+                // Delta encoding selection based on tracepoint type:
                 // - FastGA: num_differences are naturally small, use raw values
                 // - Standard: query_bases are incremental, use delta encoding
                 let use_delta = !matches!(self.tp_type, TracepointType::Fastga);
@@ -396,8 +607,8 @@ impl AlignmentRecord {
                     write_varint(&mut second_val_buf, val)?;
                 }
 
-                let first_compressed = zstd::encode_all(&first_val_buf[..], 3)?;
-                let second_compressed = zstd::encode_all(&second_val_buf[..], 3)?;
+                let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
+                let second_compressed = zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
 
                 write_varint(writer, first_compressed.len() as u64)?;
                 writer.write_all(&first_compressed)?;
@@ -438,7 +649,7 @@ impl AlignmentRecord {
     }
 
     /// Write tracepoints WITHOUT delta encoding (for raw strategies)
-    fn write_tracepoints_raw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    fn write_tracepoints_raw<W: Write>(&self, writer: &mut W, strategy: CompressionStrategy) -> io::Result<()> {
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 write_varint(writer, tps.len() as u64)?;
@@ -458,8 +669,93 @@ impl AlignmentRecord {
                     write_varint(&mut second_val_buf, val)?;
                 }
 
-                let first_compressed = zstd::encode_all(&first_val_buf[..], 3)?;
-                let second_compressed = zstd::encode_all(&second_val_buf[..], 3)?;
+                let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
+                let second_compressed = zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
+
+                write_varint(writer, first_compressed.len() as u64)?;
+                writer.write_all(&first_compressed)?;
+                write_varint(writer, second_compressed.len() as u64)?;
+                writer.write_all(&second_compressed)?;
+            }
+            TracepointData::Variable(tps) => {
+                write_varint(writer, tps.len() as u64)?;
+                for (a, b_opt) in tps {
+                    write_varint(writer, *a)?;
+                    if let Some(b) = b_opt {
+                        writer.write_all(&[1])?;
+                        write_varint(writer, *b)?;
+                    } else {
+                        writer.write_all(&[0])?;
+                    }
+                }
+            }
+            TracepointData::Mixed(items) => {
+                write_varint(writer, items.len() as u64)?;
+                for item in items {
+                    match item {
+                        MixedTracepointItem::Tracepoint(a, b) => {
+                            writer.write_all(&[0])?;
+                            write_varint(writer, *a)?;
+                            write_varint(writer, *b)?;
+                        }
+                        MixedTracepointItem::CigarOp(len, op) => {
+                            writer.write_all(&[1])?;
+                            write_varint(writer, *len)?;
+                            writer.write_all(&[*op as u8])?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write tracepoints with automatic encoding (independent delta flags for first/second values)
+    fn write_tracepoints_automatic<W: Write>(
+        &self,
+        writer: &mut W,
+        use_delta_first: bool,
+        use_delta_second: bool,
+        strategy: CompressionStrategy,
+    ) -> io::Result<()> {
+        match &self.tracepoints {
+            TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
+                write_varint(writer, tps.len() as u64)?;
+                if tps.is_empty() {
+                    return Ok(());
+                }
+                let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
+
+                // Encode first_values (delta or raw)
+                let mut first_val_buf = Vec::with_capacity(first_vals.len() * 2);
+                if use_delta_first {
+                    let first_vals_encoded = delta_encode(&first_vals);
+                    for &val in &first_vals_encoded {
+                        let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                        write_varint(&mut first_val_buf, zigzag)?;
+                    }
+                } else {
+                    for &val in &first_vals {
+                        write_varint(&mut first_val_buf, val)?;
+                    }
+                }
+
+                // Encode second_values (delta or raw)
+                let mut second_val_buf = Vec::with_capacity(second_vals.len() * 2);
+                if use_delta_second {
+                    let second_vals_encoded = delta_encode(&second_vals);
+                    for &val in &second_vals_encoded {
+                        let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                        write_varint(&mut second_val_buf, zigzag)?;
+                    }
+                } else {
+                    for &val in &second_vals {
+                        write_varint(&mut second_val_buf, val)?;
+                    }
+                }
+
+                let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
+                let second_compressed = zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
 
                 write_varint(writer, first_compressed.len() as u64)?;
                 writer.write_all(&first_compressed)?;
@@ -578,7 +874,7 @@ impl AlignmentRecord {
                     pos_values.push(val);
                 }
 
-                // Version 1 (Varint) uses FastGA-aware delta encoding
+                // Delta encoding selection based on tracepoint type
                 let positions: Vec<u64> = if matches!(tp_type, TracepointType::Fastga) {
                     // FastGA: raw values (no delta)
                     pos_values.iter().map(|&v| v as u64).collect()
@@ -814,14 +1110,13 @@ pub fn decompress_paf(input_path: &str, output_path: &str) -> io::Result<()> {
         ));
     }
 
-    let strategy = CompressionStrategy::from_code(header.flags)?;
+    let strategy = header.strategy()?;
     info!(
         "Reading {} records ({} unique names) [{}]",
         header.num_records, header.num_strings, strategy
     );
 
-    let use_delta = matches!(strategy, CompressionStrategy::Varint);
-    decompress_varint(reader, output_path, &header, use_delta)
+    decompress_varint(reader, output_path, &header, strategy)
 }
 
 /// Decompress varint-encoded records
@@ -829,16 +1124,30 @@ fn decompress_varint<R: Read>(
     mut reader: R,
     output_path: &str,
     header: &BinaryPafHeader,
-    use_delta: bool,
+    strategy: CompressionStrategy,
 ) -> io::Result<()> {
     let mut records = Vec::with_capacity(header.num_records as usize);
-    for _ in 0..header.num_records {
-        if use_delta {
-            records.push(AlignmentRecord::read(&mut reader)?);
-        } else {
-            records.push(read_record_varint(&mut reader, false)?);
+
+    match strategy {
+        CompressionStrategy::Automatic(_) => {
+            let use_delta_first = header.use_delta_first();
+            let use_delta_second = header.use_delta_second();
+            for _ in 0..header.num_records {
+                records.push(read_record_automatic(&mut reader, use_delta_first, use_delta_second)?);
+            }
+        }
+        CompressionStrategy::VarintZstd(_) => {
+            for _ in 0..header.num_records {
+                records.push(read_record_varint(&mut reader, false)?);
+            }
+        }
+        CompressionStrategy::DeltaVarintZstd(_) => {
+            for _ in 0..header.num_records {
+                records.push(AlignmentRecord::read(&mut reader)?);
+            }
         }
     }
+
     let string_table = StringTable::read(&mut reader)?;
     write_paf_output(output_path, &records, &string_table)?;
     info!("Decompressed {} records", header.num_records);
@@ -878,6 +1187,63 @@ fn read_record_varint<R: Read>(
 
     // Read tracepoints (raw, no delta)
     let tracepoints = read_tracepoints_raw(reader, tp_type)?;
+
+    let num_tags = read_varint(reader)? as usize;
+    let mut tags = Vec::with_capacity(num_tags);
+    for _ in 0..num_tags {
+        tags.push(Tag::read(reader)?);
+    }
+
+    Ok(AlignmentRecord {
+        query_name_id,
+        query_start,
+        query_end,
+        strand,
+        target_name_id,
+        target_start,
+        target_end,
+        residue_matches,
+        alignment_block_len,
+        mapping_quality,
+        tp_type,
+        complexity_metric,
+        max_complexity,
+        tracepoints,
+        tags,
+    })
+}
+
+// Read record for Automatic mode with per-field delta encoding
+fn read_record_automatic<R: Read>(
+    reader: &mut R,
+    use_delta_first: bool,
+    use_delta_second: bool,
+) -> io::Result<AlignmentRecord> {
+    let query_name_id = read_varint(reader)?;
+    let query_start = read_varint(reader)?;
+    let query_end = read_varint(reader)?;
+    let mut strand_buf = [0u8; 1];
+    reader.read_exact(&mut strand_buf)?;
+    let strand = strand_buf[0] as char;
+    let target_name_id = read_varint(reader)?;
+    let target_start = read_varint(reader)?;
+    let target_end = read_varint(reader)?;
+    let residue_matches = read_varint(reader)?;
+    let alignment_block_len = read_varint(reader)?;
+    let mut mapq_buf = [0u8; 1];
+    reader.read_exact(&mut mapq_buf)?;
+    let mapping_quality = mapq_buf[0];
+    let mut tp_type_buf = [0u8; 1];
+    reader.read_exact(&mut tp_type_buf)?;
+    let tp_type = TracepointType::from_u8(tp_type_buf[0])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut metric_buf = [0u8; 1];
+    reader.read_exact(&mut metric_buf)?;
+    let complexity_metric = complexity_metric_from_u8(metric_buf[0])?;
+    let max_complexity = read_varint(reader)?;
+
+    // Read tracepoints with automatic encoding
+    let tracepoints = read_tracepoints_automatic(reader, tp_type, use_delta_first, use_delta_second)?;
 
     let num_tags = read_varint(reader)? as usize;
     let mut tags = Vec::with_capacity(num_tags);
@@ -947,6 +1313,78 @@ fn read_tracepoints_raw<R: Read>(
     })
 }
 
+// Read tracepoints with automatic encoding (independent delta for first/second values)
+fn read_tracepoints_automatic<R: Read>(
+    reader: &mut R,
+    tp_type: TracepointType,
+    use_delta_first: bool,
+    use_delta_second: bool,
+) -> io::Result<TracepointData> {
+    let num_items = read_varint(reader)? as usize;
+    if num_items == 0 {
+        return Ok(match tp_type {
+            TracepointType::Standard => TracepointData::Standard(Vec::new()),
+            _ => TracepointData::Fastga(Vec::new()),
+        });
+    }
+
+    let first_len = read_varint(reader)? as usize;
+    let mut first_compressed = vec![0u8; first_len];
+    reader.read_exact(&mut first_compressed)?;
+    let second_len = read_varint(reader)? as usize;
+    let mut second_compressed = vec![0u8; second_len];
+    reader.read_exact(&mut second_compressed)?;
+
+    let first_buf = zstd::decode_all(&first_compressed[..])?;
+    let second_buf = zstd::decode_all(&second_compressed[..])?;
+
+    // Decode first values (delta or raw)
+    let mut first_reader = &first_buf[..];
+    let first_vals = if use_delta_first {
+        // Read zigzag-encoded deltas
+        let mut deltas = Vec::with_capacity(num_items);
+        for _ in 0..num_items {
+            let zigzag = read_varint(&mut first_reader)?;
+            let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+            deltas.push(val);
+        }
+        delta_decode(&deltas)
+    } else {
+        // Read raw values
+        let mut vals = Vec::with_capacity(num_items);
+        for _ in 0..num_items {
+            vals.push(read_varint(&mut first_reader)?);
+        }
+        vals
+    };
+
+    // Decode second values (delta or raw)
+    let mut second_reader = &second_buf[..];
+    let second_vals = if use_delta_second {
+        // Read zigzag-encoded deltas
+        let mut deltas = Vec::with_capacity(num_items);
+        for _ in 0..num_items {
+            let zigzag = read_varint(&mut second_reader)?;
+            let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+            deltas.push(val);
+        }
+        delta_decode(&deltas)
+    } else {
+        // Read raw values
+        let mut vals = Vec::with_capacity(num_items);
+        for _ in 0..num_items {
+            vals.push(read_varint(&mut second_reader)?);
+        }
+        vals
+    };
+
+    let tps: Vec<(u64, u64)> = first_vals.into_iter().zip(second_vals).collect();
+    Ok(match tp_type {
+        TracepointType::Standard => TracepointData::Standard(tps),
+        _ => TracepointData::Fastga(tps),
+    })
+}
+
 
 /// Compress PAF with tracepoints to binary format
 ///
@@ -1000,17 +1438,37 @@ fn write_binary(
     })?;
     let mut writer = BufWriter::new(output);
 
-    let header = BinaryPafHeader {
-        version: 1,
-        flags: strategy.to_code(),
-        num_records: records.len() as u64,
-        num_strings: string_table.len() as u64,
+    // Analyze data for Automatic mode
+    let (use_delta_first, use_delta_second) = match strategy {
+        CompressionStrategy::Automatic(_) => analyze_smart_light_compression(records),
+        _ => (false, false),
     };
 
-    let use_delta = matches!(strategy, CompressionStrategy::Varint);
+    let header = BinaryPafHeader::new(
+        records.len() as u64,
+        string_table.len() as u64,
+        strategy,
+        use_delta_first,
+        use_delta_second,
+    );
+
     header.write(&mut writer)?;
-    for record in records {
-        record.write(&mut writer, use_delta)?;
+    match strategy {
+        CompressionStrategy::Automatic(_) => {
+            for record in records {
+                record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?;
+            }
+        }
+        CompressionStrategy::VarintZstd(_) => {
+            for record in records {
+                record.write(&mut writer, false, strategy)?;
+            }
+        }
+        CompressionStrategy::DeltaVarintZstd(_) => {
+            for record in records {
+                record.write(&mut writer, true, strategy)?;
+            }
+        }
     }
     string_table.write(&mut writer)?;
     Ok(())
@@ -1710,10 +2168,15 @@ impl BpafReader {
     pub fn get_alignment_record_at_offset(&mut self, offset: u64) -> io::Result<AlignmentRecord> {
         self.file.seek(SeekFrom::Start(offset))?;
 
-        let strategy = CompressionStrategy::from_code(self.header.flags)?;
+        let strategy = self.header.strategy()?;
         match strategy {
-            CompressionStrategy::Varint => AlignmentRecord::read(&mut self.file),
-            CompressionStrategy::VarintRaw => read_record_varint(&mut self.file, false),
+            CompressionStrategy::Automatic(_) => {
+                let use_delta_first = self.header.use_delta_first();
+                let use_delta_second = self.header.use_delta_second();
+                read_record_automatic(&mut self.file, use_delta_first, use_delta_second)
+            }
+            CompressionStrategy::VarintZstd(_) => read_record_varint(&mut self.file, false),
+            CompressionStrategy::DeltaVarintZstd(_) => AlignmentRecord::read(&mut self.file),
         }
     }
 
@@ -1776,8 +2239,23 @@ impl BpafReader {
 
         let max_complexity = read_varint(&mut self.file)?;
 
-        // Read tracepoints
-        let tracepoints = AlignmentRecord::read_tracepoints(&mut self.file, tp_type)?;
+        // Read tracepoints - dispatch based on strategy
+        let tracepoints = match self.header.strategy()? {
+            CompressionStrategy::Automatic(_) => {
+                read_tracepoints_automatic(
+                    &mut self.file,
+                    tp_type,
+                    self.header.use_delta_first(),
+                    self.header.use_delta_second(),
+                )?
+            }
+            CompressionStrategy::VarintZstd(_) => {
+                read_tracepoints_raw(&mut self.file, tp_type)?
+            }
+            CompressionStrategy::DeltaVarintZstd(_) => {
+                AlignmentRecord::read_tracepoints(&mut self.file, tp_type)?
+            }
+        };
 
         Ok((tracepoints, tp_type, complexity_metric, max_complexity))
     }

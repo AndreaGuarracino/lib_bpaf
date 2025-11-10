@@ -6,8 +6,9 @@ Binary format for genomic sequence alignments with tracepoints.
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Varint (recommended)**: FastGA-aware delta + varint + zstd
-  - **VarintRaw**: No delta encoding
+  - **Automatic (default)**: Analyzes data to choose delta vs raw encoding + varint + zstd
+  - **DeltaVarintZstd**: Delta encoding + varint + zstd
+  - **VarintZstd**: No delta encoding + varint + zstd
 - **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
 - **String deduplication**: Shared sequence name table
 - **Byte-aligned encoding**: Enables extremely fast tracepoint extraction
@@ -88,22 +89,29 @@ for record in reader.iter_records() {
 ```rust
 use lib_bpaf::{compress_paf, CompressionStrategy};
 
-// Varint (recommended): FastGA-aware delta + varint + zstd
-// - FastGA: raw num_differences (naturally small)
-// - Standard: delta-encoded query_bases
+// Automatic (default): Analyzes data to choose delta vs raw + varint + zstd
+// - Samples first 1000 records to determine optimal encoding
+// - Handles all tracepoint types automatically
 // - Enables O(1) random tracepoint access
-compress_paf("alignments.paf", "alignments.bpaf", CompressionStrategy::Varint)?;
+compress_paf("alignments.paf", "alignments.bpaf", CompressionStrategy::Automatic(3))?;
 
-// VarintRaw: No delta + varint + zstd
+// DeltaVarintZstd: Delta encoding + varint + zstd
+// - Always uses delta encoding for tracepoints
+// - Works well when values are naturally small or monotonic
+// - Enables O(1) random tracepoint access
+compress_paf("alignments.paf", "alignments.bpaf", CompressionStrategy::DeltaVarintZstd(3))?;
+
+// VarintZstd: No delta + varint + zstd
 // - All types: raw first values
 // - Use if delta encoding doesn't help your data
 // - Also enables O(1) random tracepoint access
-compress_paf("alignments.paf", "alignments.bpaf", CompressionStrategy::VarintRaw)?;
+compress_paf("alignments.paf", "alignments.bpaf", CompressionStrategy::VarintZstd(3))?;
 ```
 
 **Strategy guide:**
-- **Varint (recommended)**: Best for most use cases with FastGA-aware delta encoding
-- **VarintRaw**: Test if delta encoding creates too many unique symbols for your data
+- **Automatic (default)**: Best for most use cases, analyzes data to choose optimal encoding
+- **DeltaVarintZstd**: Use when you know delta encoding helps your data
+- **VarintZstd**: Test if delta encoding creates too many unique symbols for your data
 
 ### Index management
 
