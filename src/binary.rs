@@ -1613,6 +1613,11 @@ impl BpafIndex {
     pub fn is_empty(&self) -> bool {
         self.offsets.is_empty()
     }
+
+    /// Get offset for a specific record ID
+    pub fn get_offset(&self, record_id: u64) -> Option<u64> {
+        self.offsets.get(record_id as usize).copied()
+    }
 }
 
 pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
