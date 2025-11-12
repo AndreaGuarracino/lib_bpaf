@@ -77,8 +77,7 @@ fn encode_varint_inline(mut value: u64) -> Vec<u8> {
     bytes
 }
 
-/// Empirical strategy selection by actually compressing samples
-/// Returns true if ZigzagDelta should be used (produces smaller output)
+/// Empirical strategy selection by actually compressing a subset of records
 pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level: i32) -> bool {
     // Collect sample tracepoints
     let mut all_first_vals = Vec::new();
@@ -156,7 +155,7 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level:
         ((zigzag_size - raw_size) as f64 / zigzag_size as f64) * 100.0
     };
 
-    info!(
+    debug!(
         "Empirical analysis: sampled {} records, {} tracepoints - Raw: {} bytes, ZigzagDelta: {} bytes -> {} wins ({:.2}% better)",
         sample_count,
         all_first_vals.len(),
@@ -214,40 +213,11 @@ pub fn write_paf_line_with_tracepoints<W: Write>(
     }
 
     // Write tracepoints as tp:Z: tag last
-    let tp_str = format_tracepoints(&record.tracepoints);
+    let tp_str = record.tracepoints.to_tp_tag();
     write!(writer, "\ttp:Z:{}", tp_str)?;
 
     writeln!(writer)?;
     Ok(())
-}
-
-fn format_tracepoints(tps: &TracepointData) -> String {
-    match tps {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps
-            .iter()
-            .map(|(a, b)| format!("{},{}", a, b))
-            .collect::<Vec<_>>()
-            .join(";"),
-        TracepointData::Variable(tps) => tps
-            .iter()
-            .map(|(a, b)| {
-                if let Some(b_val) = b {
-                    format!("{},{}", a, b_val)
-                } else {
-                    format!("{}", a)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(";"),
-        TracepointData::Mixed(items) => items
-            .iter()
-            .map(|item| match item {
-                MixedRepresentation::Tracepoint(a, b) => format!("{},{}", a, b),
-                MixedRepresentation::CigarOp(len, op) => format!("{}{}", len, op),
-            })
-            .collect::<Vec<_>>()
-            .join(";"),
-    }
 }
 
 // ============================================================================
