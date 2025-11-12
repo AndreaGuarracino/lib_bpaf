@@ -8,23 +8,23 @@ use std::io::{self, Read, Write};
 
 #[derive(Clone, Copy, Debug)]
 pub enum CompressionStrategy {
-    /// Automatic encoding decision + Zstd
-    /// - Analyze first 1000 records to decide delta vs raw encoding
+    /// Automatic strategy selection based on data analysis
+    /// - Runs heuristic to choose between Raw and ZigzagDelta
     /// - Configurable compression level (max 22, default: 3)
     Automatic(i32),
-    /// Raw encoding (no delta) + Varint + Zstd
-    /// - No delta encoding, stores absolute values
+    /// Raw encoding (no preprocessing) + Zstd
+    /// - Optimal for low complexity data
     /// - Configurable compression level (max 22, default: 3)
-    VarintZstd(i32),
-    /// Delta encoding + Varint + Zstd
-    /// - Always uses delta encoding for tracepoints
-    /// - Works well when values are naturally small or monotonic
+    Raw(i32),
+    /// Zigzag + delta encoding + Zstd
+    /// - Optimal for high complexity data
     /// - Configurable compression level (max 22, default: 3)
-    DeltaVarintZstd(i32),
+    ZigzagDelta(i32),
 }
 
 impl CompressionStrategy {
     /// Parse strategy from string (format: "strategy" or "strategy,level")
+    /// Accepts "automatic", "raw", or "zigzag-delta"
     pub fn from_str(s: &str) -> Result<Self, String> {
         let parts: Vec<&str> = s.split(',').collect();
         let strategy_name = parts[0].to_lowercase();
@@ -49,10 +49,10 @@ impl CompressionStrategy {
 
         match strategy_name.as_str() {
             "automatic" => Ok(CompressionStrategy::Automatic(compression_level)),
-            "varint-zstd" => Ok(CompressionStrategy::VarintZstd(compression_level)),
-            "delta-varint-zstd" => Ok(CompressionStrategy::DeltaVarintZstd(compression_level)),
+            "raw" => Ok(CompressionStrategy::Raw(compression_level)),
+            "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(compression_level)),
             _ => Err(format!(
-                "Unsupported compression strategy '{}'. Supported: 'automatic', 'varint-zstd', 'delta-varint-zstd'.",
+                "Unsupported compression strategy '{}'. Supported: 'automatic', 'raw', 'zigzag-delta'.",
                 strategy_name
             )),
         }
@@ -60,30 +60,28 @@ impl CompressionStrategy {
 
     /// Get all available strategies
     pub fn variants() -> &'static [&'static str] {
-        &["automatic", "varint-zstd", "delta-varint-zstd"]
+        &["automatic", "raw", "zigzag-delta"]
     }
 
     /// Convert to strategy code for file header
-    fn to_code(&self) -> u8 {
+    pub(crate) fn to_code(&self) -> u8 {
         match self {
-            CompressionStrategy::Automatic(_) => 0,
-            CompressionStrategy::VarintZstd(_) => 1,
-            CompressionStrategy::DeltaVarintZstd(_) => 2,
+            CompressionStrategy::Automatic(_) => {
+                panic!("Automatic strategy must be resolved to Raw or ZigzagDelta before writing")
+            }
+            CompressionStrategy::Raw(_) => 0,
+            CompressionStrategy::ZigzagDelta(_) => 1,
         }
     }
 
     /// Parse from strategy code
-    fn from_code(code: u8) -> io::Result<Self> {
+    pub(crate) fn from_code(code: u8) -> io::Result<Self> {
         match code {
-            0 => Ok(CompressionStrategy::Automatic(3)),
-            1 => Ok(CompressionStrategy::VarintZstd(3)),
-            2 => Ok(CompressionStrategy::DeltaVarintZstd(3)),
+            0 => Ok(CompressionStrategy::Raw(3)),
+            1 => Ok(CompressionStrategy::ZigzagDelta(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!(
-                    "Unsupported compression strategy code: {}. Supported codes: 0=automatic, 1=varint-zstd, 2=delta-varint-zstd.",
-                    code
-                ),
+                format!("Unsupported compression strategy code: {}", code),
             )),
         }
     }
@@ -92,8 +90,19 @@ impl CompressionStrategy {
     pub fn zstd_level(&self) -> i32 {
         match self {
             CompressionStrategy::Automatic(level) => *level,
-            CompressionStrategy::VarintZstd(level) => *level,
-            CompressionStrategy::DeltaVarintZstd(level) => *level,
+            CompressionStrategy::Raw(level) => *level,
+            CompressionStrategy::ZigzagDelta(level) => *level,
+        }
+    }
+
+    /// Get encoding tuple (use_zigzag, use_delta) that applies to both positions
+    pub fn encoding(&self) -> (bool, bool) {
+        match self {
+            CompressionStrategy::Automatic(_) => {
+                panic!("Automatic strategy must be resolved to Raw or ZigzagDelta before encoding")
+            }
+            CompressionStrategy::Raw(_) => (false, false),
+            CompressionStrategy::ZigzagDelta(_) => (true, true),
         }
     }
 }
@@ -102,25 +111,13 @@ impl std::fmt::Display for CompressionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompressionStrategy::Automatic(level) => {
-                if *level == 3 {
-                    write!(f, "Automatic")
-                } else {
-                    write!(f, "Automatic,{}", level)
-                }
+                write!(f, "Automatic (level {})", level)
             }
-            CompressionStrategy::VarintZstd(level) => {
-                if *level == 3 {
-                    write!(f, "Varint-zstd")
-                } else {
-                    write!(f, "Varint-zstd,{}", level)
-                }
+            CompressionStrategy::Raw(level) => {
+                write!(f, "Raw (level {})", level)
             }
-            CompressionStrategy::DeltaVarintZstd(level) => {
-                if *level == 3 {
-                    write!(f, "Delta-varint-zstd")
-                } else {
-                    write!(f, "Delta-varint-zstd,{}", level)
-                }
+            CompressionStrategy::ZigzagDelta(level) => {
+                write!(f, "ZigzagDelta (level {})", level)
             }
         }
     }
@@ -128,7 +125,7 @@ impl std::fmt::Display for CompressionStrategy {
 
 pub struct BinaryPafHeader {
     pub(crate) version: u8,
-    pub(crate) flags: u8,
+    pub(crate) strategy_code: u8,
     pub(crate) num_records: u64,
     pub(crate) num_strings: u64,
     pub(crate) tracepoint_type: TracepointType,
@@ -138,30 +135,19 @@ pub struct BinaryPafHeader {
 }
 
 impl BinaryPafHeader {
-    /// Create header with strategy and optional automatic encoding flags
+    /// Create header with strategy
     pub(crate) fn new(
         num_records: u64,
         num_strings: u64,
         strategy: CompressionStrategy,
-        use_delta_first: bool,
-        use_delta_second: bool,
         tracepoint_type: TracepointType,
         complexity_metric: ComplexityMetric,
         max_complexity: u64,
         distance: Distance,
     ) -> Self {
-        let mut flags = strategy.to_code() & 0x07; // Strategy in bits 0-2
-        if matches!(strategy, CompressionStrategy::Automatic(_)) {
-            if use_delta_first {
-                flags |= 0x08; // Bit 3
-            }
-            if use_delta_second {
-                flags |= 0x10; // Bit 4
-            }
-        }
         Self {
             version: 1,
-            flags,
+            strategy_code: strategy.to_code(),
             num_records,
             num_strings,
             tracepoint_type,
@@ -169,16 +155,6 @@ impl BinaryPafHeader {
             max_complexity,
             distance,
         }
-    }
-
-    /// Get delta encoding flag for first values (Automatic mode only)
-    pub(crate) fn use_delta_first(&self) -> bool {
-        (self.flags & 0x08) != 0
-    }
-
-    /// Get delta encoding flag for second values (Automatic mode only)
-    pub(crate) fn use_delta_second(&self) -> bool {
-        (self.flags & 0x10) != 0
     }
 
     /// Get format version
@@ -198,17 +174,7 @@ impl BinaryPafHeader {
 
     /// Get compression strategy
     pub fn strategy(&self) -> io::Result<CompressionStrategy> {
-        CompressionStrategy::from_code(self.flags & 0x07)
-    }
-
-    /// Get delta encoding flag for first values (Automatic mode only)
-    pub fn delta_first(&self) -> bool {
-        (self.flags & 0x08) != 0
-    }
-
-    /// Get delta encoding flag for second values (Automatic mode only)
-    pub fn delta_second(&self) -> bool {
-        (self.flags & 0x10) != 0
+        CompressionStrategy::from_code(self.strategy_code)
     }
 
     /// Get tracepoint type
@@ -233,7 +199,7 @@ impl BinaryPafHeader {
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(BINARY_MAGIC)?;
-        writer.write_all(&[self.version, self.flags])?;
+        writer.write_all(&[self.version, self.strategy_code])?;
         write_varint(writer, self.num_records)?;
         write_varint(writer, self.num_strings)?;
         writer.write_all(&[self.tracepoint_type.to_u8()])?;
@@ -249,10 +215,10 @@ impl BinaryPafHeader {
         if &magic != BINARY_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid magic"));
         }
-        let mut ver_flags = [0u8; 2];
-        reader.read_exact(&mut ver_flags)?;
-        let version = ver_flags[0];
-        let flags = ver_flags[1];
+        let mut ver_strategy = [0u8; 2];
+        reader.read_exact(&mut ver_strategy)?;
+        let version = ver_strategy[0];
+        let strategy_code = ver_strategy[1];
 
         let num_records = read_varint(reader)?;
         let num_strings = read_varint(reader)?;
@@ -273,7 +239,7 @@ impl BinaryPafHeader {
 
         Ok(Self {
             version,
-            flags,
+            strategy_code,
             num_records,
             num_strings,
             tracepoint_type,

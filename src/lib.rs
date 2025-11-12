@@ -93,6 +93,37 @@ pub fn compress_paf_with_tracepoints(
     )
 }
 
+/// Compress PAF with custom encoding flags (for testing/experimentation)
+///
+/// Encoding options (use_zigzag, use_delta):
+/// - (false, false) = raw varints
+/// - (true, false) = zigzag only
+/// - (false, true) = delta only (no zigzag)
+/// - (true, true) = zigzag + delta encoding
+pub fn compress_paf_with_custom_encoding(
+    input_path: &str,
+    output_path: &str,
+    tp_type: TracepointType,
+    max_complexity: u64,
+    complexity_metric: ComplexityMetric,
+    distance: Distance,
+    encoding_first: (bool, bool),
+    encoding_second: (bool, bool),
+    zstd_level: i32,
+) -> io::Result<()> {
+    compress_paf_custom(
+        input_path,
+        output_path,
+        tp_type,
+        max_complexity,
+        complexity_metric,
+        distance,
+        encoding_first,
+        encoding_second,
+        zstd_level,
+    )
+}
+
 pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Decompressing {} to text format...", input_path);
 
@@ -126,6 +157,115 @@ pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
 // Helpers
 // ============================================================================
 
+fn compress_paf_custom(
+    input_path: &str,
+    output_path: &str,
+    tp_type: TracepointType,
+    max_complexity: u64,
+    complexity_metric: ComplexityMetric,
+    distance: Distance,
+    encoding_first: (bool, bool),
+    encoding_second: (bool, bool),
+    zstd_level: i32,
+) -> io::Result<()> {
+    info!(
+        "Compressing PAF with custom encoding: first={:?}, second={:?}",
+        encoding_first, encoding_second
+    );
+
+    // Pass 1: Build string table
+    let mut string_table = StringTable::new();
+    let mut record_count = 0u64;
+
+    let input = open_paf_reader(input_path)?;
+    for (line_num, line_result) in input.lines().enumerate() {
+        let line = line_result?;
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        parse_paf_with_tracepoints(
+            &line,
+            &mut string_table,
+            &tp_type,
+            max_complexity as usize,
+            &complexity_metric,
+        )
+        .map_err(|e| {
+            error!("Line {}: {}", line_num + 1, e);
+            e
+        })?;
+
+        record_count += 1;
+    }
+
+    if record_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "No records found in PAF file",
+        ));
+    }
+
+    // Pass 2: Write with custom encoding
+    let mut output = File::create(output_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("Failed to create output file '{}': {}", output_path, e),
+        )
+    })?;
+
+    // Choose strategy based on encoding tuples
+    let strategy = if encoding_first == (true, true) && encoding_second == (true, true) {
+        CompressionStrategy::ZigzagDelta(zstd_level)
+    } else {
+        CompressionStrategy::Raw(zstd_level)
+    };
+
+    let header = BinaryPafHeader::new(
+        record_count,
+        string_table.len() as u64,
+        strategy,
+        tp_type,
+        complexity_metric,
+        max_complexity,
+        distance,
+    );
+    header.write(&mut output)?;
+    string_table.write(&mut output)?;
+
+    let mut writer = BufWriter::new(&mut output);
+    let input = open_paf_reader(input_path)?;
+    for line_result in input.lines() {
+        let line = line_result?;
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let record = parse_paf_with_tracepoints(
+            &line,
+            &mut string_table,
+            &tp_type,
+            max_complexity as usize,
+            &complexity_metric,
+        )?;
+
+        record.write_automatic(
+            &mut writer,
+            encoding_first,
+            encoding_second,
+            strategy,
+        )?;
+    }
+    writer.flush()?;
+
+    info!(
+        "Compressed {} records ({} unique sequence names) with custom encoding",
+        record_count,
+        string_table.len()
+    );
+    Ok(())
+}
+
 fn compress_paf(
     input_path: &str,
     output_path: &str,
@@ -136,6 +276,8 @@ fn compress_paf(
     distance: Distance,
     use_cigar: bool,
 ) -> io::Result<()> {
+    const SAMPLE_SIZE: usize = 1000;  // Sample size for representative statistics
+
     info!(
         "Compressing PAF with {} using {} strategy...",
         if use_cigar { "CIGAR" } else { "TRACEPOINTS" },
@@ -176,7 +318,7 @@ fn compress_paf(
             e
         })?;
 
-        if sample.len() < 1000 {
+        if sample.len() < SAMPLE_SIZE {
             sample.push(record);
         }
         record_count += 1;
@@ -190,10 +332,20 @@ fn compress_paf(
         ));
     }
 
-    // Analyze sample for Automatic mode
-    let (use_delta_first, use_delta_second) = match strategy {
-        CompressionStrategy::Automatic(_) => analyze_smart_compression(&sample),
-        _ => (false, false),
+    // Choose strategy based on user's preference
+    let chosen_strategy = match strategy {
+        CompressionStrategy::Automatic(level) => {
+            // Run empirical compression test to decide strategy
+            let use_zigzag = analyze_smart_compression(&sample, level);
+            if use_zigzag {
+                CompressionStrategy::ZigzagDelta(level)
+            } else {
+                CompressionStrategy::Raw(level)
+            }
+        }
+        // Respect explicit user choices
+        CompressionStrategy::Raw(level) => CompressionStrategy::Raw(level),
+        CompressionStrategy::ZigzagDelta(level) => CompressionStrategy::ZigzagDelta(level),
     };
 
     // Pass 2: Stream write - Header → StringTable → Records
@@ -204,13 +356,11 @@ fn compress_paf(
         )
     })?;
 
-    // Write header
+    // Write header with chosen strategy
     let header = BinaryPafHeader::new(
         record_count,
         string_table.len() as u64,
-        strategy,
-        use_delta_first,
-        use_delta_second,
+        chosen_strategy,
         tp_type,
         complexity_metric,
         max_complexity,
@@ -221,7 +371,8 @@ fn compress_paf(
     // Write string table
     string_table.write(&mut output)?;
 
-    // Write records
+    // Write records with chosen strategy's encoding
+    let encoding = chosen_strategy.encoding();
     let mut writer = BufWriter::new(&mut output);
     let input = open_paf_reader(input_path)?;
     for line_result in input.lines() {
@@ -248,13 +399,8 @@ fn compress_paf(
             )
         }?;
 
-        match strategy {
-            CompressionStrategy::Automatic(_) => {
-                record.write_automatic(&mut writer, use_delta_first, use_delta_second, strategy)?
-            }
-            CompressionStrategy::VarintZstd(_) => record.write(&mut writer, false, strategy)?,
-            CompressionStrategy::DeltaVarintZstd(_) => record.write(&mut writer, true, strategy)?,
-        }
+        // Write with chosen strategy's encoding (same for both positions)
+        record.write_automatic(&mut writer, encoding, encoding, chosen_strategy)?;
     }
     writer.flush()?;
 
@@ -262,7 +408,7 @@ fn compress_paf(
         "Compressed {} records ({} unique sequence names) with {} strategy",
         record_count,
         string_table.len(),
-        strategy
+        chosen_strategy
     );
     Ok(())
 }
@@ -515,9 +661,15 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
                 let first = coords[0].parse::<u64>().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
                 })?;
-                let second = coords[1].parse::<u64>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                })?;
+                // Handle Mixed tracepoints: single values have no comma
+                let second = if coords.len() > 1 {
+                    coords[1].parse::<u64>().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
+                    })?
+                } else {
+                    // Single value - use same value for both positions
+                    first
+                };
                 tps.push((first, second));
             }
 

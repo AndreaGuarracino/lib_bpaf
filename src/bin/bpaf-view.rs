@@ -68,18 +68,17 @@ fn main() -> io::Result<()> {
     println!("Format version: {}", header.version());
     println!("Number of records: {}", header.num_records());
     println!("Number of unique strings: {}", header.num_strings());
-    println!("Compression strategy: {}", header.strategy()?);
+
+    let strategy = header.strategy()?;
+    println!("Compression strategy: {}", strategy);
+    let (use_zigzag, use_delta) = strategy.encoding();
+    println!("  Encoding (use_zigzag, use_delta): ({}, {})", use_zigzag, use_delta);
+    println!("  Note: Both tracepoint positions use the same encoding");
+
     println!("Tracepoint type: {:?}", header.tp_type());
     println!("Complexity metric: {:?}", header.complexity_metric());
     println!("Max complexity: {}", header.max_complexity());
     println!("Distance: {:?}", header.distance());
-
-    if let Ok(strategy) = header.strategy() {
-        if matches!(strategy, lib_bpaf::CompressionStrategy::Automatic(_)) {
-            println!("  Use delta encoding (first): {}", header.delta_first());
-            println!("  Use delta encoding (second): {}", header.delta_second());
-        }
-    }
     println!();
 
     // Print string table

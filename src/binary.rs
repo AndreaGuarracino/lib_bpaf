@@ -70,65 +70,43 @@ fn delta_decode(deltas: &[i64]) -> Vec<u64> {
     values
 }
 
-/// Heuristic to decide if delta encoding is beneficial
-fn should_use_delta(values: &[u64]) -> bool {
-    if values.len() < 2 {
-        return false;
-    }
+// ============================================================================
+// ZIGZAG ENCODING
+// ============================================================================
 
-    // Check monotonicity and delta statistics
-    let mut monotonic = true;
-    let mut total_delta: u64 = 0;
-    let mut max_delta: i64 = 0;
-    let mut negative_count = 0;
-
-    for i in 1..values.len() {
-        let delta = values[i] as i64 - values[i - 1] as i64;
-
-        if delta < 0 {
-            monotonic = false;
-            negative_count += 1;
-        }
-
-        total_delta += delta.abs() as u64;
-        max_delta = max_delta.max(delta.abs());
-    }
-
-    // Average delta magnitude
-    let avg_delta = total_delta / (values.len() - 1) as u64;
-
-    // Average raw value
-    let avg_value = values.iter().sum::<u64>() / values.len() as u64;
-
-    // Heuristic: Use delta if:
-    // 1. Values are mostly monotonic (< 10% negative deltas)
-    // 2. Average delta is significantly smaller than average value (< 50%)
-    // 3. Max delta is not too large (< 10x average)
-
-    let negative_ratio = negative_count as f64 / (values.len() - 1) as f64;
-    let delta_ratio = avg_delta as f64 / avg_value.max(1) as f64;
-    let max_delta_ratio = max_delta as f64 / avg_delta.max(1) as f64;
-
-    let use_delta =
-        monotonic || (negative_ratio < 0.1 && delta_ratio < 0.5 && max_delta_ratio < 10.0);
-
-    debug!(
-        "Delta heuristic: mono={}, neg_ratio={:.2}, delta_ratio={:.2}, max_ratio={:.2} -> {}",
-        monotonic, negative_ratio, delta_ratio, max_delta_ratio, use_delta
-    );
-
-    use_delta
+/// Zigzag encode a signed value to unsigned
+#[inline]
+fn encode_zigzag(val: i64) -> u64 {
+    ((val << 1) ^ (val >> 63)) as u64
 }
 
-pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord]) -> (bool, bool) {
-    const SAMPLE_SIZE: usize = 1000;
+/// Helper function to encode varint inline (same as utils::encode_varint)
+#[inline]
+fn encode_varint_inline(mut value: u64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+    bytes
+}
 
+/// Empirical strategy selection by actually compressing samples
+/// Returns true if ZigzagDelta should be used (produces smaller output)
+pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level: i32) -> bool {
+    // Collect sample tracepoints
     let mut all_first_vals = Vec::new();
     let mut all_second_vals = Vec::new();
 
-    // Sample first N records (or all if fewer)
-    let sample_count = records.len().min(SAMPLE_SIZE);
-    for record in records.iter().take(sample_count) {
+    let sample_count = records.len();
+    for record in records.iter() {
         if let TracepointData::Standard(tps) | TracepointData::Fastga(tps) = &record.tracepoints {
             for (first, second) in tps {
                 all_first_vals.push(*first);
@@ -138,22 +116,78 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord]) -> (bool, b
     }
 
     if all_first_vals.is_empty() {
-        return (false, false);
+        info!("Empirical analysis: No tracepoints found, defaulting to Raw");
+        return false;  // Default to Raw
     }
 
-    // Analyze first_values
-    let use_delta_first = should_use_delta(&all_first_vals);
-    let use_delta_second = should_use_delta(&all_second_vals);
+    // Compress with Raw strategy (varint + zstd)
+    let raw_size = {
+        let mut first_val_buf = Vec::with_capacity(all_first_vals.len() * 2);
+        let mut second_val_buf = Vec::with_capacity(all_second_vals.len() * 2);
+
+        // Write first values as varint
+        for &val in &all_first_vals {
+            first_val_buf.extend_from_slice(&encode_varint_inline(val));
+        }
+        // Write second values as varint
+        for &val in &all_second_vals {
+            second_val_buf.extend_from_slice(&encode_varint_inline(val));
+        }
+
+        // Compress with zstd
+        let first_compressed = zstd::encode_all(&first_val_buf[..], zstd_level).unwrap();
+        let second_compressed = zstd::encode_all(&second_val_buf[..], zstd_level).unwrap();
+
+        first_compressed.len() + second_compressed.len()
+    };
+
+    // Compress with ZigzagDelta strategy (delta + zigzag + varint + zstd)
+    let zigzag_size = {
+        let mut first_val_buf = Vec::with_capacity(all_first_vals.len() * 2);
+        let mut second_val_buf = Vec::with_capacity(all_second_vals.len() * 2);
+
+        // Process first values: delta + zigzag + varint
+        if !all_first_vals.is_empty() {
+            let first_val = all_first_vals[0];
+            first_val_buf.extend_from_slice(&encode_varint_inline(encode_zigzag(first_val as i64)));
+
+            for i in 1..all_first_vals.len() {
+                let delta = all_first_vals[i] as i64 - all_first_vals[i-1] as i64;
+                first_val_buf.extend_from_slice(&encode_varint_inline(encode_zigzag(delta)));
+            }
+        }
+
+        // Process second values: just varint (NO delta, NO zigzag)
+        for &val in &all_second_vals {
+            second_val_buf.extend_from_slice(&encode_varint_inline(val));
+        }
+
+        // Compress with zstd
+        let first_compressed = zstd::encode_all(&first_val_buf[..], zstd_level).unwrap();
+        let second_compressed = zstd::encode_all(&second_val_buf[..], zstd_level).unwrap();
+
+        first_compressed.len() + second_compressed.len()
+    };
+
+    let use_zigzag = zigzag_size < raw_size;
+    let winner = if use_zigzag { "ZigzagDelta" } else { "Raw" };
+    let diff_pct = if use_zigzag {
+        ((raw_size - zigzag_size) as f64 / raw_size as f64) * 100.0
+    } else {
+        ((zigzag_size - raw_size) as f64 / zigzag_size as f64) * 100.0
+    };
 
     info!(
-        "Automatic analysis: sampled {} records, {} tracepoints - first_values: use_delta={}, second_values: use_delta={}",
+        "Empirical analysis: sampled {} records, {} tracepoints - Raw: {} bytes, ZigzagDelta: {} bytes -> {} wins ({:.2}% better)",
         sample_count,
         all_first_vals.len(),
-        use_delta_first,
-        use_delta_second
+        raw_size,
+        zigzag_size,
+        winner,
+        diff_pct
     );
 
-    (use_delta_first, use_delta_second)
+    use_zigzag
 }
 
 // ============================================================================
@@ -263,45 +297,19 @@ pub(crate) fn decompress_varint<R: Read>(
     };
     let mut writer = BufWriter::new(output);
 
-    match strategy {
-        CompressionStrategy::Automatic(_) => {
-            let use_delta_first = header.use_delta_first();
-            let use_delta_second = header.use_delta_second();
-            for _ in 0..header.num_records {
-                let record = read_record_automatic(
-                    &mut reader,
-                    use_delta_first,
-                    use_delta_second,
-                    header.tracepoint_type,
-                    header.complexity_metric,
-                    header.max_complexity,
-                )?;
-                write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
-            }
-        }
-        CompressionStrategy::VarintZstd(_) => {
-            for _ in 0..header.num_records {
-                let record = read_record_varint(
-                    &mut reader,
-                    false,
-                    header.tracepoint_type,
-                    header.complexity_metric,
-                    header.max_complexity,
-                )?;
-                write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
-            }
-        }
-        CompressionStrategy::DeltaVarintZstd(_) => {
-            for _ in 0..header.num_records {
-                let record = AlignmentRecord::read(
-                    &mut reader,
-                    header.tracepoint_type,
-                    header.complexity_metric,
-                    header.max_complexity,
-                )?;
-                write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
-            }
-        }
+    // Get encoding from strategy stored in header (applies to both positions)
+    let (use_zigzag, use_delta) = strategy.encoding();
+    let use_delta_encoding = use_zigzag && use_delta;
+    for _ in 0..header.num_records {
+        let record = read_record_automatic(
+            &mut reader,
+            use_delta_encoding,  // use_delta_first
+            use_delta_encoding,  // use_delta_second
+            header.tracepoint_type,
+            header.complexity_metric,
+            header.max_complexity,
+        )?;
+        write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
     }
     writer.flush()?;
 
@@ -381,8 +389,12 @@ fn read_record_automatic<R: Read>(
     reader.read_exact(&mut mapq_buf)?;
     let mapping_quality = mapq_buf[0];
 
+    // Convert old use_delta flags to new encoding tuples
+    // Old behavior: use_delta meant "zigzag+delta", not use_delta meant "raw"
+    let encoding_first = if use_delta_first { (true, true) } else { (false, false) };
+    let encoding_second = if use_delta_second { (true, true) } else { (false, false) };
     let tracepoints =
-        read_tracepoints_automatic(reader, tp_type, Some(use_delta_first), Some(use_delta_second))?;
+        read_tracepoints_automatic(reader, tp_type, encoding_first, encoding_second)?;
 
     let num_tags = read_varint(reader)? as usize;
     let mut tags = Vec::with_capacity(num_tags);
@@ -414,7 +426,7 @@ fn read_tracepoints_raw<R: Read>(
     tp_type: TracepointType,
 ) -> io::Result<TracepointData> {
     // Raw encoding uses no zigzag or delta
-    read_tracepoints_automatic(reader, tp_type, None, None)
+    read_tracepoints_automatic(reader, tp_type, (false, false), (false, false))
 }
 
 fn read_tracepoints_delta<R: Read>(
@@ -425,20 +437,24 @@ fn read_tracepoints_delta<R: Read>(
     // - Standard: zigzag + delta on first, raw on second
     // - Fastga: zigzag only on first, raw on second
     let encoding_first = match tp_type {
-        TracepointType::Standard => Some(true),  // zigzag + delta
-        TracepointType::Fastga => Some(false),   // zigzag only
-        _ => None,                               // not applicable
+        TracepointType::Standard => (true, true),   // zigzag + delta
+        TracepointType::Fastga => (true, false),    // zigzag only
+        _ => (false, false),                        // raw
     };
-    read_tracepoints_automatic(reader, tp_type, encoding_first, None)
+    read_tracepoints_automatic(reader, tp_type, encoding_first, (false, false))
 }
 
 /// Read tracepoints with configurable encoding per component.
-/// Encoding modes: None = raw varints, Some(false) = zigzag only, Some(true) = zigzag + delta
+/// Encoding: (use_zigzag, use_delta)
+/// - (false, false) = raw varints
+/// - (true, false) = zigzag only
+/// - (false, true) = delta only (no zigzag)
+/// - (true, true) = zigzag + delta
 fn read_tracepoints_automatic<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
-    encoding_first: Option<bool>,
-    encoding_second: Option<bool>,
+    encoding_first: (bool, bool),
+    encoding_second: (bool, bool),
 ) -> io::Result<TracepointData> {
     let num_items = read_varint(reader)? as usize;
     match tp_type {
@@ -460,71 +476,52 @@ fn read_tracepoints_automatic<R: Read>(
             let first_buf = zstd::decode_all(&first_compressed[..])?;
             let second_buf = zstd::decode_all(&second_compressed[..])?;
 
-            // Decode first values
-            let mut first_reader = &first_buf[..];
-            let first_vals = match encoding_first {
-                Some(true) => {
-                    // Zigzag + delta
-                    let mut deltas = Vec::with_capacity(num_items);
-                    for _ in 0..num_items {
-                        let zigzag = read_varint(&mut first_reader)?;
-                        let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                        deltas.push(val);
+            // Helper to decode values based on encoding flags
+            let decode_values = |buf: &[u8], use_zigzag: bool, use_delta: bool| -> io::Result<Vec<u64>> {
+                let mut reader = buf;
+                match (use_zigzag, use_delta) {
+                    (false, false) => {
+                        // Raw varints
+                        let mut vals = Vec::with_capacity(num_items);
+                        for _ in 0..num_items {
+                            vals.push(read_varint(&mut reader)?);
+                        }
+                        Ok(vals)
                     }
-                    delta_decode(&deltas)
-                }
-                Some(false) => {
-                    // Zigzag only (no delta) - for Fastga
-                    let mut zigzag_vals = Vec::with_capacity(num_items);
-                    for _ in 0..num_items {
-                        let zigzag = read_varint(&mut first_reader)?;
-                        let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                        zigzag_vals.push(val as u64);
+                    (true, false) => {
+                        // Zigzag only
+                        let mut vals = Vec::with_capacity(num_items);
+                        for _ in 0..num_items {
+                            let zigzag = read_varint(&mut reader)?;
+                            let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                            vals.push(val as u64);
+                        }
+                        Ok(vals)
                     }
-                    zigzag_vals
-                }
-                None => {
-                    // Raw varints (no zigzag, no delta)
-                    let mut vals = Vec::with_capacity(num_items);
-                    for _ in 0..num_items {
-                        vals.push(read_varint(&mut first_reader)?);
+                    (false, true) => {
+                        // Delta only (no zigzag)
+                        let mut deltas = Vec::with_capacity(num_items);
+                        for _ in 0..num_items {
+                            let val = read_varint(&mut reader)? as i64;
+                            deltas.push(val);
+                        }
+                        Ok(delta_decode(&deltas))
                     }
-                    vals
+                    (true, true) => {
+                        // Zigzag + delta
+                        let mut deltas = Vec::with_capacity(num_items);
+                        for _ in 0..num_items {
+                            let zigzag = read_varint(&mut reader)?;
+                            let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+                            deltas.push(val);
+                        }
+                        Ok(delta_decode(&deltas))
+                    }
                 }
             };
 
-            // Decode second values
-            let mut second_reader = &second_buf[..];
-            let second_vals = match encoding_second {
-                Some(true) => {
-                    // Zigzag + delta
-                    let mut deltas = Vec::with_capacity(num_items);
-                    for _ in 0..num_items {
-                        let zigzag = read_varint(&mut second_reader)?;
-                        let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                        deltas.push(val);
-                    }
-                    delta_decode(&deltas)
-                }
-                Some(false) => {
-                    // Zigzag only (no delta)
-                    let mut zigzag_vals = Vec::with_capacity(num_items);
-                    for _ in 0..num_items {
-                        let zigzag = read_varint(&mut second_reader)?;
-                        let val = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
-                        zigzag_vals.push(val as u64);
-                    }
-                    zigzag_vals
-                }
-                None => {
-                    // Raw varints (no zigzag, no delta)
-                    let mut vals = Vec::with_capacity(num_items);
-                    for _ in 0..num_items {
-                        vals.push(read_varint(&mut second_reader)?);
-                    }
-                    vals
-                }
-            };
+            let first_vals = decode_values(&first_buf, encoding_first.0, encoding_first.1)?;
+            let second_vals = decode_values(&second_buf, encoding_second.0, encoding_second.1)?;
 
             let tps: Vec<(u64, u64)> = first_vals.into_iter().zip(second_vals).collect();
             Ok(match tp_type {
@@ -629,8 +626,8 @@ impl AlignmentRecord {
     pub(crate) fn write_automatic<W: Write>(
         &self,
         writer: &mut W,
-        use_delta_first: bool,
-        use_delta_second: bool,
+        encoding_first: (bool, bool),
+        encoding_second: (bool, bool),
         strategy: CompressionStrategy,
     ) -> io::Result<()> {
         write_varint(writer, self.query_name_id)?;
@@ -643,7 +640,7 @@ impl AlignmentRecord {
         write_varint(writer, self.residue_matches)?;
         write_varint(writer, self.alignment_block_len)?;
         writer.write_all(&[self.mapping_quality])?;
-        self.write_tracepoints_automatic(writer, use_delta_first, use_delta_second, strategy)?;
+        self.write_tracepoints_automatic(writer, encoding_first, encoding_second, strategy)?;
         write_varint(writer, self.tags.len() as u64)?;
         for tag in &self.tags {
             tag.write(writer)?;
@@ -792,8 +789,8 @@ impl AlignmentRecord {
     fn write_tracepoints_automatic<W: Write>(
         &self,
         writer: &mut W,
-        use_delta_first: bool,
-        use_delta_second: bool,
+        encoding_first: (bool, bool),
+        encoding_second: (bool, bool),
         strategy: CompressionStrategy,
     ) -> io::Result<()> {
         match &self.tracepoints {
@@ -804,31 +801,45 @@ impl AlignmentRecord {
                 }
                 let (first_vals, second_vals): (Vec<u64>, Vec<u64>) = tps.iter().copied().unzip();
 
-                let mut first_val_buf = Vec::with_capacity(first_vals.len() * 2);
-                if use_delta_first {
-                    let first_vals_encoded = delta_encode(&first_vals);
-                    for &val in &first_vals_encoded {
-                        let zigzag = ((val << 1) ^ (val >> 63)) as u64;
-                        write_varint(&mut first_val_buf, zigzag)?;
+                // Helper to encode values based on (use_zigzag, use_delta) flags
+                let encode_values = |vals: &[u64], use_zigzag: bool, use_delta: bool| -> io::Result<Vec<u8>> {
+                    let mut buf = Vec::with_capacity(vals.len() * 2);
+                    match (use_zigzag, use_delta) {
+                        (false, false) => {
+                            // Raw varints
+                            for &val in vals {
+                                write_varint(&mut buf, val)?;
+                            }
+                        }
+                        (true, false) => {
+                            // Zigzag only
+                            for &val in vals {
+                                let signed = val as i64;
+                                let zigzag = ((signed << 1) ^ (signed >> 63)) as u64;
+                                write_varint(&mut buf, zigzag)?;
+                            }
+                        }
+                        (false, true) => {
+                            // Delta only (no zigzag)
+                            let deltas = delta_encode(vals);
+                            for &val in &deltas {
+                                write_varint(&mut buf, val as u64)?;
+                            }
+                        }
+                        (true, true) => {
+                            // Zigzag + delta
+                            let deltas = delta_encode(vals);
+                            for &val in &deltas {
+                                let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+                                write_varint(&mut buf, zigzag)?;
+                            }
+                        }
                     }
-                } else {
-                    for &val in &first_vals {
-                        write_varint(&mut first_val_buf, val)?;
-                    }
-                }
+                    Ok(buf)
+                };
 
-                let mut second_val_buf = Vec::with_capacity(second_vals.len() * 2);
-                if use_delta_second {
-                    let second_vals_encoded = delta_encode(&second_vals);
-                    for &val in &second_vals_encoded {
-                        let zigzag = ((val << 1) ^ (val >> 63)) as u64;
-                        write_varint(&mut second_val_buf, zigzag)?;
-                    }
-                } else {
-                    for &val in &second_vals {
-                        write_varint(&mut second_val_buf, val)?;
-                    }
-                }
+                let first_val_buf = encode_values(&first_vals, encoding_first.0, encoding_first.1)?;
+                let second_val_buf = encode_values(&second_vals, encoding_second.0, encoding_second.1)?;
 
                 let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
                 let second_compressed =
@@ -1237,34 +1248,18 @@ impl BpafReader {
     pub fn get_alignment_record_at_offset(&mut self, offset: u64) -> io::Result<AlignmentRecord> {
         self.file.seek(SeekFrom::Start(offset))?;
 
+        // Get encoding from strategy stored in header (applies to both positions)
         let strategy = self.header.strategy()?;
-        match strategy {
-            CompressionStrategy::Automatic(_) => {
-                let use_delta_first = self.header.use_delta_first();
-                let use_delta_second = self.header.use_delta_second();
-                read_record_automatic(
-                    &mut self.file,
-                    use_delta_first,
-                    use_delta_second,
-                    self.header.tracepoint_type,
-                    self.header.complexity_metric,
-                    self.header.max_complexity,
-                )
-            }
-            CompressionStrategy::VarintZstd(_) => read_record_varint(
-                &mut self.file,
-                false,
-                self.header.tracepoint_type,
-                self.header.complexity_metric,
-                self.header.max_complexity,
-            ),
-            CompressionStrategy::DeltaVarintZstd(_) => AlignmentRecord::read(
-                &mut self.file,
-                self.header.tracepoint_type,
-                self.header.complexity_metric,
-                self.header.max_complexity,
-            ),
-        }
+        let (use_zigzag, use_delta) = strategy.encoding();
+        let use_delta_encoding = use_zigzag && use_delta;
+        read_record_automatic(
+            &mut self.file,
+            use_delta_encoding,  // use_delta_first
+            use_delta_encoding,  // use_delta_second
+            self.header.tracepoint_type,
+            self.header.complexity_metric,
+            self.header.max_complexity,
+        )
     }
 
     /// Get tracepoints only (optimized) - O(1) random access by record ID
@@ -1322,18 +1317,15 @@ impl BpafReader {
         let complexity_metric = self.header.complexity_metric;
         let max_complexity = self.header.max_complexity;
 
-        let tracepoints = match self.header.strategy()? {
-            CompressionStrategy::Automatic(_) => read_tracepoints_automatic(
-                &mut self.file,
-                tp_type,
-                Some(self.header.use_delta_first()),
-                Some(self.header.use_delta_second()),
-            )?,
-            CompressionStrategy::VarintZstd(_) => read_tracepoints_raw(&mut self.file, tp_type)?,
-            CompressionStrategy::DeltaVarintZstd(_) => {
-                read_tracepoints_delta(&mut self.file, tp_type)?
-            }
-        };
+        // Get encoding from strategy stored in header (applies to both positions)
+        let strategy = self.header.strategy()?;
+        let encoding = strategy.encoding();
+        let tracepoints = read_tracepoints_automatic(
+            &mut self.file,
+            tp_type,
+            encoding,
+            encoding,
+        )?;
 
         Ok((tracepoints, tp_type, complexity_metric, max_complexity))
     }
