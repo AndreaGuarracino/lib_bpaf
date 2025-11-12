@@ -299,7 +299,7 @@ pub(crate) fn decompress_varint<R: Read>(
 
     // Read records with strategy from header
     for _ in 0..header.num_records {
-        let record = read_record_automatic(
+        let record = read_record(
             &mut reader,
             strategy,
             header.tracepoint_type,
@@ -314,7 +314,7 @@ pub(crate) fn decompress_varint<R: Read>(
     Ok(())
 }
 
-fn read_record_automatic<R: Read>(
+fn read_record<R: Read>(
     reader: &mut R,
     strategy: CompressionStrategy,
     tp_type: TracepointType,
@@ -336,7 +336,7 @@ fn read_record_automatic<R: Read>(
     reader.read_exact(&mut mapq_buf)?;
     let mapping_quality = mapq_buf[0];
 
-    let tracepoints = read_tracepoints_automatic(reader, tp_type, strategy)?;
+    let tracepoints = read_tracepoints(reader, tp_type, strategy)?;
 
     let num_tags = read_varint(reader)? as usize;
     let mut tags = Vec::with_capacity(num_tags);
@@ -364,7 +364,7 @@ fn read_record_automatic<R: Read>(
 }
 
 /// Read tracepoints with compression strategy
-fn read_tracepoints_automatic<R: Read>(
+fn read_tracepoints<R: Read>(
     reader: &mut R,
     tp_type: TracepointType,
     strategy: CompressionStrategy,
@@ -507,7 +507,7 @@ impl AlignmentRecord {
         write_varint(writer, self.residue_matches)?;
         write_varint(writer, self.alignment_block_len)?;
         writer.write_all(&[self.mapping_quality])?;
-        self.write_tracepoints_automatic(writer, strategy)?;
+        self.write_tracepoints(writer, strategy)?;
         write_varint(writer, self.tags.len() as u64)?;
         for tag in &self.tags {
             tag.write(writer)?;
@@ -515,7 +515,7 @@ impl AlignmentRecord {
         Ok(())
     }
 
-    fn write_tracepoints_automatic<W: Write>(
+    fn write_tracepoints<W: Write>(
         &self,
         writer: &mut W,
         strategy: CompressionStrategy,
@@ -920,7 +920,7 @@ impl BpafReader {
 
         // Read with strategy from header
         let strategy = self.header.strategy()?;
-        read_record_automatic(
+        read_record(
             &mut self.file,
             strategy,
             self.header.tracepoint_type,
@@ -986,7 +986,7 @@ impl BpafReader {
 
         // Read tracepoints with strategy from header
         let strategy = self.header.strategy()?;
-        let tracepoints = read_tracepoints_automatic(
+        let tracepoints = read_tracepoints(
             &mut self.file,
             tp_type,
             strategy,

@@ -93,31 +93,6 @@ pub fn compress_paf_with_tracepoints(
     )
 }
 
-/// Compress PAF with custom compression strategy (for testing/experimentation)
-///
-/// Strategy options:
-/// - Raw: raw varints + zstd
-/// - ZigzagDelta: zigzag + delta encoding + zstd
-pub fn compress_paf_with_custom_encoding(
-    input_path: &str,
-    output_path: &str,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-    strategy: CompressionStrategy,
-) -> io::Result<()> {
-    compress_paf_custom(
-        input_path,
-        output_path,
-        tp_type,
-        max_complexity,
-        complexity_metric,
-        distance,
-        strategy,
-    )
-}
-
 pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Decompressing {} to text format...", input_path);
 
@@ -151,101 +126,6 @@ pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
 // Helpers
 // ============================================================================
 
-fn compress_paf_custom(
-    input_path: &str,
-    output_path: &str,
-    tp_type: TracepointType,
-    max_complexity: u64,
-    complexity_metric: ComplexityMetric,
-    distance: Distance,
-    strategy: CompressionStrategy,
-) -> io::Result<()> {
-    info!(
-        "Compressing PAF with custom strategy: {}",
-        strategy
-    );
-
-    // Pass 1: Build string table
-    let mut string_table = StringTable::new();
-    let mut record_count = 0u64;
-
-    let input = open_paf_reader(input_path)?;
-    for (line_num, line_result) in input.lines().enumerate() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        parse_paf_with_tracepoints(
-            &line,
-            &mut string_table,
-            &tp_type,
-            max_complexity as usize,
-            &complexity_metric,
-        )
-        .map_err(|e| {
-            error!("Line {}: {}", line_num + 1, e);
-            e
-        })?;
-
-        record_count += 1;
-    }
-
-    if record_count == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "No records found in PAF file",
-        ));
-    }
-
-    // Pass 2: Write with custom strategy
-    let mut output = File::create(output_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("Failed to create output file '{}': {}", output_path, e),
-        )
-    })?;
-
-    let header = BinaryPafHeader::new(
-        record_count,
-        string_table.len() as u64,
-        strategy,
-        tp_type,
-        complexity_metric,
-        max_complexity,
-        distance,
-    );
-    header.write(&mut output)?;
-    string_table.write(&mut output)?;
-
-    let mut writer = BufWriter::new(&mut output);
-    let input = open_paf_reader(input_path)?;
-    for line_result in input.lines() {
-        let line = line_result?;
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let record = parse_paf_with_tracepoints(
-            &line,
-            &mut string_table,
-            &tp_type,
-            max_complexity as usize,
-            &complexity_metric,
-        )?;
-
-        record.write_automatic(&mut writer, strategy)?;
-    }
-    writer.flush()?;
-
-    info!(
-        "Compressed {} records ({} unique sequence names) with custom encoding",
-        record_count,
-        string_table.len()
-    );
-    Ok(())
-}
-
 fn compress_paf(
     input_path: &str,
     output_path: &str,
@@ -256,13 +136,13 @@ fn compress_paf(
     distance: Distance,
     use_cigar: bool,
 ) -> io::Result<()> {
-    const SAMPLE_SIZE: usize = 1000;  // Sample size for representative statistics
-
     info!(
         "Compressing PAF with {} using {} strategy...",
         if use_cigar { "CIGAR" } else { "TRACEPOINTS" },
         strategy
     );
+
+    const SAMPLE_SIZE: usize = 1000;  // Sample size for empirical compression test to decide strategy
 
     // Pass 1: Build string table + collect sample for analysis
     let mut string_table = StringTable::new();
@@ -305,7 +185,7 @@ fn compress_paf(
     }
 
     // Verify file is not empty
-    if sample.is_empty() {
+    if record_count == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "No records found in PAF file",
@@ -560,6 +440,32 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
         .collect();
 
     match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => {
+            // Parse as Standard/FASTGA tracepoints
+            let mut tps = Vec::new();
+            for part in segments {
+                let coords: Vec<&str> = part.split(',').collect();
+                let first = coords[0].parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
+                })?;
+                // Handle Mixed tracepoints: single values have no comma
+                let second = if coords.len() > 1 {
+                    coords[1].parse::<u64>().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
+                    })?
+                } else {
+                    // Single value - use same value for both positions
+                    first
+                };
+                tps.push((first, second));
+            }
+
+            match tp_type {
+                TracepointType::Standard => Ok(TracepointData::Standard(tps)),
+                TracepointType::Fastga => Ok(TracepointData::Fastga(tps)),
+                _ => unreachable!(),
+            }
+        }
         TracepointType::Mixed => {
             // Parse as Mixed tracepoints
             let mut items = Vec::new();
@@ -631,32 +537,6 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
                 }
             }
             Ok(TracepointData::Variable(tps))
-        }
-        TracepointType::Standard | TracepointType::Fastga => {
-            // Parse as Standard/FASTGA tracepoints
-            let mut tps = Vec::new();
-            for part in segments {
-                let coords: Vec<&str> = part.split(',').collect();
-                let first = coords[0].parse::<u64>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
-                })?;
-                // Handle Mixed tracepoints: single values have no comma
-                let second = if coords.len() > 1 {
-                    coords[1].parse::<u64>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                    })?
-                } else {
-                    // Single value - use same value for both positions
-                    first
-                };
-                tps.push((first, second));
-            }
-
-            match tp_type {
-                TracepointType::Standard => Ok(TracepointData::Standard(tps)),
-                TracepointType::Fastga => Ok(TracepointData::Fastga(tps)),
-                _ => unreachable!(),
-            }
         }
     }
 }
