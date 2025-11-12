@@ -414,33 +414,7 @@ fn read_tracepoints<R: Read>(
     let num_items = read_varint(reader)? as usize;
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
-            if num_items == 0 {
-                return Ok(match tp_type {
-                    TracepointType::Standard => TracepointData::Standard(Vec::new()),
-                    _ => TracepointData::Fastga(Vec::new()),
-                });
-            }
-
-            let first_len = read_varint(reader)? as usize;
-            let mut first_compressed = vec![0u8; first_len];
-            reader.read_exact(&mut first_compressed)?;
-            let second_len = read_varint(reader)? as usize;
-            let mut second_compressed = vec![0u8; second_len];
-            reader.read_exact(&mut second_compressed)?;
-
-            let first_buf = zstd::decode_all(&first_compressed[..])?;
-            let second_buf = zstd::decode_all(&second_compressed[..])?;
-
-            let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
-            let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
-
-            let mut tps = Vec::with_capacity(num_items);
-            for (a, b) in first_vals.into_iter().zip(second_vals) {
-                let a_usize = u64_to_usize(a)?;
-                let b_usize = u64_to_usize(b)?;
-                tps.push((a_usize, b_usize));
-            }
-
+            let tps = decode_standard_tracepoints(reader, num_items, strategy)?;
             Ok(match tp_type {
                 TracepointType::Standard => TracepointData::Standard(tps),
                 _ => TracepointData::Fastga(tps),
@@ -455,6 +429,41 @@ fn read_tracepoints<R: Read>(
             Ok(TracepointData::Mixed(items))
         }
     }
+}
+
+/// Standard/Fastga tracepoint decoding - fully inlined for zero overhead
+#[inline(always)]
+fn decode_standard_tracepoints<R: Read>(
+    reader: &mut R,
+    num_items: usize,
+    strategy: CompressionStrategy,
+) -> io::Result<Vec<(usize, usize)>> {
+    // Read compressed blocks
+    let first_len = read_varint(reader)? as usize;
+    let mut first_compressed = vec![0u8; first_len];
+    reader.read_exact(&mut first_compressed)?;
+
+    let second_len = read_varint(reader)? as usize;
+    let mut second_compressed = vec![0u8; second_len];
+    reader.read_exact(&mut second_compressed)?;
+
+    // Decompress
+    let first_buf = zstd::decode_all(&first_compressed[..])?;
+    let second_buf = zstd::decode_all(&second_compressed[..])?;
+
+    // Decode values
+    let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
+    let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
+
+    // Convert to (usize, usize) tuples
+    let mut tps = Vec::with_capacity(num_items);
+    for (a, b) in first_vals.into_iter().zip(second_vals) {
+        let a_usize = u64_to_usize(a)?;
+        let b_usize = u64_to_usize(b)?;
+        tps.push((a_usize, b_usize));
+    }
+
+    Ok(tps)
 }
 
 fn read_variable_tracepoint_items<R: Read>(
@@ -740,9 +749,6 @@ fn skip_tracepoints<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> 
     let num_items = read_varint(reader)? as usize;
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
-            if num_items == 0 {
-                return Ok(());
-            }
             // Read first_len and skip first_data
             let first_len = read_varint(reader)?;
             let first_len = i64::try_from(first_len).map_err(|_| {
@@ -924,29 +930,8 @@ impl BpafReader {
         )
     }
 
-    /// Get tracepoints only (optimized) - O(1) random access by record ID
-    pub fn get_tracepoints(
-        &mut self,
-        record_id: u64,
-    ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
-        if record_id >= self.index.len() as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Record ID {} out of range (max: {})",
-                    record_id,
-                    self.index.len() - 1
-                ),
-            ));
-        }
-
-        let tracepoint_offset = self.get_tracepoint_offset(record_id)?;
-        self.get_tracepoints_at_offset(tracepoint_offset)
-    }
-
-    /// Get tracepoint offset for a specific record ID
+    /// Get tracepoint offset by record ID
     /// Returns the byte offset where tracepoint data starts within the record
-    /// Use this to build external indexes that store tracepoint offsets for fastest access
     pub fn get_tracepoint_offset(&mut self, record_id: u64) -> io::Result<u64> {
         let record_offset = self.index.offsets[record_id as usize];
         self.file.seek(SeekFrom::Start(record_offset))?;
@@ -966,9 +951,18 @@ impl BpafReader {
         self.file.stream_position()
     }
 
-    /// Get tracepoints by tracepoint offset (fastest access)
+
+    /// Get tracepoints by record ID
+    pub fn get_tracepoints(
+        &mut self,
+        record_id: u64,
+    ) -> io::Result<(TracepointData, TracepointType, ComplexityMetric, u64)> {
+        let tracepoint_offset = self.get_tracepoint_offset(record_id)?;
+        self.get_tracepoints_at_offset(tracepoint_offset)
+    }
+
+    /// Get tracepoints by tracepoint offset
     /// Seeks directly to tracepoint data within a record
-    /// Use this when your external index stores tracepoint offsets for O(1) access
     pub fn get_tracepoints_at_offset(
         &mut self,
         tracepoint_offset: u64,
@@ -988,6 +982,19 @@ impl BpafReader {
         )?;
 
         Ok((tracepoints, tp_type, complexity_metric, max_complexity))
+    }
+
+    /// Get standard tracepoints by tracepoint offset
+    /// Fully specialized for TracepointType::Standard with known strategy
+    #[inline]
+    pub fn get_standard_tracepoints_at_offset(
+        &mut self,
+        tracepoint_offset: u64,
+        strategy: CompressionStrategy,
+    ) -> io::Result<Vec<(usize, usize)>> {
+        self.file.seek(SeekFrom::Start(tracepoint_offset))?;
+        let num_items = read_varint(&mut self.file)? as usize;
+        decode_standard_tracepoints(&mut self.file, num_items, strategy)
     }
 
     /// Iterator over all records (sequential access)
