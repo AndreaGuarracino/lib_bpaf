@@ -1,4 +1,4 @@
-use lib_bpaf::{BpafReader, MixedRepresentation, TracepointData};
+use lib_bpaf::BpafReader;
 use std::env;
 use std::io::{self, Write};
 use std::process;
@@ -10,35 +10,6 @@ fn print_usage() {
     eprintln!("  - Header information");
     eprintln!("  - String table");
     eprintln!("  - Alignment records in PAF format with tp:Z: tags");
-}
-
-fn format_tracepoints(tp_data: &TracepointData) -> String {
-    match tp_data {
-        TracepointData::Standard(tps) | TracepointData::Fastga(tps) => tps
-            .iter()
-            .map(|(a, b)| format!("{},{}", a, b))
-            .collect::<Vec<_>>()
-            .join(";"),
-        TracepointData::Variable(tps) => tps
-            .iter()
-            .map(|(a, b_opt)| {
-                if let Some(b) = b_opt {
-                    format!("{},{}", a, b)
-                } else {
-                    format!("{}", a)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(";"),
-        TracepointData::Mixed(items) => items
-            .iter()
-            .map(|item| match item {
-                MixedRepresentation::Tracepoint(a, b) => format!("{},{}", a, b),
-                MixedRepresentation::CigarOp(len, op) => format!("{}{}", len, op),
-            })
-            .collect::<Vec<_>>()
-            .join(";"),
-    }
 }
 
 fn main() -> io::Result<()> {
@@ -140,7 +111,7 @@ fn main() -> io::Result<()> {
         }
 
         // Write tracepoints as tp:Z: tag
-        let tp_str = format_tracepoints(&record.tracepoints);
+        let tp_str = record.tracepoints.to_tp_tag();
         writeln!(writer, "\ttp:Z:{}", tp_str)?;
     }
 

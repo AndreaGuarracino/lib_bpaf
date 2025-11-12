@@ -28,7 +28,7 @@ use crate::utils::{parse_u8, parse_usize};
 
 pub use binary::{
     build_index, BpafIndex, BpafReader, RecordIterator, BINARY_MAGIC,
-    // Mode E: Standalone functions for ultimate performance
+    // Standalone functions for ultimate performance
     read_standard_tracepoints_at_offset, read_variable_tracepoints_at_offset,
     read_mixed_tracepoints_at_offset,
 };

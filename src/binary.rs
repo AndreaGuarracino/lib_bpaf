@@ -305,6 +305,31 @@ fn read_record<R: Read>(
     })
 }
 
+fn read_tracepoints<R: Read>(
+    reader: &mut R,
+    tp_type: TracepointType,
+    strategy: CompressionStrategy,
+) -> io::Result<TracepointData> {
+    let num_items = read_varint(reader)? as usize;
+    match tp_type {
+        TracepointType::Standard | TracepointType::Fastga => {
+            let tps = decode_standard_tracepoints(reader, num_items, strategy)?;
+            Ok(match tp_type {
+                TracepointType::Standard => TracepointData::Standard(tps),
+                _ => TracepointData::Fastga(tps),
+            })
+        }
+        TracepointType::Variable => {
+            let tps = decode_variable_tracepoints(reader, num_items)?;
+            Ok(TracepointData::Variable(tps))
+        }
+        TracepointType::Mixed => {
+            let items = decode_mixed_tracepoints(reader, num_items)?;
+            Ok(TracepointData::Mixed(items))
+        }
+    }
+}
+
 /// Encode tracepoint values based on compression strategy
 #[inline]
 fn encode_tracepoint_values(
@@ -336,6 +361,7 @@ fn encode_tracepoint_values(
 
 /// Decode tracepoint values based on compression strategy
 #[inline]
+#[allow(dead_code)]
 fn decode_tracepoint_values(
     buf: &[u8],
     num_items: usize,
@@ -375,31 +401,6 @@ fn decode_tracepoint_values(
     }
 }
 
-fn read_tracepoints<R: Read>(
-    reader: &mut R,
-    tp_type: TracepointType,
-    strategy: CompressionStrategy,
-) -> io::Result<TracepointData> {
-    let num_items = read_varint(reader)? as usize;
-    match tp_type {
-        TracepointType::Standard | TracepointType::Fastga => {
-            let tps = decode_standard_tracepoints(reader, num_items, strategy)?;
-            Ok(match tp_type {
-                TracepointType::Standard => TracepointData::Standard(tps),
-                _ => TracepointData::Fastga(tps),
-            })
-        }
-        TracepointType::Variable => {
-            let tps = decode_variable_tracepoints(reader, num_items)?;
-            Ok(TracepointData::Variable(tps))
-        }
-        TracepointType::Mixed => {
-            let items = decode_mixed_tracepoints(reader, num_items)?;
-            Ok(TracepointData::Mixed(items))
-        }
-    }
-}
-
 /// Standard/Fastga tracepoint decoding
 #[inline(always)]
 fn decode_standard_tracepoints<R: Read>(
@@ -420,22 +421,55 @@ fn decode_standard_tracepoints<R: Read>(
     let first_buf = zstd::decode_all(&first_compressed[..])?;
     let second_buf = zstd::decode_all(&second_compressed[..])?;
 
-    // Decode values
-    let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
-    let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
+    // Decode directly to (usize, usize) tuples
+    let mut first_reader = &first_buf[..];
+    let mut second_reader = &second_buf[..];
 
-    // Convert to (usize, usize) tuples
     let mut tps = Vec::with_capacity(num_items);
-    for (a, b) in first_vals.into_iter().zip(second_vals) {
-        let a_usize = a as usize;
-        let b_usize = b as usize;
-        tps.push((a_usize, b_usize));
+
+    match strategy {
+        CompressionStrategy::Raw(_) => {
+            // Raw varints - direct decode to usize
+            for _ in 0..num_items {
+                let a = read_varint(&mut first_reader)? as usize;
+                let b = read_varint(&mut second_reader)? as usize;
+                tps.push((a, b));
+            }
+        }
+        CompressionStrategy::ZigzagDelta(_) => {
+            // First values
+            let zigzag_a = read_varint(&mut first_reader)?;
+            let a = (((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64)) as usize;
+
+            let zigzag_b = read_varint(&mut second_reader)?;
+            let b = (((zigzag_b >> 1) as i64) ^ -((zigzag_b & 1) as i64)) as usize;
+
+            tps.push((a, b));
+
+            // Remaining values: zigzag decode + delta accumulate
+            for _ in 1..num_items {
+                let zigzag_a = read_varint(&mut first_reader)?;
+                let delta_a = ((zigzag_a >> 1) as i64) ^ -((zigzag_a & 1) as i64);
+                let prev_a = tps.last().unwrap().0 as i64;
+                let a = (prev_a + delta_a) as usize;
+
+                let zigzag_b = read_varint(&mut second_reader)?;
+                let delta_b = ((zigzag_b >> 1) as i64) ^ -((zigzag_b & 1) as i64);
+                let prev_b = tps.last().unwrap().1 as i64;
+                let b = (prev_b + delta_b) as usize;
+
+                tps.push((a, b));
+            }
+        }
+        CompressionStrategy::Automatic(_) => {
+            panic!("Automatic strategy must be resolved before decoding")
+        }
     }
 
     Ok(tps)
 }
 
-/// Variable tracepoint decoding
+/// Variable tracepoint decoding (only raw varints)
 #[inline(always)]
 fn decode_variable_tracepoints<R: Read>(
     reader: &mut R,
@@ -456,7 +490,7 @@ fn decode_variable_tracepoints<R: Read>(
     Ok(tps)
 }
 
-/// Mixed tracepoint decoding
+/// Mixed tracepoint decoding (only raw varints)
 #[inline(always)]
 fn decode_mixed_tracepoints<R: Read>(
     reader: &mut R,
@@ -792,7 +826,7 @@ impl BpafReader {
         let idx_path = format!("{}.idx", bpaf_path);
 
         let index = if Path::new(&idx_path).exists() {
-            info!("Loading existing index: {}", idx_path);
+            debug!("Loading existing index: {}", idx_path);
             BpafIndex::load(&idx_path)?
         } else {
             info!("No index found, building...");
@@ -813,18 +847,6 @@ impl BpafReader {
             header,
             string_table,
         })
-    }
-
-    /// Load string table (call this if you need sequence names)
-    pub fn load_string_table(&mut self) -> io::Result<()> {
-        if !self.string_table.is_empty() {
-            return Ok(());
-        }
-
-        self.file.seek(SeekFrom::Start(0))?;
-        BinaryPafHeader::read(&mut self.file)?;
-        self.string_table = StringTable::read(&mut self.file)?;
-        Ok(())
     }
 
     /// Get number of records
@@ -850,6 +872,18 @@ impl BpafReader {
         Ok(&self.string_table)
     }
 
+    /// Load string table (call this if you need sequence names)
+    pub fn load_string_table(&mut self) -> io::Result<()> {
+        if !self.string_table.is_empty() {
+            return Ok(());
+        }
+
+        self.file.seek(SeekFrom::Start(0))?;
+        BinaryPafHeader::read(&mut self.file)?;
+        self.string_table = StringTable::read(&mut self.file)?;
+        Ok(())
+    }
+
     /// Get immutable reference to string table (must be loaded first with load_string_table)
     pub fn string_table_ref(&self) -> &StringTable {
         &self.string_table
@@ -857,17 +891,6 @@ impl BpafReader {
 
     /// Get full alignment record by ID - O(1) random access
     pub fn get_alignment_record(&mut self, record_id: u64) -> io::Result<AlignmentRecord> {
-        if record_id >= self.index.len() as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Record ID {} out of range (max: {})",
-                    record_id,
-                    self.index.len() - 1
-                ),
-            ));
-        }
-
         let offset = self.index.offsets[record_id as usize];
         self.get_alignment_record_at_offset(offset)
     }
@@ -883,6 +906,15 @@ impl BpafReader {
             strategy,
             self.header.tracepoint_type,
         )
+    }
+
+    /// Get tracepoints by record ID
+    pub fn get_tracepoints(
+        &mut self,
+        record_id: u64,
+    ) -> io::Result<(TracepointData, ComplexityMetric, u64)> {
+        let tracepoint_offset = self.get_tracepoint_offset(record_id)?;
+        self.get_tracepoints_at_offset(tracepoint_offset)
     }
 
     /// Get tracepoint offset by record ID
@@ -904,15 +936,6 @@ impl BpafReader {
         self.file.seek(SeekFrom::Current(1))?; // mapping_quality
 
         self.file.stream_position()
-    }
-
-    /// Get tracepoints by record ID
-    pub fn get_tracepoints(
-        &mut self,
-        record_id: u64,
-    ) -> io::Result<(TracepointData, ComplexityMetric, u64)> {
-        let tracepoint_offset = self.get_tracepoint_offset(record_id)?;
-        self.get_tracepoints_at_offset(tracepoint_offset)
     }
 
     /// Get tracepoints by tracepoint offset
@@ -948,7 +971,7 @@ impl BpafReader {
 }
 
 // ============================================================================
-// MODE E: STANDALONE FUNCTIONS (NO BPAFREADER OVERHEAD)
+// STANDALONE FUNCTIONS (NO BPAFREADER OVERHEAD)
 // ============================================================================
 
 /// Fastest access: decode standard tracepoints directly from file at offset.
