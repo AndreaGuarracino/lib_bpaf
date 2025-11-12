@@ -65,16 +65,34 @@ match &tracepoints {
 }
 ```
 
-### Read with file offsets (faster open)
+### Fast tracepoint access
+
+For maximum speed when you have pre-computed offsets:
 
 ```rust
-// Skip index loading if you store offsets externally
-let mut reader = BpafReader::open_without_index("alignments.bpaf")?;
+use lib_bpaf::{read_standard_tracepoints_at_offset,
+               read_variable_tracepoints_at_offset,
+               read_mixed_tracepoints_at_offset,
+               CompressionStrategy};
+use std::fs::File;
 
-// Access by byte offset
+// Open file once (reuse for multiple seeks)
+let mut file = File::open("alignments.bpaf")?;
+
+// Pre-computed offsets and strategy from index/header
 let offset = 123456;
-let record = reader.get_alignment_record_at_offset(offset)?;
+let strategy = CompressionStrategy::ZigzagDelta(3);
+
+// Direct tracepoint decoding - no BpafReader overhead
+let standard_tps = read_standard_tracepoints_at_offset(&mut file, offset, strategy)?;
+let variable_tps = read_variable_tracepoints_at_offset(&mut file, offset)?;
+let mixed_tps = read_mixed_tracepoints_at_offset(&mut file, offset)?;
 ```
+
+**Use when**:
+- You have pre-computed tracepoint offsets (from index)
+- Only need tracepoints (not full alignment records)
+- Processing many records in tight loops
 
 ### Sequential iteration
 

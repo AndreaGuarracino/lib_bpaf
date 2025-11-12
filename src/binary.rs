@@ -421,17 +421,17 @@ fn read_tracepoints<R: Read>(
             })
         }
         TracepointType::Variable => {
-            let tps = read_variable_tracepoint_items(reader, num_items)?;
+            let tps = decode_variable_tracepoints(reader, num_items)?;
             Ok(TracepointData::Variable(tps))
         }
         TracepointType::Mixed => {
-            let items = read_mixed_tracepoint_items(reader, num_items)?;
+            let items = decode_mixed_tracepoints(reader, num_items)?;
             Ok(TracepointData::Mixed(items))
         }
     }
 }
 
-/// Standard/Fastga tracepoint decoding - fully inlined for zero overhead
+/// Standard/Fastga tracepoint decoding
 #[inline(always)]
 fn decode_standard_tracepoints<R: Read>(
     reader: &mut R,
@@ -466,7 +466,9 @@ fn decode_standard_tracepoints<R: Read>(
     Ok(tps)
 }
 
-fn read_variable_tracepoint_items<R: Read>(
+/// Variable tracepoint decoding
+#[inline(always)]
+fn decode_variable_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
 ) -> io::Result<Vec<(usize, Option<usize>)>> {
@@ -485,7 +487,9 @@ fn read_variable_tracepoint_items<R: Read>(
     Ok(tps)
 }
 
-fn read_mixed_tracepoint_items<R: Read>(
+/// Mixed tracepoint decoding
+#[inline(always)]
+fn decode_mixed_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
 ) -> io::Result<Vec<MixedRepresentation>> {
@@ -842,24 +846,6 @@ impl BpafReader {
         })
     }
 
-    /// Open a BPAF file without index (for offset-based access only)
-    pub fn open_without_index(bpaf_path: &str) -> io::Result<Self> {
-        let mut file = File::open(bpaf_path)?;
-        let header = BinaryPafHeader::read(&mut file)?;
-
-        let index = BpafIndex {
-            offsets: Vec::new(),
-        };
-        let string_table = StringTable::new();
-
-        Ok(Self {
-            file,
-            index,
-            header,
-            string_table,
-        })
-    }
-
     /// Load string table (call this if you need sequence names)
     pub fn load_string_table(&mut self) -> io::Result<()> {
         if !self.string_table.is_empty() {
@@ -983,19 +969,6 @@ impl BpafReader {
         Ok((tracepoints, complexity_metric, max_complexity))
     }
 
-    /// Get standard tracepoints by tracepoint offset
-    /// Fully specialized for TracepointType::Standard with known strategy
-    #[inline]
-    pub fn get_standard_tracepoints_at_offset(
-        &mut self,
-        tracepoint_offset: u64,
-        strategy: CompressionStrategy,
-    ) -> io::Result<Vec<(usize, usize)>> {
-        self.file.seek(SeekFrom::Start(tracepoint_offset))?;
-        let num_items = read_varint(&mut self.file)? as usize;
-        decode_standard_tracepoints(&mut self.file, num_items, strategy)
-    }
-
     /// Iterator over all records (sequential access)
     pub fn iter_records(&mut self) -> RecordIterator<'_> {
         RecordIterator {
@@ -1003,6 +976,47 @@ impl BpafReader {
             current_id: 0,
         }
     }
+}
+
+// ============================================================================
+// MODE E: STANDALONE FUNCTIONS (NO BPAFREADER OVERHEAD)
+// ============================================================================
+
+/// Fastest access: decode standard tracepoints directly from file at offset.
+/// Requires pre-computed offset and compression strategy.
+#[inline]
+pub fn read_standard_tracepoints_at_offset<R: Read + Seek>(
+    file: &mut R,
+    offset: u64,
+    strategy: CompressionStrategy,
+) -> io::Result<Vec<(usize, usize)>> {
+    file.seek(SeekFrom::Start(offset))?;
+    let num_items = read_varint(file)? as usize;
+    decode_standard_tracepoints(file, num_items, strategy)
+}
+
+/// Fastest access: decode variable tracepoints directly from file at offset.
+/// Requires pre-computed offset.
+#[inline]
+pub fn read_variable_tracepoints_at_offset<R: Read + Seek>(
+    file: &mut R,
+    offset: u64,
+) -> io::Result<Vec<(usize, Option<usize>)>> {
+    file.seek(SeekFrom::Start(offset))?;
+    let num_items = read_varint(file)? as usize;
+    decode_variable_tracepoints(file, num_items)
+}
+
+/// Fastest access: decode mixed tracepoints directly from file at offset.
+/// Requires pre-computed offset.
+#[inline]
+pub fn read_mixed_tracepoints_at_offset<R: Read + Seek>(
+    file: &mut R,
+    offset: u64,
+) -> io::Result<Vec<MixedRepresentation>> {
+    file.seek(SeekFrom::Start(offset))?;
+    let num_items = read_varint(file)? as usize;
+    decode_mixed_tracepoints(file, num_items)
 }
 
 pub struct RecordIterator<'a> {

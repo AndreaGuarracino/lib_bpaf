@@ -26,7 +26,12 @@ pub use lib_tracepoints::{MixedRepresentation, TracepointData, TracepointType};
 use crate::format::parse_tag;
 use crate::utils::{parse_u8, parse_usize};
 
-pub use binary::{build_index, BpafIndex, BpafReader, RecordIterator, BINARY_MAGIC};
+pub use binary::{
+    build_index, BpafIndex, BpafReader, RecordIterator, BINARY_MAGIC,
+    // Mode E: Standalone functions for ultimate performance
+    read_standard_tracepoints_at_offset, read_variable_tracepoints_at_offset,
+    read_mixed_tracepoints_at_offset,
+};
 
 use crate::binary::{analyze_smart_compression, decompress_varint};
 
