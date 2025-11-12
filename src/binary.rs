@@ -36,6 +36,7 @@ fn delta_encode(values: &[u64]) -> Vec<i64> {
 
 /// Delta decode back to positions
 #[inline]
+#[allow(dead_code)]
 fn delta_decode(deltas: &[i64]) -> Vec<u64> {
     let mut values = Vec::with_capacity(deltas.len());
     if deltas.is_empty() {

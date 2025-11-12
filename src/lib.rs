@@ -429,18 +429,18 @@ fn parse_tracepoints(tp_str: &str, tp_type: TracepointType) -> io::Result<Tracep
             let mut tps = Vec::new();
             for part in segments {
                 let coords: Vec<&str> = part.split(',').collect();
+                if coords.len() != 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid mixed tracepoint format: '{}'", part),
+                    ));
+                }
                 let first = coords[0].parse::<usize>().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "Invalid first value")
                 })?;
-                // Handle Mixed tracepoints: single values have no comma
-                let second = if coords.len() > 1 {
-                    coords[1].parse::<usize>().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
-                    })?
-                } else {
-                    // Single value - use same value for both positions
-                    first
-                };
+                let second = coords[1].parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Invalid second value")
+                })?;
                 tps.push((first, second));
             }
 
