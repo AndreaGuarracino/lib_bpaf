@@ -6,9 +6,9 @@ Binary format for genomic sequence alignments with tracepoints.
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Automatic (default)**: Analyzes data to choose delta vs raw encoding + varint + zstd
-  - **DeltaVarintZstd**: Delta encoding + varint + zstd
-  - **VarintZstd**: No delta encoding + varint + zstd
+  - **Automatic (default)**: Samples data to choose between raw or delta+zigzag encoding
+  - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
+  - **Raw**: Plain varints + zstd
 - **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
 - **String deduplication**: Shared sequence name table
 - **Byte-aligned encoding**: Enables extremely fast tracepoint extraction
@@ -16,24 +16,27 @@ Binary format for genomic sequence alignments with tracepoints.
 ## Format
 
 ```
-[Header] → [Records] → [StringTable]
+[Header] → [StringTable] → [Records]
 ```
 
-### Header (6+ bytes)
+### Header (metadata + strategy)
 - Magic: `BPAF` (4 bytes)
 - Version: `1` (1 byte)
-- Strategy: `0-1` (1 byte) - 0=varint, 1=varint-raw
+- Strategy: `0-1` (1 byte) - 0=Raw, 1=ZigzagDelta (Automatic resolves to one of these)
 - Record count: varint
 - String count: varint
+- Tracepoint type: `1` byte
+- Complexity metric: `1` byte
+- Max complexity / spacing: varint
+- Distance parameters: serialized to match `lib_wfa2::Distance`
 
 ### Records (per alignment)
 - **PAF fields**: varints for positions, 1-byte strand/quality
-- **Tracepoint metadata**: type (1 byte), complexity metric (1 byte), max_complexity (varint)
 - **Tracepoints**: Byte-aligned varint-encoded (first_values, second_values) pairs
 - **Tags**: Optional key-value pairs
 
 ### String Table
-- Deduplicated sequence names (length + UTF-8 bytes)
+- Follows the header and stores deduplicated sequence names (length + UTF-8 bytes)
 
 ## Installation
 
@@ -114,23 +117,22 @@ use lib_bpaf::{compress_paf_with_tracepoints, CompressionStrategy};
 // - Enables O(1) random tracepoint access
 compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Automatic(3))?;
 
-// DeltaVarintZstd: Delta encoding + varint + zstd
+// ZigzagDelta: Delta + zigzag transform (both values) + varint + zstd
 // - Always uses delta encoding for tracepoints
-// - Works well when values are naturally small or monotonic
+// - Works well when values are monotonic or slowly changing
 // - Enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::DeltaVarintZstd(3))?;
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::ZigzagDelta(3))?;
 
-// VarintZstd: No delta + varint + zstd
-// - All types: raw first values
-// - Use if delta encoding doesn't help your data
+// Raw: No delta, direct varints + zstd compression
+// - Ideal when deltas are noisy or large
 // - Also enables O(1) random tracepoint access
-compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::VarintZstd(3))?;
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Raw(3))?;
 ```
 
 **Strategy guide:**
-- **Automatic (default)**: Best for most use cases, analyzes data to choose optimal encoding
-- **DeltaVarintZstd**: Use when you know delta encoding helps your data
-- **VarintZstd**: Test if delta encoding creates too many unique symbols for your data
+- **Automatic (default)**: Best for most use cases, analyzes data to choose Raw or ZigzagDelta
+- **ZigzagDelta**: Use when tracepoint values are mostly increasing (better delta compression)
+- **Raw**: Use when tracepoint values jump frequently and delta encoding increases entropy
 
 ### Index management
 

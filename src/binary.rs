@@ -126,18 +126,18 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level:
 
         // Process first values: delta + zigzag + varint
         if !all_first_vals.is_empty() {
-            let first_val = all_first_vals[0];
-            first_val_buf.extend_from_slice(&encode_varint_inline(encode_zigzag(first_val as i64)));
-
-            for i in 1..all_first_vals.len() {
-                let delta = all_first_vals[i] as i64 - all_first_vals[i-1] as i64;
+            let deltas = delta_encode(&all_first_vals);
+            for delta in deltas {
                 first_val_buf.extend_from_slice(&encode_varint_inline(encode_zigzag(delta)));
             }
         }
 
-        // Process second values: just varint (NO delta, NO zigzag)
-        for &val in &all_second_vals {
-            second_val_buf.extend_from_slice(&encode_varint_inline(val));
+        // Process second values: delta + zigzag + varint
+        if !all_second_vals.is_empty() {
+            let deltas = delta_encode(&all_second_vals);
+            for delta in deltas {
+                second_val_buf.extend_from_slice(&encode_varint_inline(encode_zigzag(delta)));
+            }
         }
 
         // Compress with zstd
@@ -697,6 +697,12 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
     let mut reader = BufReader::with_capacity(131072, file);
 
     let header = BinaryPafHeader::read(&mut reader)?;
+    if header.version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported format version: {}", header.version),
+        ));
+    }
     StringTable::read(&mut reader)?;
 
     let mut offsets = Vec::with_capacity(header.num_records as usize);
@@ -838,6 +844,12 @@ impl BpafReader {
 
         let mut file = File::open(bpaf_path)?;
         let header = BinaryPafHeader::read(&mut file)?;
+        if header.version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported format version: {}", header.version),
+            ));
+        }
 
         let string_table = StringTable::new();
 

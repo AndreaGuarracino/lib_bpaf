@@ -1,4 +1,4 @@
-/// Demo of offset-based access without index loading
+/// Demo of offset-based access using direct file offsets
 use lib_bpaf::{BpafReader, TracepointData};
 use std::time::Instant;
 
@@ -22,13 +22,13 @@ fn main() -> std::io::Result<()> {
     let bpaf_path = &args[1];
     let offset: u64 = args[2].parse().expect("Invalid offset");
 
-    println!("Opening {} WITHOUT index...", bpaf_path);
+    println!("Opening {}...", bpaf_path);
     let start = Instant::now();
-    let mut reader = BpafReader::open_without_index(bpaf_path)?;
+    let mut reader = BpafReader::open(bpaf_path)?;
     let open_time = start.elapsed();
 
     println!(
-        "✓ Opened in {:.3}ms (no index loaded)",
+        "✓ Opened in {:.3}ms (index-backed)",
         open_time.as_secs_f64() * 1000.0
     );
     println!();
