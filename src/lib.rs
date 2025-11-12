@@ -33,6 +33,9 @@ pub use binary::{
     read_mixed_tracepoints_at_offset,
 };
 
+// Re-export utility functions for external tools
+pub use utils::{read_varint, varint_size};
+
 use crate::binary::{analyze_smart_compression, decompress_varint};
 
 use crate::utils::open_paf_reader;

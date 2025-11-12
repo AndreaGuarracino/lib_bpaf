@@ -199,7 +199,7 @@ impl BinaryPafHeader {
         Ok(())
     }
 
-    pub(crate) fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
+    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != BINARY_MAGIC {
@@ -296,7 +296,7 @@ impl StringTable {
         Ok(())
     }
 
-    pub(crate) fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
+    pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let num_strings = read_varint(reader)? as usize;
         let mut strings = Vec::with_capacity(num_strings);
         let mut lengths = Vec::with_capacity(num_strings);
@@ -433,13 +433,4 @@ pub fn format_tag(tag: &Tag) -> String {
         TagValue::Float(v) => format!("{}:{}:{}", key, tag_type, v),
         TagValue::String(s) => format!("{}:Z:{}", key, s),
     }
-}
-
-/// CIGAR operation
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CigarOp {
-    Match = 0,
-    Mismatch = 1,
-    Insertion = 2,
-    Deletion = 3,
 }

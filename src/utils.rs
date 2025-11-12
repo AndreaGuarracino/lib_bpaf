@@ -36,7 +36,7 @@ pub(crate) fn write_varint<W: Write>(writer: &mut W, value: u64) -> io::Result<u
 
 /// Read a varint from a reader
 #[inline]
-pub(crate) fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
+pub fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
     let mut value: u64 = 0;
     let mut shift = 0;
     loop {
@@ -56,6 +56,24 @@ pub(crate) fn read_varint<R: Read>(reader: &mut R) -> io::Result<u64> {
         }
     }
     Ok(value)
+}
+
+/// Calculate the encoded size of a varint in bytes
+///
+/// Returns the exact number of bytes required to encode the given value
+/// using LEB128 variable-length encoding (7 bits per byte + continuation bit).
+#[inline]
+pub fn varint_size(value: u64) -> u64 {
+    if value < (1 << 7) { 1 }
+    else if value < (1 << 14) { 2 }
+    else if value < (1 << 21) { 3 }
+    else if value < (1 << 28) { 4 }
+    else if value < (1 << 35) { 5 }
+    else if value < (1 << 42) { 6 }
+    else if value < (1 << 49) { 7 }
+    else if value < (1 << 56) { 8 }
+    else if value < (1 << 63) { 9 }
+    else { 10 }
 }
 
 // ============================================================================

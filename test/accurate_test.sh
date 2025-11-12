@@ -12,8 +12,12 @@ CIGZIP_DIR="/home/guarracino/Dropbox/git/cigzip"
 CIGAR_PAF="${1:-/home/guarracino/git/impg/hprcv2/data/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz}"
 MAX_COMPLEXITY="${2:-32}"
 COMPLEXITY_METRIC="${3:-edit-distance}"
+DISTANCE_METRIC="gap-affine"
+PENALTIES="5,8,2"
 NUM_RECORDS=20000
 SEEK_ITERATIONS=1000
+SEEK_PER_RECORD=100
+PAF_SEEK_BIN="$REPO_DIR/target/release/examples/paf_seek_bench"
 
 # Tracepoint types to test
 TP_TYPES=("standard" "variable" "mixed")
@@ -64,6 +68,7 @@ echo
 echo "=== Building lib_bpaf test programs ==="
 cd "$REPO_DIR"
 cargo build --release 2>&1 | tail -3
+cargo build --release --example paf_seek_bench 2>&1 | tail -3
 
 # Build seek test program (Mode A - with index)
 cat > /tmp/seek_test_mode_a.rs << 'RUST_EOF'
@@ -190,6 +195,24 @@ echo "Size:      $SIZE ($SIZE_BYTES bytes)"
 echo
 echo
 
+echo "=== Benchmarking PAF BGZF CIGAR seeks ==="
+PAF_SEEK_TIME="N/A"
+PAF_INDEXED=0
+if [ -x "$PAF_SEEK_BIN" ]; then
+    PAF_SEEK_OUTPUT=$("$PAF_SEEK_BIN" "$CIGAR_PAF" "$EXTRACTED" 10 "$SEEK_PER_RECORD" 2>&1 || true)
+    echo "$PAF_SEEK_OUTPUT"
+    if [[ $PAF_SEEK_OUTPUT =~ PAF_INDEXED[[:space:]]+([0-9]+) ]]; then
+        PAF_INDEXED="${BASH_REMATCH[1]}"
+    fi
+    if [[ $PAF_SEEK_OUTPUT =~ PAF_SEEK[[:space:]]+([0-9.]+) ]]; then
+        PAF_SEEK_TIME="${BASH_REMATCH[1]}"
+    fi
+else
+    echo "Warning: paf_seek_bench binary not found at $PAF_SEEK_BIN"
+fi
+echo
+echo
+
 # Test each tracepoint type
 for TP_TYPE in "${TP_TYPES[@]}"; do
     echo "###################################################################"
@@ -222,8 +245,17 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     echo "========================================"
     
     START_TIME=$(date +%s.%N)
-    env RUST_LOG=info $CIGZIP compress -i /tmp/test.$TP_TYPE.tp.paf \
-        -o /tmp/test.$TP_TYPE.bpaf 2>&1 | grep -E "INFO|Compressed"
+    rm -f /tmp/test.$TP_TYPE.bpaf.idx
+    COMPRESS_LOG=$(env RUST_LOG=info $CIGZIP compress -i /tmp/test.$TP_TYPE.tp.paf \
+        -o /tmp/test.$TP_TYPE.bpaf \
+        --type "$TP_TYPE" \
+        --max-complexity "$MAX_COMPLEXITY" \
+        --complexity-metric "$COMPLEXITY_METRIC" \
+        --distance "$DISTANCE_METRIC" \
+        --penalties "$PENALTIES" 2>&1)
+    if ! echo "$COMPRESS_LOG" | grep -E "INFO|Compressed"; then
+        echo "$COMPRESS_LOG"
+    fi
     END_TIME=$(date +%s.%N)
     
     BPAF_SIZE=$(du -h /tmp/test.$TP_TYPE.bpaf | cut -f1)
@@ -239,22 +271,24 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     echo "TEST 3 ($TP_TYPE): Decompress BPAF → Tracepoints"
     echo "========================================"
     
-    /usr/bin/time -l $CIGZIP decompress -i /tmp/test.$TP_TYPE.bpaf \
-        -o /tmp/test.$TP_TYPE.decomp.paf 2>&1 | tee /tmp/decomp_stats.txt | head -10
+    START_TIME=$(date +%s.%N)
+    $CIGZIP decompress -i /tmp/test.$TP_TYPE.bpaf \
+        -o /tmp/test.$TP_TYPE.decomp.paf
+    END_TIME=$(date +%s.%N)
     
-    DECOMP_TIME[$TP_TYPE]=$(grep "real" /tmp/decomp_stats.txt | awk '{print $2}' || echo "N/A")
-    DECOMP_MEM[$TP_TYPE]=$(grep "maximum resident set size" /tmp/decomp_stats.txt | awk '{print $1}' || echo "N/A")
+    DECOMP_TIME[$TP_TYPE]=$(echo "$END_TIME - $START_TIME" | bc -l)
+    DECOMP_MEM[$TP_TYPE]="N/A"
     
     echo "Decomp time:  ${DECOMP_TIME[$TP_TYPE]}s"
     echo "Memory:       ${DECOMP_MEM[$TP_TYPE]} KB"
-    
-    # Normalize floats to 3 decimals and compute MD5
-    perl -pe 's/(\d+\.\d{3})\d+/$1/g' /tmp/test.$TP_TYPE.tp.paf | md5sum > /tmp/orig.md5
-    perl -pe 's/(\d+\.\d{3})\d+/$1/g' /tmp/test.$TP_TYPE.decomp.paf | md5sum > /tmp/decomp.md5
-    
+
+    # Normalize floats to 3 decimal places and compute MD5
+    perl -pe 's/(\d+\.\d{3})\d*/$1/g' /tmp/test.$TP_TYPE.tp.paf | md5sum > /tmp/orig.md5
+    perl -pe 's/(\d+\.\d{3})\d*/$1/g' /tmp/test.$TP_TYPE.decomp.paf | md5sum > /tmp/decomp.md5
+
     ORIG_MD5=$(cut -d' ' -f1 /tmp/orig.md5)
     DECOMP_MD5=$(cut -d' ' -f1 /tmp/decomp.md5)
-    
+
     if [ "$ORIG_MD5" = "$DECOMP_MD5" ]; then
         echo "✓ Tracepoints verified: Perfect match (MD5: $ORIG_MD5, normalized to 3 decimal places for all floats)"
         VERIFIED[$TP_TYPE]="✓ Perfect match"
@@ -277,7 +311,7 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     TOTAL_TIME_A=0
     COUNT_A=0
     for i in $(seq 0 10 $((EXTRACTED - 1))); do
-        OUTPUT=$(/tmp/seek_test_mode_a /tmp/test.$TP_TYPE.bpaf "$i" 100 2>/dev/null)
+        OUTPUT=$(/tmp/seek_test_mode_a /tmp/test.$TP_TYPE.bpaf "$i" "$SEEK_PER_RECORD" 2>/dev/null)
         if [[ $OUTPUT =~ MODEA_SEEK[[:space:]]+([0-9.]+) ]]; then
             TIME="${BASH_REMATCH[1]}"
             TOTAL_TIME_A=$(echo "$TOTAL_TIME_A + $TIME" | bc -l)
@@ -295,7 +329,7 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     TOTAL_TIME_B=0
     COUNT_B=0
     for i in $(seq 0 10 $((EXTRACTED - 1))); do
-        OUTPUT=$(/tmp/seek_test_mode_b /tmp/test.$TP_TYPE.bpaf "$i" 100 "$TP_TYPE" 2>/dev/null)
+        OUTPUT=$(/tmp/seek_test_mode_b /tmp/test.$TP_TYPE.bpaf "$i" "$SEEK_PER_RECORD" "$TP_TYPE" 2>/dev/null)
         if [[ $OUTPUT =~ MODEB_SEEK[[:space:]]+([0-9.]+) ]]; then
             TIME="${BASH_REMATCH[1]}"
             TOTAL_TIME_B=$(echo "$TOTAL_TIME_B + $TIME" | bc -l)
@@ -356,6 +390,11 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     printf "  %-10s: %sx (CIGAR: %s bytes → BPAF: %s bytes)\n" \
         "$TP_TYPE" "$RATIO" "$SIZE_BYTES" "${COMPRESS_SIZE[$TP_TYPE]}"
 done
+echo
+
+echo "PAF BGZF (cg:Z:) seek benchmark:"
+echo "  Records indexed: $PAF_INDEXED"
+echo "  Average seek time: ${PAF_SEEK_TIME} μs (stride 10, ${SEEK_PER_RECORD} iterations)"
 echo
 
 echo "Seek Mode Legend:"
