@@ -11,6 +11,68 @@ use crate::format::*;
 use crate::utils::*;
 
 // ============================================================================
+// COMPRESSION LAYER ABSTRACTION
+// ============================================================================
+
+/// Compress data using the specified compression layer
+fn compress_with_layer(data: &[u8], layer: CompressionLayer, level: i32) -> io::Result<Vec<u8>> {
+    match layer {
+        CompressionLayer::Zstd => {
+            zstd::encode_all(data, level).map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("Zstd compression failed: {}", e))
+            })
+        }
+        CompressionLayer::Bgzip => {
+            // Use bgzip crate for BGZF compression
+            use bgzip::write::BGZFWriter;
+            let mut compressed = Vec::new();
+            {
+                let compression = bgzip::Compression::new(level as u32).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid bgzip compression level: {}", e))
+                })?;
+                let mut writer = BGZFWriter::new(&mut compressed, compression);
+                writer.write_all(data)?;
+            } // BGZFWriter flushes on drop
+            Ok(compressed)
+        }
+        CompressionLayer::Nocomp => {
+            // No compression - return data as-is
+            Ok(data.to_vec())
+        }
+    }
+}
+
+/// Decompress data by auto-detecting the compression format
+/// BGZF has magic bytes 1f 8b at start (gzip header)
+/// Zstd has magic bytes 28 b5 2f fd
+/// No magic bytes = uncompressed data
+fn decompress_auto(data: &[u8]) -> io::Result<Vec<u8>> {
+    if data.len() < 2 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Data too short"));
+    }
+
+    // Check for BGZF/gzip magic bytes (1f 8b)
+    if data[0] == 0x1f && data[1] == 0x8b {
+        // Use bgzip crate for BGZF decompression
+        use bgzip::read::BGZFReader;
+        let mut reader = BGZFReader::new(data).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("BGZF decompression failed: {}", e))
+        })?;
+        let mut decompressed = Vec::new();
+        reader.read_to_end(&mut decompressed)?;
+        Ok(decompressed)
+    } else if data.len() >= 4 && data[0] == 0x28 && data[1] == 0xb5 && data[2] == 0x2f && data[3] == 0xfd {
+        // Zstd magic bytes detected
+        zstd::decode_all(data).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("Zstd decompression failed: {}", e))
+        })
+    } else {
+        // No recognized compression magic bytes - assume uncompressed
+        Ok(data.to_vec())
+    }
+}
+
+// ============================================================================
 // CONSTANTS
 // ============================================================================
 
@@ -235,10 +297,11 @@ fn test_strategy_on_sample(
         }
     };
 
-    // Compress both with zstd
+    // Compress both with the current compression layer
     let zstd_level = strategy.zstd_level();
-    let first_compressed = zstd::encode_all(&first_buf[..], zstd_level)?;
-    let second_compressed = zstd::encode_all(&second_buf[..], zstd_level)?;
+    let layer = CompressionLayer::current();
+    let first_compressed = compress_with_layer(&first_buf[..], layer, zstd_level)?;
+    let second_compressed = compress_with_layer(&second_buf[..], layer, zstd_level)?;
 
     Ok(first_compressed.len() + second_compressed.len())
 }
@@ -653,14 +716,6 @@ fn encode_tracepoint_values(
             // Selective RLE: detect and encode runs
             buf = crate::hybrids::encode_selective_rle(vals)?;
         }
-        CompressionStrategy::RiceEntropy(_) => {
-            // Rice/Golomb entropy coding
-            buf = crate::advanced_codecs::encode_rice(vals)?;
-        }
-        CompressionStrategy::HuffmanEntropy(_) => {
-            // Huffman entropy coding
-            buf = crate::advanced_codecs::encode_huffman(vals)?;
-        }
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before encoding")
         }
@@ -960,14 +1015,6 @@ fn decode_tracepoint_values(
             // Selective RLE decode
             crate::hybrids::decode_selective_rle(buf)
         }
-        CompressionStrategy::RiceEntropy(_) => {
-            // Rice/Golomb entropy decoding
-            crate::advanced_codecs::decode_rice(buf)
-        }
-        CompressionStrategy::HuffmanEntropy(_) => {
-            // Huffman entropy decoding
-            crate::advanced_codecs::decode_huffman(buf)
-        }
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before decoding")
         }
@@ -1010,9 +1057,9 @@ fn decode_standard_tracepoints<R: Read>(
     let mut second_compressed = vec![0u8; second_len];
     reader.read_exact(&mut second_compressed)?;
 
-    // Decompress
-    let first_buf = zstd::decode_all(&first_compressed[..])?;
-    let second_buf = zstd::decode_all(&second_compressed[..])?;
+    // Decompress (auto-detect compression format)
+    let first_buf = decompress_auto(&first_compressed[..])?;
+    let second_buf = decompress_auto(&second_compressed[..])?;
 
     // Decode directly to (usize, usize) tuples
     let mut first_reader = &first_buf[..];
@@ -1183,8 +1230,7 @@ fn decode_standard_tracepoints<R: Read>(
         CompressionStrategy::XORDelta(_) | CompressionStrategy::Dictionary(_) |
         CompressionStrategy::Simple8(_) | CompressionStrategy::StreamVByte(_) |
         CompressionStrategy::FastPFOR(_) | CompressionStrategy::Cascaded(_) |
-        CompressionStrategy::Simple8bFull(_) | CompressionStrategy::SelectiveRLE(_) |
-        CompressionStrategy::RiceEntropy(_) | CompressionStrategy::HuffmanEntropy(_) => {
+        CompressionStrategy::Simple8bFull(_) | CompressionStrategy::SelectiveRLE(_) => {
             // These strategies use standard encoding for both streams
             let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
             let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
@@ -1385,9 +1431,10 @@ impl AlignmentRecord {
                     }
                 };
 
-                let first_compressed = zstd::encode_all(&first_val_buf[..], strategy.zstd_level())?;
+                let layer = CompressionLayer::current();
+                let first_compressed = compress_with_layer(&first_val_buf[..], layer, strategy.zstd_level())?;
                 let second_compressed =
-                    zstd::encode_all(&second_val_buf[..], strategy.zstd_level())?;
+                    compress_with_layer(&second_val_buf[..], layer, strategy.zstd_level())?;
 
                 write_varint(writer, first_compressed.len() as u64)?;
                 writer.write_all(&first_compressed)?;

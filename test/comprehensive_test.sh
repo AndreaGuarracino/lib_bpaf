@@ -104,7 +104,7 @@ else
 fi
 
 EXTRACTED=$(wc -l < "$OUTPUT_DIR/input_sample.paf")
-SIZE=$(stat -c%s "$OUTPUT_DIR/input_sample.paf" 2>/dev/null || stat -f%z "$OUTPUT_DIR/input_sample.paf")
+SIZE=$(stat -c %s "$OUTPUT_DIR/input_sample.paf" 2>/dev/null || stat -f %z "$OUTPUT_DIR/input_sample.paf")
 echo "Extracted: $EXTRACTED records ($SIZE bytes)"
 echo ""
 
@@ -282,10 +282,12 @@ declare -A DECOMPRESS_TIME DECOMPRESS_MEM
 declare -A SEEK_A SEEK_B SEEK_A_STDDEV SEEK_B_STDDEV SEEK_SUCCESS_RATIO
 declare -A VERIFIED
 declare -A TP_SIZE
+declare -A BGZIP_TIME BGZIP_MEM BGZIP_SIZE
 
 # Determine tracepoint types to test
 if [ "$INPUT_TYPE" = "cigar" ]; then
-    TP_TYPES=("standard" "variable" "mixed")
+    #TP_TYPES=("standard" "variable" "mixed")
+    TP_TYPES=("standard") # Focus on standard for now
     echo "=== Encoding CIGAR to all tracepoint types ==="
     for TP_TYPE in "${TP_TYPES[@]}"; do
         echo "  Encoding $TP_TYPE..."
@@ -310,8 +312,34 @@ else
     echo ""
 fi
 
+# Compress tracepoint PAF files with BGZIP for comparison (if bgzip is available)
+if command -v bgzip &> /dev/null; then
+    echo "=== Compressing tracepoint PAF files with BGZIP ==="
+    for TP_TYPE in "${TP_TYPES[@]}"; do
+        TP_PAF="$OUTPUT_DIR/${TP_TYPE}.tp.paf"
+        if [ -f "$TP_PAF" ]; then
+            echo "  Compressing ${TP_TYPE}.tp.paf with bgzip..."
+            /usr/bin/time -v bgzip -c "$TP_PAF" > "${TP_PAF}.gz" 2> "$OUTPUT_DIR/${TP_TYPE}_bgzip.log"
+
+            # Extract compression metrics
+            BGZIP_TIME[$TP_TYPE]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${TP_TYPE}_bgzip.log" | awk '{print $8}')
+            BGZIP_MEM[$TP_TYPE]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${TP_TYPE}_bgzip.log" | awk '{print $6}')
+            BGZIP_SIZE[$TP_TYPE]=$(stat -f%z "${TP_PAF}.gz" 2>/dev/null || stat -c%s "${TP_PAF}.gz")
+            TP_SIZE[$TP_TYPE]=$(stat -f%z "$TP_PAF" 2>/dev/null || stat -c%s "$TP_PAF")
+
+            echo "    Uncompressed: $(numfmt --to=iec ${TP_SIZE[$TP_TYPE]})"
+            echo "    BGZIP:        $(numfmt --to=iec ${BGZIP_SIZE[$TP_TYPE]}) ($(awk "BEGIN {printf \"%.2f\", ${TP_SIZE[$TP_TYPE]}/${BGZIP_SIZE[$TP_TYPE]}}")x compression)"
+        fi
+    done
+    echo "✓ BGZIP compression complete"
+else
+    echo "=== BGZIP compression skipped (bgzip not found in PATH) ==="
+fi
+echo ""
+
 # Compression strategies
-STRATEGIES=(
+# Base strategies (will be tested with +zstd and +bgzip)
+BASE_STRATEGIES=(
     "raw"
     "zigzag-delta"
     "2d-delta"
@@ -329,9 +357,25 @@ STRATEGIES=(
     "cascaded"
     "simple8b-full"
     "selective-rle"
-    "rice-entropy"
-    "huffman-entropy"
 )
+
+# Build full strategy list: base+zstd, base-bgzip, and base-nocomp
+STRATEGIES=()
+
+# Add all base strategies with default zstd compression
+for strategy in "${BASE_STRATEGIES[@]}"; do
+    STRATEGIES+=("$strategy")
+done
+
+# Add all base strategies with bgzip compression
+for strategy in "${BASE_STRATEGIES[@]}"; do
+    STRATEGIES+=("${strategy}-bgzip")
+done
+
+# Add all base strategies with no compression layer (level 0)
+for strategy in "${BASE_STRATEGIES[@]}"; do
+    STRATEGIES+=("${strategy}-nocomp")
+done
 
 # Test function
 test_configuration() {
@@ -344,18 +388,24 @@ test_configuration() {
 
     # Store tracepoint PAF size (only once per type)
     if [ -z "${TP_SIZE[$tp_type]}" ]; then
-        TP_SIZE[$tp_type]=$(stat -c%s "$tp_paf" 2>/dev/null || stat -f%z "$tp_paf")
+        TP_SIZE[$tp_type]=$(stat -c %s "$tp_paf" 2>/dev/null || stat -f %z "$tp_paf")
     fi
 
     # Compress
+    # Add ,0 to -nocomp strategies to force compression level 0
+    local strategy_arg="$strategy"
+    if [[ "$strategy" == *"-nocomp" ]]; then
+        strategy_arg="${strategy},0"
+    fi
+
     /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
         --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
         --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-        --strategy "$strategy" 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+        --strategy "$strategy_arg" 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
 
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
     COMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $6}')
-    COMPRESS_SIZE[$key]=$(stat -c%s "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || stat -f%z "$OUTPUT_DIR/${key}.bpaf")
+    COMPRESS_SIZE[$key]=$(stat -c %s "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || stat -f %z "$OUTPUT_DIR/${key}.bpaf")
     
     # Decompress
     /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \

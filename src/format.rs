@@ -5,6 +5,35 @@ use crate::{utils::*, Distance};
 use lib_tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::cell::Cell;
+
+thread_local! {
+    /// Thread-local compression layer override (set by from_str when parsing suffix)
+    static COMPRESSION_LAYER: Cell<Option<CompressionLayer>> = Cell::new(None);
+}
+
+/// Compression layer to use for final compression
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressionLayer {
+    /// Zstd compression (default)
+    Zstd,
+    /// BGZF (blocked gzip) compression
+    Bgzip,
+    /// No compression (store raw encoded data)
+    Nocomp,
+}
+
+impl CompressionLayer {
+    /// Get the current compression layer (from thread-local or default to Zstd)
+    pub fn current() -> Self {
+        COMPRESSION_LAYER.with(|layer| layer.get().unwrap_or(CompressionLayer::Zstd))
+    }
+
+    /// Set the compression layer for the current thread
+    pub fn set_current(layer: CompressionLayer) {
+        COMPRESSION_LAYER.with(|l| l.set(Some(layer)));
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum CompressionStrategy {
@@ -110,47 +139,47 @@ pub enum CompressionStrategy {
     /// - Negligible overhead when runs are absent
     /// - Configurable compression level (max 22, default: 3)
     SelectiveRLE(i32),
-    /// Rice/Golomb entropy coding
-    /// - Optimal for geometric distributions (many small values, few large)
-    /// - Dynamic parameter k where 2^k ≈ mean(values)
-    /// - Encodes as quotient (unary) + remainder (k bits)
-    /// - Expected 5-20% additional compression on skewed data
-    /// - Configurable compression level (max 22, default: 3)
-    RiceEntropy(i32),
-    /// Huffman entropy coding
-    /// - Canonical Huffman for values 0-255, escape codes for larger
-    /// - Shorter codes for frequent values (e.g., 0 → 1 bit)
-    /// - Dynamic code table built from frequency analysis
-    /// - Expected 5-20% additional compression on skewed data
-    /// - Configurable compression level (max 22, default: 3)
-    HuffmanEntropy(i32),
 }
 
 impl CompressionStrategy {
-    /// Parse strategy from string (format: "strategy" or "strategy,level")
-    pub fn from_str(s: &str) -> Result<Self, String> {
+    /// Parse strategy from string with compression layer (format: "strategy-bgzip,level" or "strategy-nocomp" or "strategy,level")
+    pub fn from_str_with_layer(s: &str) -> Result<(Self, CompressionLayer), String> {
         let parts: Vec<&str> = s.split(',').collect();
-        let strategy_name = parts[0].to_lowercase();
+        let mut strategy_name = parts[0].to_lowercase();
+
+        // Check for suffix: -bgzip or -nocomp
+        let layer = if strategy_name.ends_with("-bgzip") {
+            strategy_name = strategy_name.trim_end_matches("-bgzip").to_string();
+            CompressionLayer::Bgzip
+        } else if strategy_name.ends_with("-nocomp") {
+            strategy_name = strategy_name.trim_end_matches("-nocomp").to_string();
+            CompressionLayer::Nocomp // No compression - store raw encoded data
+        } else {
+            CompressionLayer::Zstd
+        };
+
         let compression_level = if parts.len() > 1 {
             parts[1].trim().parse::<i32>().map_err(|_| {
                 format!(
-                    "Invalid compression level '{}'. Must be a number between 1 and 22.",
+                    "Invalid compression level '{}'. Must be a number between 0 and 22.",
                     parts[1]
                 )
             })?
+        } else if strategy_name.ends_with("-nocomp") || s.contains("-nocomp") {
+            0 // nocomp means level 0
         } else {
             3 // Default compression level
         };
 
-        // Validate compression level range
-        if compression_level < 1 || compression_level > 22 {
+        // Validate compression level range (allow 0 for nocomp)
+        if compression_level < 0 || compression_level > 22 {
             return Err(format!(
-                "Compression level {} is out of range. Must be between 1 and 22.",
+                "Compression level {} is out of range. Must be between 0 and 22.",
                 compression_level
             ));
         }
 
-        match strategy_name.as_str() {
+        let strategy = match strategy_name.as_str() {
             "automatic" => Ok(CompressionStrategy::Automatic(compression_level)),
             "raw" => Ok(CompressionStrategy::Raw(compression_level)),
             "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(compression_level)),
@@ -170,13 +199,22 @@ impl CompressionStrategy {
             "cascaded" => Ok(CompressionStrategy::Cascaded(compression_level)),
             "simple8b-full" | "simple8bfull" => Ok(CompressionStrategy::Simple8bFull(compression_level)),
             "selective-rle" | "selectiverle" => Ok(CompressionStrategy::SelectiveRLE(compression_level)),
-            "rice" | "rice-entropy" => Ok(CompressionStrategy::RiceEntropy(compression_level)),
-            "huffman" | "huffman-entropy" => Ok(CompressionStrategy::HuffmanEntropy(compression_level)),
             _ => Err(format!(
                 "Unsupported compression strategy '{}'. Use --help to see all available strategies.",
                 strategy_name
             )),
-        }
+        }?;
+
+        Ok((strategy, layer))
+    }
+
+    /// Parse strategy from string (format: "strategy" or "strategy,level") - defaults to Zstd
+    /// Also sets the thread-local compression layer based on suffix (-bgzip/-nocomp)
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        let (strategy, layer) = Self::from_str_with_layer(s)?;
+        // Set thread-local compression layer
+        CompressionLayer::set_current(layer);
+        Ok(strategy)
     }
 
     /// Get all available strategies
@@ -211,8 +249,6 @@ impl CompressionStrategy {
             CompressionStrategy::Cascaded(_) => 14,
             CompressionStrategy::Simple8bFull(_) => 15,
             CompressionStrategy::SelectiveRLE(_) => 16,
-            CompressionStrategy::RiceEntropy(_) => 17,
-            CompressionStrategy::HuffmanEntropy(_) => 18,
         }
     }
 
@@ -236,8 +272,6 @@ impl CompressionStrategy {
             14 => Ok(CompressionStrategy::Cascaded(3)),
             15 => Ok(CompressionStrategy::Simple8bFull(3)),
             16 => Ok(CompressionStrategy::SelectiveRLE(3)),
-            17 => Ok(CompressionStrategy::RiceEntropy(3)),
-            18 => Ok(CompressionStrategy::HuffmanEntropy(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported compression strategy code: {}", code),
@@ -267,8 +301,6 @@ impl CompressionStrategy {
             CompressionStrategy::Cascaded(level) => *level,
             CompressionStrategy::Simple8bFull(level) => *level,
             CompressionStrategy::SelectiveRLE(level) => *level,
-            CompressionStrategy::RiceEntropy(level) => *level,
-            CompressionStrategy::HuffmanEntropy(level) => *level,
         }
     }
 
@@ -333,12 +365,6 @@ impl std::fmt::Display for CompressionStrategy {
             }
             CompressionStrategy::SelectiveRLE(level) => {
                 write!(f, "SelectiveRLE (level {})", level)
-            }
-            CompressionStrategy::RiceEntropy(level) => {
-                write!(f, "RiceEntropy (level {})", level)
-            }
-            CompressionStrategy::HuffmanEntropy(level) => {
-                write!(f, "HuffmanEntropy (level {})", level)
             }
         }
     }

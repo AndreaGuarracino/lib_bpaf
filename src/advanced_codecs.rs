@@ -1084,6 +1084,42 @@ mod tests {
     }
 
     #[test]
+    fn test_huffman_simple() {
+        // Test small values that fit in Huffman table
+        let values = vec![0u64, 1, 2, 3, 0, 1, 0, 2];
+        let encoded = encode_huffman(&values).unwrap();
+        let decoded = decode_huffman(&encoded).unwrap();
+        assert_eq!(values, decoded, "Huffman simple values failed");
+    }
+
+    #[test]
+    fn test_huffman_large_values() {
+        // Test values > 255 that need escape codes
+        let values = vec![100u64, 200, 300, 400, 100, 200];
+        let encoded = encode_huffman(&values).unwrap();
+        let decoded = decode_huffman(&encoded).unwrap();
+        assert_eq!(values, decoded, "Huffman large values failed");
+    }
+
+    #[test]
+    fn test_rice_simple() {
+        // Test Rice coding with small values
+        let values = vec![0u64, 1, 2, 3, 4, 5, 6, 7];
+        let encoded = encode_rice(&values).unwrap();
+        let decoded = decode_rice(&encoded).unwrap();
+        assert_eq!(values, decoded, "Rice simple values failed");
+    }
+
+    #[test]
+    fn test_rice_geometric() {
+        // Test Rice with geometric distribution
+        let values = vec![1u64, 1, 2, 1, 3, 1, 1, 4, 1, 2];
+        let encoded = encode_rice(&values).unwrap();
+        let decoded = decode_rice(&encoded).unwrap();
+        assert_eq!(values, decoded, "Rice geometric values failed");
+    }
+
+    #[test]
     fn test_joint_offset() {
         let query = vec![1000, 1100, 1200, 1300];
         let target = vec![1005, 1105, 1206, 1304]; // Highly correlated with offset

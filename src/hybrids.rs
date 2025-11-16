@@ -155,6 +155,9 @@ pub fn encode_cascaded(vals: &[u64]) -> io::Result<Vec<u8>> {
         // Very low cardinality: Dictionary → RLE
         buf.push(1); // Mode 1
 
+        // Write total value count for decoder verification
+        write_varint(&mut buf, vals.len() as u64)?;
+
         // Build dictionary of top values
         let mut freq_vec: Vec<_> = freq.into_iter().collect();
         freq_vec.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
@@ -224,6 +227,7 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
     match mode {
         1 => {
             // Dictionary + RLE mode
+            let expected_count = read_varint(&mut reader)? as usize;
             let dict_size = read_varint(&mut reader)?;
 
             let mut dictionary = Vec::new();
@@ -231,8 +235,8 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
                 dictionary.push(read_varint(&mut reader)?);
             }
 
-            // Decode RLE
-            while reader.len() >= 2 {
+            // Decode RLE until we have expected_count values
+            while result.len() < expected_count && reader.len() >= 2 {
                 let mut val_run_buf = [0u8; 2];
                 reader.read_exact(&mut val_run_buf)?;
                 let val_idx = val_run_buf[0] as usize;
@@ -240,7 +244,9 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
 
                 let val = dictionary.get(val_idx).copied().unwrap_or(0);
                 for _ in 0..run {
-                    result.push(val);
+                    if result.len() < expected_count {
+                        result.push(val);
+                    }
                 }
             }
         },

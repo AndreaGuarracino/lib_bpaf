@@ -241,8 +241,6 @@ fn compress_paf(
         CompressionStrategy::Cascaded(level) => CompressionStrategy::Cascaded(level),
         CompressionStrategy::Simple8bFull(level) => CompressionStrategy::Simple8bFull(level),
         CompressionStrategy::SelectiveRLE(level) => CompressionStrategy::SelectiveRLE(level),
-        CompressionStrategy::RiceEntropy(level) => CompressionStrategy::RiceEntropy(level),
-        CompressionStrategy::HuffmanEntropy(level) => CompressionStrategy::HuffmanEntropy(level),
     };
 
     // Pass 2: Stream write - Header → StringTable → Records
