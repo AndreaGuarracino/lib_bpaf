@@ -10,19 +10,36 @@ fi
 
 # Wrapper script to run comprehensive tests on multiple PAF files
 # Aggregates results into a final report
+#
+# Usage: ./run_all_tests.sh [num_records] [output_base] [paf1] [paf2] ... [pafN]
+#
+# Arguments:
+#   num_records  - Number of records to test per file (default: 50, 0 = all records)
+#   output_base  - Output directory for all test results (default: ./test/bpaf_all_tests)
+#   paf1..pafN   - Input PAF files to test (default: 3 standard test files)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPREHENSIVE_TEST="$SCRIPT_DIR/comprehensive_test.sh"
 
-# Default test files (can override with arguments)
-TEST_FILES=(
-    "${1:-/home/guarracino/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz}"
-    "${2:-/home/guarracino/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.sweepga.paf.gz}"
-    "${3:-/home/guarracino/git/_resources/big-from-fg.tp.20k.paf}"
+# Parse arguments
+NUM_RECORDS="${1:-50}"  # 0 means use ALL records
+OUTPUT_BASE="${2:-$SCRIPT_DIR/bpaf_all_tests}"
+
+# Default test files
+DEFAULT_FILES=(
+    "/home/guarracino/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz"
+    "/home/guarracino/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.sweepga.paf.gz"
+    "/home/guarracino/git/_resources/big-from-fg.tp.20k.paf"
 )
 
-OUTPUT_BASE="${5:-/home/guarracino/git/lib_bpaf/test/bpaf_all_tests}"
-NUM_RECORDS="${6:-0}"  # 0 means use ALL records
+# Collect input files (from arg 3 onwards, or use defaults)
+if [ $# -le 2 ]; then
+    # No input files specified, use defaults
+    TEST_FILES=("${DEFAULT_FILES[@]}")
+else
+    # Use provided input files
+    TEST_FILES=("${@:3}")
+fi
 
 mkdir -p "$OUTPUT_BASE"
 
@@ -60,12 +77,23 @@ done
 if [ ${#VALID_FILES[@]} -eq 0 ]; then
     echo "Error: No valid input files found"
     echo ""
-    echo "Usage: $0 [paf1] [paf2] [paf3] [output_dir] [num_records]"
+    echo "Usage: $0 [num_records] [output_base] [paf1] [paf2] ... [pafN]"
     echo ""
-    echo "Default files:"
+    echo "Arguments:"
+    echo "  num_records  - Number of records to test per file (default: 50)"
+    echo "  output_base  - Output directory (default: ./test/bpaf_all_tests)"
+    echo "  paf1..pafN   - Input PAF files to test"
+    echo ""
+    echo "Default test files:"
     echo "  1. p95 CIGAR PAF (compressed)"
     echo "  2. sweepga CIGAR PAF (compressed)"
-    echo "  3. p95 tracepoint PAF"
+    echo "  3. big-from-fg tracepoint PAF"
+    echo ""
+    echo "Examples:"
+    echo "  $0                                    # Use all defaults"
+    echo "  $0 100                                # Test 100 records per file"
+    echo "  $0 200 /tmp/results                   # 200 records, custom output dir"
+    echo "  $0 50 /tmp/out file1.paf file2.paf    # Custom files"
     exit 1
 fi
 
@@ -89,7 +117,7 @@ for i in "${!VALID_FILES[@]}"; do
     echo "###################################################################"
     echo ""
     
-    $COMPREHENSIVE_TEST "$PAF" "$OUT_DIR" 32 edit-distance "$NUM_RECORDS"
+    $COMPREHENSIVE_TEST "$PAF" "$OUT_DIR" 32 edit-distance "$NUM_RECORDS" dual
 
     # Append TSV data (skip header)
     if [ -f "$OUT_DIR/results.tsv" ]; then
@@ -227,4 +255,18 @@ for NAME in "${FILE_NAMES[@]}"; do
     echo "  - Markdown: $OUTPUT_BASE/$NAME/test_report.md"
     echo "  - TSV:      $OUTPUT_BASE/$NAME/results.tsv"
 done
+echo ""
+
+# Generate plots
+echo "###################################################################"
+echo "# Generating Visualization Plots"
+echo "###################################################################"
+echo ""
+
+if command -v python3 &> /dev/null; then
+    python3 "$SCRIPT_DIR/plot_results.py" "$MASTER_TSV" && echo "✓ Plots generated successfully"
+else
+    echo "⚠ Python3 not found - skipping plot generation"
+    echo "  (Install python3, pandas, and matplotlib to enable plots)"
+fi
 echo ""

@@ -421,14 +421,23 @@ test_configuration() {
         TP_SIZE[$tp_type]=$(stat -c %s "$tp_paf" 2>/dev/null || stat -f %z "$tp_paf")
     fi
 
-    # Compress - use compress_paf for dual mode, cigzip for single mode
+    # Compress - use cigzip for all modes
     if [ "$TEST_MODE" = "dual" ]; then
-        # Use compress_paf example tool for explicit dual strategies
-        /usr/bin/time -v "$REPO_DIR/target/release/examples/compress_paf" \
-            "$tp_paf" "$OUTPUT_DIR/${key}.bpaf" \
-            "$first_strategy,3" "$second_strategy,3" \
-            "$tp_type" "$MAX_COMPLEXITY" "$COMPLEXITY_METRIC" 2>&1 | \
-            tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+        # Special handling for automatic mode (selects both strategies internally)
+        if [ "$first_strategy" = "automatic" ]; then
+            /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
+                --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
+                --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
+                --strategy "$first_strategy" 2>&1 | \
+                tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+        else
+            # Use cigzip with dual strategies (--strategy and --strategy-second)
+            /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
+                --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
+                --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
+                --strategy "$first_strategy,3" --strategy-second "$second_strategy,3" 2>&1 | \
+                tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+        fi
     else
         # Use cigzip for single/symmetric strategies
         local strategy_arg="$first_strategy"
@@ -446,8 +455,8 @@ test_configuration() {
     COMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $6}')
     COMPRESS_SIZE[$key]=$(stat -c %s "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || stat -f %z "$OUTPUT_DIR/${key}.bpaf")
 
-    # Extract actual strategies from BPAF header
-    local strategy_output=$("$REPO_DIR/target/release/examples/bpaf_header" "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || echo "unknown	unknown")
+    # Extract actual strategies from BPAF header using bpaf-view
+    local strategy_output=$("$REPO_DIR/target/release/bpaf-view" --strategies "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || echo "unknown	unknown")
     read -r first_strat second_strat <<< "$strategy_output"
     STRATEGY_FIRST[$key]="$first_strat"
     STRATEGY_SECOND[$key]="$second_strat"
@@ -469,14 +478,14 @@ test_configuration() {
         VERIFIED[$key]="✗"
     fi
     
-    # Seek Mode A: 100 positions × 100 iterations
-    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 100 100 2>/dev/null || echo "0 0 0")
+    # Seek Mode A: 10 positions × 10 iterations (for quick testing)
+    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 2>/dev/null || echo "0 0 0")
     read -r seek_a_avg seek_a_std seek_a_ratio <<< "$seek_a_result"
     SEEK_A[$key]="$seek_a_avg"
     SEEK_A_STDDEV[$key]="$seek_a_std"
 
-    # Seek Mode B: 100 positions × 100 iterations
-    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 100 100 "$tp_type" 2>/dev/null || echo "0 0 0")
+    # Seek Mode B: 10 positions × 10 iterations (for quick testing)
+    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_type" 2>/dev/null || echo "0 0 0")
     read -r seek_b_avg seek_b_std seek_b_ratio <<< "$seek_b_result"
     SEEK_B[$key]="$seek_b_avg"
     SEEK_B_STDDEV[$key]="$seek_b_std"
@@ -580,21 +589,48 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     echo "═══════════════════════════════════════════════════"
 
     if [ "$TEST_MODE" = "dual" ]; then
-        # Test all 17×17=289 combinations (use only base strategies, no bgzip/nocomp variants)
-        total_combos=$((${#BASE_STRATEGIES[@]} * ${#BASE_STRATEGIES[@]}))
+        # Test all 17×17×3=867 combinations (17 first strategies × 17 second strategies × 3 layers)
+        LAYERS=("" "-bgzip" "-nocomp")
+        total_combos=$((${#BASE_STRATEGIES[@]} * ${#BASE_STRATEGIES[@]} * ${#LAYERS[@]}))
         combo_count=0
-        echo "Testing $total_combos dual strategy combinations..."
+        echo "Testing $total_combos dual strategy combinations (17 first × 17 second × 3 layers)..."
 
-        for FIRST in "${BASE_STRATEGIES[@]}"; do
-            for SECOND in "${BASE_STRATEGIES[@]}"; do
-                combo_count=$((combo_count + 1))
-                if [ $((combo_count % 20)) -eq 0 ]; then
-                    echo "  Progress: $combo_count/$total_combos"
-                fi
-                test_configuration "$TP_TYPE" "$FIRST" "$SECOND"
-                output_tsv_row "$TP_TYPE" "$FIRST" "$SECOND"
+        for LAYER in "${LAYERS[@]}"; do
+            for FIRST in "${BASE_STRATEGIES[@]}"; do
+                for SECOND in "${BASE_STRATEGIES[@]}"; do
+                    combo_count=$((combo_count + 1))
+                    if [ $((combo_count % 50)) -eq 0 ]; then
+                        echo "  Progress: $combo_count/$total_combos"
+                    fi
+
+                    # Build full strategy names with layer suffix
+                    FIRST_FULL="${FIRST}${LAYER}"
+                    SECOND_FULL="${SECOND}${LAYER}"
+
+                    test_configuration "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL"
+                    output_tsv_row "$TP_TYPE" "$FIRST_FULL" "$SECOND_FULL"
+                done
             done
         done
+
+        # Also test automatic mode (which internally tests all 867 combinations and selects best)
+        echo ""
+        echo "Testing automatic meta-strategy (selects best from 867 combinations)..."
+        test_configuration "$TP_TYPE" "automatic"
+
+        # Extract the strategies that automatic mode selected from the BPAF header
+        auto_bpaf="$OUTPUT_DIR/${TP_TYPE}_automatic.bpaf"
+        selected_strategies=$("$REPO_DIR/target/release/bpaf-view" --strategies "$auto_bpaf" 2>/dev/null)
+        first_selected=$(echo "$selected_strategies" | cut -f1)
+        second_selected=$(echo "$selected_strategies" | cut -f2)
+
+        echo "  → Automatic selected: $first_selected → $second_selected"
+
+        # Output TSV row with the actual selected strategies (not "automatic")
+        output_tsv_row "$TP_TYPE" "$first_selected" "$second_selected"
+
+        echo ""
+        echo "✓ Completed 868 tests: 867 explicit dual combinations + 1 automatic"
     else
         # Single mode: test each strategy symmetrically (first==second)
         for STRATEGY in "${STRATEGIES[@]}"; do

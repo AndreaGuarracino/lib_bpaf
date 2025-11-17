@@ -178,9 +178,11 @@ pub(crate) fn analyze_correlation(records: &[AlignmentRecord]) -> f64 {
     (numerator / denominator).abs() // Return absolute value of correlation
 }
 
-/// Empirical strategy selection by actually compressing a subset of records
-/// Tests ALL concrete strategies and returns the best performing one
-pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level: i32) -> CompressionStrategy {
+/// Empirical DUAL strategy selection - tests all combinations of first × second × layer
+/// Returns the best performing first strategy, second strategy, and compression layer
+pub(crate) fn analyze_smart_dual_compression(records: &[AlignmentRecord], zstd_level: i32) -> (CompressionStrategy, CompressionStrategy, CompressionLayer) {
+    use crate::format::CompressionLayer;
+
     // Collect sample tracepoints
     let mut all_first_vals = Vec::new();
     let mut all_second_vals = Vec::new();
@@ -196,8 +198,12 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level:
     }
 
     if all_first_vals.is_empty() {
-        info!("Empirical analysis: No tracepoints found, defaulting to Raw");
-        return CompressionStrategy::Raw(zstd_level);
+        info!("Dual analysis: No tracepoints found, defaulting to Raw→Raw with Zstd");
+        return (
+            CompressionStrategy::Raw(zstd_level),
+            CompressionStrategy::Raw(zstd_level),
+            CompressionLayer::Zstd
+        );
     }
 
     // Define all concrete strategies to test (excluding meta-strategies)
@@ -221,85 +227,114 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level:
         CompressionStrategy::SelectiveRLE(zstd_level),
     ];
 
+    // Define compression layers to test
+    let layers_to_test = vec![
+        CompressionLayer::Zstd,
+        CompressionLayer::Bgzip,
+        CompressionLayer::Nocomp,
+    ];
+
     let mut results = Vec::new();
 
-    // Test each strategy
-    for strategy in strategies_to_test {
-        let total_size = match test_strategy_on_sample(&all_first_vals, &all_second_vals, strategy.clone()) {
-            Ok(size) => size,
-            Err(_) => {
-                // If a strategy fails, skip it
-                debug!("Strategy {} failed on sample, skipping", &strategy);
-                continue;
+    // Test each first_strategy × second_strategy × layer combination
+    for layer in &layers_to_test {
+        for first_strat in &strategies_to_test {
+            for second_strat in &strategies_to_test {
+                let total_size = match test_dual_strategy_on_sample(
+                    &all_first_vals,
+                    &all_second_vals,
+                    first_strat.clone(),
+                    second_strat.clone(),
+                    *layer  // Pass layer explicitly
+                ) {
+                    Ok(size) => size,
+                    Err(_) => {
+                        debug!("Dual strategy {}→{} with layer {:?} failed, skipping",
+                            first_strat, second_strat, layer);
+                        continue;
+                    }
+                };
+
+                results.push((first_strat.clone(), second_strat.clone(), *layer, total_size));
             }
-        };
-
-        results.push((strategy, total_size));
+        }
     }
 
-    // Find the best strategy (minimum size)
+    // Find the best combination (minimum size)
     if results.is_empty() {
-        info!("All strategies failed, defaulting to Raw");
-        return CompressionStrategy::Raw(zstd_level);
+        info!("All dual strategy combinations failed, defaulting to Raw→Raw with Zstd");
+        return (
+            CompressionStrategy::Raw(zstd_level),
+            CompressionStrategy::Raw(zstd_level),
+            CompressionLayer::Zstd
+        );
     }
 
-    results.sort_by_key(|(_, size)| *size);
-    let (best_strategy, best_size) = results[0].clone();
-    let (worst_strategy, worst_size) = results[results.len() - 1].clone();
+    results.sort_by_key(|(_, _, _, size)| *size);
+    let (best_first, best_second, best_layer, best_size) = results[0].clone();
+    let (worst_first, worst_second, worst_layer, worst_size) = results[results.len() - 1].clone();
 
     let improvement = ((worst_size - best_size) as f64 / worst_size as f64) * 100.0;
 
     info!(
-        "Empirical analysis: sampled {} records, {} tracepoints - tested {} strategies",
+        "Dual empirical analysis: sampled {} records, {} tracepoints - tested {} first × {} second × {} layers = {} combinations",
         sample_count,
         all_first_vals.len(),
+        strategies_to_test.len(),
+        strategies_to_test.len(),
+        layers_to_test.len(),
         results.len()
     );
     info!(
-        "Winner: {} ({} bytes) - Best improvement: {:.2}% better than {} ({} bytes)",
-        best_strategy,
+        "Winner: {}→{} with {:?} ({} bytes) - Best improvement: {:.2}% better than {}→{} with {:?} ({} bytes)",
+        best_first,
+        best_second,
+        best_layer,
         best_size,
         improvement,
-        worst_strategy,
+        worst_first,
+        worst_second,
+        worst_layer,
         worst_size
     );
 
-    // Log top 3 strategies
-    for (i, (strat, size)) in results.iter().take(3).enumerate() {
+    // Log top 5 combinations
+    for (i, (first, second, layer, size)) in results.iter().take(5).enumerate() {
         let pct_worse = if size > &best_size {
             ((*size - best_size) as f64 / best_size as f64) * 100.0
         } else {
             0.0
         };
-        debug!("  {}. {} - {} bytes (+{:.2}%)", i + 1, strat, size, pct_worse);
+        debug!("  {}. {}→{} with {:?} - {} bytes (+{:.2}%)", i + 1, first, second, layer, size, pct_worse);
     }
 
-    best_strategy
+    (best_first, best_second, best_layer)
 }
 
-/// Helper function to test a single strategy on sample data
-fn test_strategy_on_sample(
+/// Helper function to test a dual strategy combination on sample data
+fn test_dual_strategy_on_sample(
     first_vals: &[u64],
     second_vals: &[u64],
-    strategy: CompressionStrategy,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    layer: CompressionLayer,  // Explicit layer parameter
 ) -> io::Result<usize> {
-    // Encode first values
-    let first_buf = encode_tracepoint_values(first_vals, strategy.clone())?;
+    // Encode first values with first strategy
+    let first_buf = encode_tracepoint_values(first_vals, first_strategy.clone())?;
 
-    // Encode second values (handle 2D-Delta specially)
-    let second_buf = match &strategy {
+    // Encode second values with second strategy (handle special cases)
+    let second_buf = match &second_strategy {
         CompressionStrategy::TwoDimDelta(_) => {
             // Second values encoded as delta from first
             encode_2d_delta_second_values(first_vals, second_vals)?
         }
         _ => {
-            encode_tracepoint_values(second_vals, strategy.clone())?
+            encode_tracepoint_values(second_vals, second_strategy.clone())?
         }
     };
 
-    // Compress both with the current compression layer
-    let zstd_level = strategy.zstd_level();
-    let layer = CompressionLayer::current();
+    // Compress both with the SPECIFIED compression layer (explicit, not thread-local)
+    let zstd_level = first_strategy.zstd_level();
     let first_compressed = compress_with_layer(&first_buf[..], layer, zstd_level)?;
     let second_compressed = compress_with_layer(&second_buf[..], layer, zstd_level)?;
 
@@ -1368,6 +1403,7 @@ impl AlignmentRecord {
         &self,
         writer: &mut W,
         strategy: CompressionStrategy,
+        layer: CompressionLayer,
     ) -> io::Result<()> {
         write_varint(writer, self.query_name_id)?;
         write_varint(writer, self.query_start)?;
@@ -1379,7 +1415,7 @@ impl AlignmentRecord {
         write_varint(writer, self.residue_matches)?;
         write_varint(writer, self.alignment_block_len)?;
         writer.write_all(&[self.mapping_quality])?;
-        self.write_tracepoints(writer, strategy)?;
+        self.write_tracepoints(writer, strategy, layer)?;
         write_varint(writer, self.tags.len() as u64)?;
         for tag in &self.tags {
             tag.write(writer)?;
@@ -1391,6 +1427,7 @@ impl AlignmentRecord {
         &self,
         writer: &mut W,
         strategy: CompressionStrategy,
+        layer: CompressionLayer,
     ) -> io::Result<()> {
         match &self.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
@@ -1457,7 +1494,7 @@ impl AlignmentRecord {
                     }
                 };
 
-                let layer = CompressionLayer::current();
+                // Use the explicitly passed layer parameter
                 let first_compressed = compress_with_layer(&first_val_buf[..], layer, strategy.zstd_level())?;
                 let second_compressed =
                     compress_with_layer(&second_val_buf[..], layer, strategy.zstd_level())?;

@@ -21,7 +21,7 @@ use lib_tracepoints::{
 };
 pub use lib_wfa2::affine_wavefront::Distance;
 
-pub use format::{AlignmentRecord, BinaryPafHeader, CompressionStrategy, StringTable, Tag, TagValue};
+pub use format::{AlignmentRecord, BinaryPafHeader, CompressionLayer, CompressionStrategy, StringTable, Tag, TagValue};
 pub use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::format::parse_tag;
@@ -37,7 +37,7 @@ pub use binary::{
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-use crate::binary::{analyze_smart_compression, analyze_correlation, decompress_varint};
+use crate::binary::{analyze_smart_dual_compression, analyze_correlation, decompress_varint};
 
 use crate::utils::open_paf_reader;
 
@@ -62,6 +62,7 @@ pub fn compress_paf_with_cigar(
     input_path: &str,
     output_path: &str,
     strategy: CompressionStrategy,
+    layer: format::CompressionLayer,
     tp_type: TracepointType,
     max_complexity: u64,
     complexity_metric: ComplexityMetric,
@@ -71,6 +72,62 @@ pub fn compress_paf_with_cigar(
         input_path,
         output_path,
         strategy,
+        layer,
+        tp_type,
+        max_complexity,
+        complexity_metric,
+        distance,
+        true, // use_cigar
+    )
+}
+
+pub fn compress_paf_with_cigar_dual(
+    input_path: &str,
+    output_path: &str,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    layer: format::CompressionLayer,
+    tp_type: TracepointType,
+    max_complexity: u64,
+    complexity_metric: ComplexityMetric,
+    distance: Distance,
+) -> io::Result<()> {
+    // Extract zstd level from first strategy
+    let zstd_level = match &first_strategy {
+        CompressionStrategy::Raw(lvl) |
+        CompressionStrategy::ZigzagDelta(lvl) |
+        CompressionStrategy::TwoDimDelta(lvl) |
+        CompressionStrategy::RunLength(lvl) |
+        CompressionStrategy::BitPacked(lvl) |
+        CompressionStrategy::DeltaOfDelta(lvl) |
+        CompressionStrategy::FrameOfReference(lvl) |
+        CompressionStrategy::HybridRLE(lvl) |
+        CompressionStrategy::OffsetJoint(lvl) |
+        CompressionStrategy::XORDelta(lvl) |
+        CompressionStrategy::Dictionary(lvl) |
+        CompressionStrategy::Simple8(lvl) |
+        CompressionStrategy::StreamVByte(lvl) |
+        CompressionStrategy::FastPFOR(lvl) |
+        CompressionStrategy::Cascaded(lvl) |
+        CompressionStrategy::Simple8bFull(lvl) |
+        CompressionStrategy::SelectiveRLE(lvl) => *lvl,
+        CompressionStrategy::Dual(_, _, lvl) => *lvl,
+        CompressionStrategy::Automatic(lvl) => *lvl,
+        CompressionStrategy::AdaptiveCorrelation(lvl) => *lvl,
+    };
+
+    // Create Dual strategy
+    let dual_strategy = CompressionStrategy::Dual(
+        Box::new(first_strategy),
+        Box::new(second_strategy),
+        zstd_level,
+    );
+
+    compress_paf(
+        input_path,
+        output_path,
+        dual_strategy,
+        layer,
         tp_type,
         max_complexity,
         complexity_metric,
@@ -83,6 +140,7 @@ pub fn compress_paf_with_tracepoints(
     input_path: &str,
     output_path: &str,
     strategy: CompressionStrategy,
+    layer: format::CompressionLayer,
     tp_type: TracepointType,
     max_complexity: u64,
     complexity_metric: ComplexityMetric,
@@ -92,6 +150,7 @@ pub fn compress_paf_with_tracepoints(
         input_path,
         output_path,
         strategy,
+        layer,
         tp_type,
         max_complexity,
         complexity_metric,
@@ -135,6 +194,7 @@ pub fn compress_paf_with_tracepoints_dual(
     output_path: &str,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
+    layer: format::CompressionLayer,
     tp_type: TracepointType,
     max_complexity: u64,
     complexity_metric: ComplexityMetric,
@@ -175,6 +235,7 @@ pub fn compress_paf_with_tracepoints_dual(
         input_path,
         output_path,
         dual_strategy,
+        layer,
         tp_type,
         max_complexity,
         complexity_metric,
@@ -220,6 +281,7 @@ fn compress_paf(
     input_path: &str,
     output_path: &str,
     strategy: CompressionStrategy,
+    user_specified_layer: format::CompressionLayer,
     tp_type: TracepointType,
     max_complexity: u64,
     complexity_metric: ComplexityMetric,
@@ -283,15 +345,19 @@ fn compress_paf(
     }
 
     // Choose strategy based on user's preference
-    let chosen_strategy = match strategy {
+    let (chosen_strategy, chosen_layer) = match strategy {
         CompressionStrategy::Automatic(level) => {
-            // Run empirical compression test to find best strategy
-            analyze_smart_compression(&sample, level)
+            // Run empirical compression test for DUAL strategies (test all 17×17×3 = 867 combinations)
+            let (best_first, best_second, best_layer) = analyze_smart_dual_compression(&sample, level);
+            info!("Automatic: Selected {} → {} with layer {:?}", best_first, best_second, best_layer);
+            // Wrap in Dual strategy
+            let dual_strategy = CompressionStrategy::Dual(Box::new(best_first), Box::new(best_second), level);
+            (dual_strategy, best_layer)
         }
         CompressionStrategy::AdaptiveCorrelation(level) => {
             // Analyze correlation and choose optimal strategy
             let correlation = analyze_correlation(&sample);
-            if correlation > 0.95 {
+            let chosen = if correlation > 0.95 {
                 info!("Adaptive: High correlation ({:.4}) → OffsetJoint", correlation);
                 CompressionStrategy::OffsetJoint(level)
             } else if correlation > 0.80 {
@@ -303,27 +369,12 @@ fn compress_paf(
             } else {
                 info!("Adaptive: Very low correlation ({:.4}) → FrameOfReference", correlation);
                 CompressionStrategy::FrameOfReference(level)
-            }
+            };
+            // Use user-specified layer or default
+            (chosen, user_specified_layer)
         }
-        // Respect explicit user choices
-        CompressionStrategy::Dual(first, second, level) => CompressionStrategy::Dual(first, second, level),
-        CompressionStrategy::Raw(level) => CompressionStrategy::Raw(level),
-        CompressionStrategy::ZigzagDelta(level) => CompressionStrategy::ZigzagDelta(level),
-        CompressionStrategy::TwoDimDelta(level) => CompressionStrategy::TwoDimDelta(level),
-        CompressionStrategy::RunLength(level) => CompressionStrategy::RunLength(level),
-        CompressionStrategy::BitPacked(level) => CompressionStrategy::BitPacked(level),
-        CompressionStrategy::DeltaOfDelta(level) => CompressionStrategy::DeltaOfDelta(level),
-        CompressionStrategy::FrameOfReference(level) => CompressionStrategy::FrameOfReference(level),
-        CompressionStrategy::HybridRLE(level) => CompressionStrategy::HybridRLE(level),
-        CompressionStrategy::OffsetJoint(level) => CompressionStrategy::OffsetJoint(level),
-        CompressionStrategy::XORDelta(level) => CompressionStrategy::XORDelta(level),
-        CompressionStrategy::Dictionary(level) => CompressionStrategy::Dictionary(level),
-        CompressionStrategy::Simple8(level) => CompressionStrategy::Simple8(level),
-        CompressionStrategy::StreamVByte(level) => CompressionStrategy::StreamVByte(level),
-        CompressionStrategy::FastPFOR(level) => CompressionStrategy::FastPFOR(level),
-        CompressionStrategy::Cascaded(level) => CompressionStrategy::Cascaded(level),
-        CompressionStrategy::Simple8bFull(level) => CompressionStrategy::Simple8bFull(level),
-        CompressionStrategy::SelectiveRLE(level) => CompressionStrategy::SelectiveRLE(level),
+        // Respect explicit user choices - use user-specified layer
+        strategy => (strategy, user_specified_layer),
     };
 
     // Pass 2: Stream write - Header → StringTable → Records
@@ -376,8 +427,8 @@ fn compress_paf(
             )
         }?;
 
-        // Write with chosen strategy
-        record.write(&mut writer, chosen_strategy.clone())?;
+        // Write with chosen strategy and layer
+        record.write(&mut writer, chosen_strategy.clone(), chosen_layer)?;
     }
     writer.flush()?;
 

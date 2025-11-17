@@ -5,12 +5,6 @@ use crate::{utils::*, Distance};
 use lib_tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::cell::Cell;
-
-thread_local! {
-    /// Thread-local compression layer override (set by from_str when parsing suffix)
-    static COMPRESSION_LAYER: Cell<Option<CompressionLayer>> = Cell::new(None);
-}
 
 /// Compression layer to use for final compression
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,18 +15,6 @@ pub enum CompressionLayer {
     Bgzip,
     /// No compression (store raw encoded data)
     Nocomp,
-}
-
-impl CompressionLayer {
-    /// Get the current compression layer (from thread-local or default to Zstd)
-    pub fn current() -> Self {
-        COMPRESSION_LAYER.with(|layer| layer.get().unwrap_or(CompressionLayer::Zstd))
-    }
-
-    /// Set the compression layer for the current thread
-    pub fn set_current(layer: CompressionLayer) {
-        COMPRESSION_LAYER.with(|l| l.set(Some(layer)));
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -331,9 +313,8 @@ impl CompressionStrategy {
     /// Parse strategy from string (format: "strategy" or "strategy,level") - defaults to Zstd
     /// Also sets the thread-local compression layer based on suffix (-bgzip/-nocomp)
     pub fn from_str(s: &str) -> Result<Self, String> {
-        let (strategy, layer) = Self::from_str_with_layer(s)?;
-        // Set thread-local compression layer
-        CompressionLayer::set_current(layer);
+        let (strategy, _layer) = Self::from_str_with_layer(s)?;
+        // Note: Layer is now passed explicitly through API calls, not via thread-local state
         Ok(strategy)
     }
 

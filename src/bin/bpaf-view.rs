@@ -4,12 +4,42 @@ use std::io::{self, Write};
 use std::process;
 
 fn print_usage() {
-    eprintln!("Usage: bpaf-view <bpaf-file>");
+    eprintln!("Usage: bpaf-view [OPTIONS] <bpaf-file>");
     eprintln!();
     eprintln!("Display BPAF file contents:");
     eprintln!("  - Header information");
     eprintln!("  - String table");
     eprintln!("  - Alignment records in PAF format with tp:Z: tags");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --strategies    Output only first_strategy<TAB>second_strategy");
+}
+
+fn strategy_to_name(strat: &str) -> String {
+    // Convert Debug format to hyphenated lowercase
+    // E.g., "ZigzagDelta" -> "zigzag-delta", "TwoDimDelta" -> "2d-delta"
+    let name = strat.split('(').next().unwrap_or("unknown");
+
+    match name {
+        "Raw" => "raw",
+        "ZigzagDelta" => "zigzag-delta",
+        "TwoDimDelta" => "2d-delta",
+        "RunLength" => "rle",
+        "BitPacked" => "bit-packed",
+        "DeltaOfDelta" => "delta-of-delta",
+        "FrameOfReference" => "frame-of-reference",
+        "HybridRLE" => "hybrid-rle",
+        "OffsetJoint" => "offset-joint",
+        "XORDelta" => "xor-delta",
+        "Dictionary" => "dictionary",
+        "Simple8" => "simple8",
+        "StreamVByte" => "stream-vbyte",
+        "FastPFOR" => "fastpfor",
+        "Cascaded" => "cascaded",
+        "Simple8bFull" => "simple8b-full",
+        "SelectiveRLE" => "selective-rle",
+        _ => "unknown",
+    }.to_string()
 }
 
 fn main() -> io::Result<()> {
@@ -18,14 +48,41 @@ fn main() -> io::Result<()> {
 
     let args: Vec<String> = env::args().collect();
 
-    if args.len() != 2 {
+    // Parse arguments
+    let mut strategies_only = false;
+    let mut bpaf_path = None;
+
+    for arg in args.iter().skip(1) {
+        if arg == "--strategies" {
+            strategies_only = true;
+        } else if !arg.starts_with("--") {
+            bpaf_path = Some(arg.as_str());
+        }
+    }
+
+    if bpaf_path.is_none() {
         print_usage();
         process::exit(1);
     }
 
-    let bpaf_path = &args[1];
+    let bpaf_path = bpaf_path.unwrap();
 
     // Open BPAF file
+    let reader = BpafReader::open(bpaf_path)?;
+
+    // If --strategies flag, output strategies and exit
+    if strategies_only {
+        let header = reader.header();
+        let first_strat = header.first_strategy()?;
+        let second_strat = header.second_strategy()?;
+
+        let first_name = strategy_to_name(&format!("{:?}", first_strat));
+        let second_name = strategy_to_name(&format!("{:?}", second_strat));
+
+        println!("{}\t{}", first_name, second_name);
+        return Ok(());
+    }
+
     let mut reader = BpafReader::open(bpaf_path)?;
 
     // Load string table

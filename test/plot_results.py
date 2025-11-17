@@ -43,16 +43,16 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
         second = row['strategy_second']
         strategies.append(f"{first}→{second}")
 
-    # Create figure with 4 subplots
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle(f'Compression Strategy Performance: {dataset_name}', fontsize=16, fontweight='bold')
+    # Create figure with 4 subplots (vertical stack)
+    fig, axes = plt.subplots(4, 1, figsize=(72, 32))
+    fig.suptitle(f'Compression Strategy Performance: {dataset_name}', fontsize=16, fontweight='bold', y=0.995)
 
     # Original file info
     orig_size = data['original_size_bytes'].iloc[0]
     num_records = data['num_records'].iloc[0]
     dataset_type = data['dataset_type'].iloc[0]
 
-    fig.text(0.5, 0.96, f'Type: {dataset_type} | Records: {num_records:,} | Original Size: {format_bytes(orig_size)}',
+    fig.text(0.5, 0.975, f'Type: {dataset_type} | Records: {num_records:,} | Original Size: {format_bytes(orig_size)}',
              ha='center', fontsize=11, style='italic')
 
     # Color code by compression layer (based on requested strategy)
@@ -67,7 +67,7 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
             colors.append('#1f77b4')  # blue for zstd (default)
 
     # Plot 1: BPAF File Size
-    ax1 = axes[0, 0]
+    ax1 = axes[0]
     bars1 = ax1.bar(range(len(strategies)), data['bpaf_size_bytes'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
     ax1.set_xlabel('Compression Strategy', fontweight='bold')
     ax1.set_ylabel('BPAF File Size (bytes)', fontweight='bold')
@@ -87,7 +87,7 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8), fontsize=9)
 
     # Plot 2: Compression Ratio (Original → BPAF)
-    ax2 = axes[0, 1]
+    ax2 = axes[1]
     bars2 = ax2.bar(range(len(strategies)), data['ratio_orig_to_bpaf'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
     ax2.set_xlabel('Compression Strategy', fontweight='bold')
     ax2.set_ylabel('Compression Ratio (x)', fontweight='bold')
@@ -106,7 +106,7 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8), fontsize=9)
 
     # Plot 3: Seek Time (Mode B)
-    ax3 = axes[1, 0]
+    ax3 = axes[2]
     bars3 = ax3.bar(range(len(strategies)), data['seek_mode_b_avg_us'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
     ax3.set_xlabel('Compression Strategy', fontweight='bold')
     ax3.set_ylabel('Average Seek Time (μs)', fontweight='bold')
@@ -125,7 +125,7 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
              bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8), fontsize=9)
 
     # Plot 4: Compression Time
-    ax4 = axes[1, 1]
+    ax4 = axes[3]
     bars4 = ax4.bar(range(len(strategies)), data['compression_runtime_sec'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
     ax4.set_xlabel('Compression Strategy', fontweight='bold')
     ax4.set_ylabel('Compression Time (seconds)', fontweight='bold')
@@ -151,7 +151,8 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
                loc='lower center', ncol=3, frameon=True, fontsize=10,
                bbox_to_anchor=(0.5, -0.02))
 
-    plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+    plt.subplots_adjust(left=0.05, right=0.98)
+    plt.tight_layout(rect=[0, 0.02, 1, 0.96])
 
     # Save plot
     output_file = output_dir / f'{dataset_name}_metrics.png'
