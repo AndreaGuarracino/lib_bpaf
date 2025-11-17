@@ -225,11 +225,11 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level:
 
     // Test each strategy
     for strategy in strategies_to_test {
-        let total_size = match test_strategy_on_sample(&all_first_vals, &all_second_vals, strategy) {
+        let total_size = match test_strategy_on_sample(&all_first_vals, &all_second_vals, strategy.clone()) {
             Ok(size) => size,
             Err(_) => {
                 // If a strategy fails, skip it
-                debug!("Strategy {} failed on sample, skipping", strategy);
+                debug!("Strategy {} failed on sample, skipping", &strategy);
                 continue;
             }
         };
@@ -244,8 +244,8 @@ pub(crate) fn analyze_smart_compression(records: &[AlignmentRecord], zstd_level:
     }
 
     results.sort_by_key(|(_, size)| *size);
-    let (best_strategy, best_size) = results[0];
-    let (worst_strategy, worst_size) = results[results.len() - 1];
+    let (best_strategy, best_size) = results[0].clone();
+    let (worst_strategy, worst_size) = results[results.len() - 1].clone();
 
     let improvement = ((worst_size - best_size) as f64 / worst_size as f64) * 100.0;
 
@@ -284,16 +284,16 @@ fn test_strategy_on_sample(
     strategy: CompressionStrategy,
 ) -> io::Result<usize> {
     // Encode first values
-    let first_buf = encode_tracepoint_values(first_vals, strategy)?;
+    let first_buf = encode_tracepoint_values(first_vals, strategy.clone())?;
 
     // Encode second values (handle 2D-Delta specially)
-    let second_buf = match strategy {
+    let second_buf = match &strategy {
         CompressionStrategy::TwoDimDelta(_) => {
             // Second values encoded as delta from first
             encode_2d_delta_second_values(first_vals, second_vals)?
         }
         _ => {
-            encode_tracepoint_values(second_vals, strategy)?
+            encode_tracepoint_values(second_vals, strategy.clone())?
         }
     };
 
@@ -388,7 +388,7 @@ pub(crate) fn decompress_varint<R: Read>(
     for _ in 0..header.num_records {
         let record = read_record(
             &mut reader,
-            strategy,
+            strategy.clone(),
             header.tracepoint_type,
         )?;
         write_paf_line_with_tracepoints(&mut writer, &record, &string_table)?;
@@ -719,6 +719,9 @@ fn encode_tracepoint_values(
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before encoding")
         }
+        CompressionStrategy::Dual(_, _, _) => {
+            panic!("Dual strategies must be resolved before encoding")
+        }
     }
     Ok(buf)
 }
@@ -1018,6 +1021,9 @@ fn decode_tracepoint_values(
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before decoding")
         }
+        CompressionStrategy::Dual(_, _, _) => {
+            panic!("Dual strategies must be resolved before decoding")
+        }
     }
 }
 
@@ -1232,7 +1238,7 @@ fn decode_standard_tracepoints<R: Read>(
         CompressionStrategy::FastPFOR(_) | CompressionStrategy::Cascaded(_) |
         CompressionStrategy::Simple8bFull(_) | CompressionStrategy::SelectiveRLE(_) => {
             // These strategies use standard encoding for both streams
-            let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy)?;
+            let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy.clone())?;
             let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
             for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
                 tps.push((a as usize, b as usize));
@@ -1285,6 +1291,14 @@ fn decode_standard_tracepoints<R: Read>(
         }
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before decoding")
+        }
+        CompressionStrategy::Dual(first_strat, second_strat, _) => {
+            // Dual strategy: decode first_vals and second_vals independently
+            let first_vals = decode_tracepoint_values(&first_buf, num_items, *first_strat.clone())?;
+            let second_vals = decode_tracepoint_values(&second_buf, num_items, *second_strat.clone())?;
+            for (a, b) in first_vals.into_iter().zip(second_vals.into_iter()) {
+                tps.push((a as usize, b as usize));
+            }
         }
     }
 
@@ -1389,45 +1403,57 @@ impl AlignmentRecord {
                     .map(|(a, b)| (*a as u64, *b as u64))
                     .unzip();
 
-                let first_val_buf = encode_tracepoint_values(&first_vals, strategy)?;
-                let second_val_buf = match strategy {
-                    CompressionStrategy::TwoDimDelta(_) => {
-                        // Encode second as delta from first
-                        encode_2d_delta_second_values(&first_vals, &second_vals)?
-                    }
-                    CompressionStrategy::OffsetJoint(_) => {
-                        // Encode second as offset from first (simpler than 2D-Delta)
-                        let mut buf = Vec::with_capacity(second_vals.len() * 2);
-                        for (f, s) in first_vals.iter().zip(second_vals.iter()) {
-                            let offset = s - f; // No zigzag, just raw offset
-                            write_varint(&mut buf, offset)?;
-                        }
-                        buf
-                    }
-                    CompressionStrategy::HybridRLE(_) => {
-                        // Encode target with RLE
-                        let mut buf = Vec::with_capacity(second_vals.len() * 2);
-                        if !second_vals.is_empty() {
-                            let mut run_val = second_vals[0];
-                            let mut run_len = 1u64;
-                            for &val in &second_vals[1..] {
-                                if val == run_val {
-                                    run_len += 1;
-                                } else {
-                                    write_varint(&mut buf, run_val)?;
-                                    write_varint(&mut buf, run_len)?;
-                                    run_val = val;
-                                    run_len = 1;
-                                }
-                            }
-                            write_varint(&mut buf, run_val)?;
-                            write_varint(&mut buf, run_len)?;
-                        }
-                        buf
+                let (first_val_buf, second_val_buf) = match &strategy {
+                    CompressionStrategy::Dual(first_strat, second_strat, _) => {
+                        // Dual strategy: encode first_vals and second_vals independently
+                        let first_buf = encode_tracepoint_values(&first_vals, *first_strat.clone())?;
+                        let second_buf = encode_tracepoint_values(&second_vals, *second_strat.clone())?;
+                        (first_buf, second_buf)
                     }
                     _ => {
-                        // Standard encoding
-                        encode_tracepoint_values(&second_vals, strategy)?
+                        // Single strategy
+                        let first_buf = encode_tracepoint_values(&first_vals, strategy.clone())?;
+                        let second_buf = match &strategy {
+                            CompressionStrategy::TwoDimDelta(_) => {
+                                // Encode second as delta from first
+                                encode_2d_delta_second_values(&first_vals, &second_vals)?
+                            }
+                            CompressionStrategy::OffsetJoint(_) => {
+                                // Encode second as offset from first (simpler than 2D-Delta)
+                                let mut buf = Vec::with_capacity(second_vals.len() * 2);
+                                for (f, s) in first_vals.iter().zip(second_vals.iter()) {
+                                    let offset = s - f; // No zigzag, just raw offset
+                                    write_varint(&mut buf, offset)?;
+                                }
+                                buf
+                            }
+                            CompressionStrategy::HybridRLE(_) => {
+                                // Encode target with RLE
+                                let mut buf = Vec::with_capacity(second_vals.len() * 2);
+                                if !second_vals.is_empty() {
+                                    let mut run_val = second_vals[0];
+                                    let mut run_len = 1u64;
+                                    for &val in &second_vals[1..] {
+                                        if val == run_val {
+                                            run_len += 1;
+                                        } else {
+                                            write_varint(&mut buf, run_val)?;
+                                            write_varint(&mut buf, run_len)?;
+                                            run_val = val;
+                                            run_len = 1;
+                                        }
+                                    }
+                                    write_varint(&mut buf, run_val)?;
+                                    write_varint(&mut buf, run_len)?;
+                                }
+                                buf
+                            }
+                            _ => {
+                                // Standard encoding
+                                encode_tracepoint_values(&second_vals, strategy.clone())?
+                            }
+                        };
+                        (first_buf, second_buf)
                     }
                 };
 
@@ -1559,7 +1585,7 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
     let mut reader = BufReader::with_capacity(131072, file);
 
     let header = BinaryPafHeader::read(&mut reader)?;
-    if header.version != 1 {
+    if header.version < 1 || header.version > 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unsupported format version: {}", header.version),
@@ -1706,7 +1732,7 @@ impl BpafReader {
 
         let mut file = File::open(bpaf_path)?;
         let header = BinaryPafHeader::read(&mut file)?;
-        if header.version != 1 {
+        if header.version < 1 || header.version > 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unsupported format version: {}", header.version),

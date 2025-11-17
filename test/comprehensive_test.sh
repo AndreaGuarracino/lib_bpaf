@@ -1,15 +1,22 @@
 #!/bin/bash
 set -e
 
+# Ensure Rust/Cargo tools are available
+if [ -f "$HOME/.cargo/env" ]; then
+    source "$HOME/.cargo/env"
+else
+    export PATH="/home/node/.cargo/bin:$PATH"
+fi
+
 # Comprehensive test for a single PAF file
 # Automatically detects: CIGAR (compressed/uncompressed) or Tracepoint PAF
 # Tests: all tracepoint types + all compression strategies + seek performance
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-CIGZIP_DIR="/workspace/git/cigzip"
+CIGZIP_DIR="${CIGZIP_DIR:-/home/guarracino/git/cigzip}"
 CIGZIP="$CIGZIP_DIR/target/release/cigzip"
-NORMALIZE="$SCRIPT_DIR/normalize_paf.pl"
+NORMALIZE="python3 $SCRIPT_DIR/normalize_paf.py"
 
 # Helper functions for unit conversion
 time_to_seconds() {
@@ -35,13 +42,18 @@ OUTPUT_DIR="${2:-/tmp/bpaf_test_output}"
 MAX_COMPLEXITY="${3:-32}"
 COMPLEXITY_METRIC="${4:-edit-distance}"
 NUM_RECORDS="${5:-20000}"
+TEST_MODE="${6:-single}"  # "single" or "dual" - controls strategy testing mode
 
 if [ -z "$INPUT_PAF" ] || [ ! -f "$INPUT_PAF" ]; then
-    echo "Usage: $0 <input.paf[.gz]> [output_dir] [max_complexity] [complexity_metric] [num_records]"
+    echo "Usage: $0 <input.paf[.gz]> [output_dir] [max_complexity] [complexity_metric] [num_records] [test_mode]"
     echo ""
     echo "Automatically detects input type:"
     echo "  - CIGAR PAF (compressed or uncompressed)"
     echo "  - Tracepoint PAF"
+    echo ""
+    echo "Test Modes:"
+    echo "  single (default) - Test each strategy symmetrically (first==second)"
+    echo "  dual             - Test all 17×17=289 strategy combinations"
     echo ""
     echo "Tests:"
     echo "  - All tracepoint types (if CIGAR input)"
@@ -61,6 +73,7 @@ echo "Output:      $OUTPUT_DIR"
 echo "Complexity:  $MAX_COMPLEXITY"
 echo "Metric:      $COMPLEXITY_METRIC"
 echo "Records:     $NUM_RECORDS"
+echo "Test Mode:   $TEST_MODE"
 echo "========================================="
 echo ""
 
@@ -226,7 +239,7 @@ fn main() {
         // Warmup
         for _ in 0..3 {
             let _ = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy).map(|_| ()),
+                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy.clone()).map(|_| ()),
                 "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| ()),
                 "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| ()),
                 _ => panic!("Invalid tp_type"),
@@ -237,7 +250,7 @@ fn main() {
         for _ in 0..iterations_per_pos {
             let start = Instant::now();
             let result = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy).map(|_| ()),
+                "standard" => read_standard_tracepoints_at_offset(&mut file, offset, strategy.clone()).map(|_| ()),
                 "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| ()),
                 "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| ()),
                 _ => panic!("Invalid tp_type"),
@@ -264,13 +277,19 @@ fn main() {
 }
 RUST_B
 
-rustc --edition 2021 -O /tmp/seek_mode_a.rs \
+if ! rustc --edition 2021 -O /tmp/seek_mode_a.rs \
     -L target/release/deps --extern lib_bpaf=target/release/liblib_bpaf.rlib \
-    -o /tmp/seek_mode_a 2>/dev/null
+    -o /tmp/seek_mode_a 2>&1; then
+    echo "✗ Error: Failed to compile seek_mode_a"
+    exit 1
+fi
 
-rustc --edition 2021 -O /tmp/seek_mode_b.rs \
+if ! rustc --edition 2021 -O /tmp/seek_mode_b.rs \
     -L target/release/deps --extern lib_bpaf=target/release/liblib_bpaf.rlib \
-    -o /tmp/seek_mode_b 2>/dev/null
+    -o /tmp/seek_mode_b 2>&1; then
+    echo "✗ Error: Failed to compile seek_mode_b"
+    exit 1
+fi
 
 echo "✓ Seek tools ready"
 echo ""
@@ -283,6 +302,7 @@ declare -A SEEK_A SEEK_B SEEK_A_STDDEV SEEK_B_STDDEV SEEK_SUCCESS_RATIO
 declare -A VERIFIED
 declare -A TP_SIZE
 declare -A BGZIP_TIME BGZIP_MEM BGZIP_SIZE
+declare -A STRATEGY_FIRST STRATEGY_SECOND
 
 # Determine tracepoint types to test
 if [ "$INPUT_TYPE" = "cigar" ]; then
@@ -377,35 +397,60 @@ for strategy in "${BASE_STRATEGIES[@]}"; do
     STRATEGIES+=("${strategy}-nocomp")
 done
 
+# Add meta-strategies (they choose a concrete strategy, so no variants needed)
+STRATEGIES+=("automatic")
+STRATEGIES+=("adaptive-correlation")
+
 # Test function
 test_configuration() {
     local tp_type="$1"
-    local strategy="$2"
+    local first_strategy="$2"
+    local second_strategy="${3:-$2}"  # Default to first_strategy if not provided (single mode)
     local tp_paf="$OUTPUT_DIR/${tp_type}.tp.paf"
-    local key="${tp_type}_${strategy}"
 
-    echo "    Testing $strategy..."
+    # Create key from strategies
+    local key="${tp_type}_${first_strategy}"
+    if [ "$first_strategy" != "$second_strategy" ]; then
+        key="${key}_${second_strategy}"
+    fi
+
+    echo "    Testing $first_strategy → $second_strategy..."
 
     # Store tracepoint PAF size (only once per type)
     if [ -z "${TP_SIZE[$tp_type]}" ]; then
         TP_SIZE[$tp_type]=$(stat -c %s "$tp_paf" 2>/dev/null || stat -f %z "$tp_paf")
     fi
 
-    # Compress
-    # Add ,0 to -nocomp strategies to force compression level 0
-    local strategy_arg="$strategy"
-    if [[ "$strategy" == *"-nocomp" ]]; then
-        strategy_arg="${strategy},0"
-    fi
+    # Compress - use compress_paf for dual mode, cigzip for single mode
+    if [ "$TEST_MODE" = "dual" ]; then
+        # Use compress_paf example tool for explicit dual strategies
+        /usr/bin/time -v "$REPO_DIR/target/release/examples/compress_paf" \
+            "$tp_paf" "$OUTPUT_DIR/${key}.bpaf" \
+            "$first_strategy,3" "$second_strategy,3" \
+            "$tp_type" "$MAX_COMPLEXITY" "$COMPLEXITY_METRIC" 2>&1 | \
+            tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+    else
+        # Use cigzip for single/symmetric strategies
+        local strategy_arg="$first_strategy"
+        if [[ "$first_strategy" == *"-nocomp" ]]; then
+            strategy_arg="${first_strategy},0"
+        fi
 
-    /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
-        --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
-        --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
-        --strategy "$strategy_arg" 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+        /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
+            --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
+            --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
+            --strategy "$strategy_arg" 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
+    fi
 
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
     COMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $6}')
     COMPRESS_SIZE[$key]=$(stat -c %s "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || stat -f %z "$OUTPUT_DIR/${key}.bpaf")
+
+    # Extract actual strategies from BPAF header
+    local strategy_output=$("$REPO_DIR/target/release/examples/bpaf_header" "$OUTPUT_DIR/${key}.bpaf" 2>/dev/null || echo "unknown	unknown")
+    read -r first_strat second_strat <<< "$strategy_output"
+    STRATEGY_FIRST[$key]="$first_strat"
+    STRATEGY_SECOND[$key]="$second_strat"
     
     # Decompress
     /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \
@@ -444,9 +489,21 @@ test_configuration() {
 # TSV output function
 output_tsv_row() {
     local tp_type="$1"
-    local strategy="$2"
-    local key="${tp_type}_${strategy}"
+    local first_strategy="$2"
+    local second_strategy="${3:-$2}"  # Default to first_strategy if not provided
     local tsv_file="$OUTPUT_DIR/results.tsv"
+
+    # Create key from strategies (must match test_configuration)
+    local key="${tp_type}_${first_strategy}"
+    if [ "$first_strategy" != "$second_strategy" ]; then
+        key="${key}_${second_strategy}"
+    fi
+
+    # Strategy label for display
+    local strategy_label="$first_strategy"
+    if [ "$first_strategy" != "$second_strategy" ]; then
+        strategy_label="${first_strategy}→${second_strategy}"
+    fi
 
     # Calculate ratios
     local tp_size_bytes=${TP_SIZE[$tp_type]}
@@ -475,8 +532,8 @@ output_tsv_row() {
     # Dataset name from input file
     local dataset_name=$(basename "$INPUT_PAF" .paf.gz | sed 's/.paf$//')
 
-    # Output TSV row (28 columns)
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    # Output TSV row (30 columns - includes strategy_first and strategy_second)
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$dataset_name" \
         "$INPUT_TYPE" \
         "$SIZE" \
@@ -487,7 +544,9 @@ output_tsv_row() {
         "$tp_size_bytes" \
         "$MAX_COMPLEXITY" \
         "$COMPLEXITY_METRIC" \
-        "$strategy" \
+        "$strategy_label" \
+        "${STRATEGY_FIRST[$key]}" \
+        "${STRATEGY_SECOND[$key]}" \
         "$compress_time_sec" \
         "$compress_mem_mb" \
         "$bpaf_size_bytes" \
@@ -511,7 +570,7 @@ output_tsv_row() {
 # Initialize TSV file with header
 TSV_FILE="$OUTPUT_DIR/results.tsv"
 cat > "$TSV_FILE" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
 TSV_HEADER
 
 # Run all tests
@@ -519,11 +578,30 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     echo "═══════════════════════════════════════════════════"
     echo "Testing Tracepoint Type: ${TP_TYPE^^}"
     echo "═══════════════════════════════════════════════════"
-    
-    for STRATEGY in "${STRATEGIES[@]}"; do
-        test_configuration "$TP_TYPE" "$STRATEGY"
-        output_tsv_row "$TP_TYPE" "$STRATEGY"
-    done
+
+    if [ "$TEST_MODE" = "dual" ]; then
+        # Test all 17×17=289 combinations (use only base strategies, no bgzip/nocomp variants)
+        total_combos=$((${#BASE_STRATEGIES[@]} * ${#BASE_STRATEGIES[@]}))
+        combo_count=0
+        echo "Testing $total_combos dual strategy combinations..."
+
+        for FIRST in "${BASE_STRATEGIES[@]}"; do
+            for SECOND in "${BASE_STRATEGIES[@]}"; do
+                combo_count=$((combo_count + 1))
+                if [ $((combo_count % 20)) -eq 0 ]; then
+                    echo "  Progress: $combo_count/$total_combos"
+                fi
+                test_configuration "$TP_TYPE" "$FIRST" "$SECOND"
+                output_tsv_row "$TP_TYPE" "$FIRST" "$SECOND"
+            done
+        done
+    else
+        # Single mode: test each strategy symmetrically (first==second)
+        for STRATEGY in "${STRATEGIES[@]}"; do
+            test_configuration "$TP_TYPE" "$STRATEGY"
+            output_tsv_row "$TP_TYPE" "$STRATEGY"
+        done
+    fi
     echo ""
 done
 
@@ -542,12 +620,34 @@ cat > "$REPORT" << HEADER
 
 HEADER
 
-for TP_TYPE in "${TP_TYPES[@]}"; do
-    # Calculate baseline sizes
-    tp_size_bytes=${TP_SIZE[$TP_TYPE]}
-    tp_size_mb=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / 1024 / 1024}")
+if [ "$TEST_MODE" = "dual" ]; then
+    # For dual mode, skip detailed table (too many rows), just reference TSV
+    cat >> "$REPORT" << DUAL_NOTE
+## Dual Strategy Testing Mode
 
-    cat >> "$REPORT" << SECTION
+Testing all ${#BASE_STRATEGIES[@]}×${#BASE_STRATEGIES[@]}=289 strategy combinations per tracepoint type.
+
+**Results are available in:** \`results.tsv\`
+
+Use \`plot_results.py\` to visualize the data or analyze the TSV file directly.
+
+**Baseline Sizes:**
+DUAL_NOTE
+
+    for TP_TYPE in "${TP_TYPES[@]}"; do
+        tp_size_bytes=${TP_SIZE[$TP_TYPE]}
+        tp_size_mb=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / 1024 / 1024}")
+        echo "- $TP_TYPE: $tp_size_bytes bytes ($tp_size_mb MB)" >> "$REPORT"
+    done
+    echo "" >> "$REPORT"
+else
+    # Single mode: generate detailed markdown table
+    for TP_TYPE in "${TP_TYPES[@]}"; do
+        # Calculate baseline sizes
+        tp_size_bytes=${TP_SIZE[$TP_TYPE]}
+        tp_size_mb=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / 1024 / 1024}")
+
+        cat >> "$REPORT" << SECTION
 ## Tracepoint Type: ${TP_TYPE^^}
 
 **Baseline Sizes:**
@@ -558,20 +658,21 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
 |----------|-------------------------|------------|------------------|---------------|-------------------|-----------------|---------------------|-------------|-------------|----------|
 SECTION
 
-    for STRATEGY in "${STRATEGIES[@]}"; do
-        key="${TP_TYPE}_${STRATEGY}"
+        for STRATEGY in "${STRATEGIES[@]}"; do
+            key="${TP_TYPE}_${STRATEGY}"
 
-        # Calculate both ratios
-        bpaf_ratio=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / ${COMPRESS_SIZE[$key]}}" 2>/dev/null || echo "N/A")
-        e2e_ratio=$(awk "BEGIN {printf \"%.2f\", $SIZE / ${COMPRESS_SIZE[$key]}}" 2>/dev/null || echo "N/A")
+            # Calculate both ratios
+            bpaf_ratio=$(awk "BEGIN {printf \"%.2f\", $tp_size_bytes / ${COMPRESS_SIZE[$key]}}" 2>/dev/null || echo "N/A")
+            e2e_ratio=$(awk "BEGIN {printf \"%.2f\", $SIZE / ${COMPRESS_SIZE[$key]}}" 2>/dev/null || echo "N/A")
 
-        cat >> "$REPORT" << ROW
+            cat >> "$REPORT" << ROW
 | $STRATEGY | ${COMPRESS_SIZE[$key]} | ${bpaf_ratio}x | ${e2e_ratio}x | ${COMPRESS_TIME[$key]} | ${COMPRESS_MEM[$key]} | ${DECOMPRESS_TIME[$key]} | ${DECOMPRESS_MEM[$key]} | ${SEEK_A[$key]} | ${SEEK_B[$key]} | ${VERIFIED[$key]} |
 ROW
-    done
+        done
 
-    echo "" >> "$REPORT"
-done
+        echo "" >> "$REPORT"
+    done
+fi
 
 cat >> "$REPORT" << FOOTER
 

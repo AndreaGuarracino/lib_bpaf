@@ -18,12 +18,11 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 // Re-export public types
 use lib_tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_variable_tracepoints,
-    ComplexityMetric,
 };
 pub use lib_wfa2::affine_wavefront::Distance;
 
 pub use format::{AlignmentRecord, BinaryPafHeader, CompressionStrategy, StringTable, Tag, TagValue};
-pub use lib_tracepoints::{MixedRepresentation, TracepointData, TracepointType};
+pub use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::format::parse_tag;
 use crate::utils::{parse_u8, parse_usize};
@@ -101,6 +100,89 @@ pub fn compress_paf_with_tracepoints(
     )
 }
 
+/// Compress a PAF file with tracepoints using separate strategies for first and second values
+///
+/// This allows explicit control over which compression strategy is used for each value
+/// in tracepoint pairs, enabling testing of all 17×17=289 strategy combinations.
+///
+/// # Arguments
+/// * `input_path` - Path to input PAF file with tracepoints
+/// * `output_path` - Path to output BPAF file
+/// * `first_strategy` - Strategy for compressing first values in tracepoint pairs
+/// * `second_strategy` - Strategy for compressing second values in tracepoint pairs
+/// * `tp_type` - Type of tracepoint representation
+/// * `max_complexity` - Maximum complexity/spacing parameter
+/// * `complexity_metric` - Metric used for complexity calculation
+/// * `distance` - Distance parameters for alignment
+///
+/// # Example
+/// ```no_run
+/// use lib_bpaf::{compress_paf_with_tracepoints_dual, CompressionStrategy, TracepointType, ComplexityMetric, Distance};
+///
+/// compress_paf_with_tracepoints_dual(
+///     "input.paf",
+///     "output.bpaf",
+///     CompressionStrategy::Raw(3),
+///     CompressionStrategy::ZigzagDelta(3),
+///     TracepointType::Standard,
+///     32,
+///     ComplexityMetric::EditDistance,
+///     Distance::Edit,
+/// ).unwrap();
+/// ```
+pub fn compress_paf_with_tracepoints_dual(
+    input_path: &str,
+    output_path: &str,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    tp_type: TracepointType,
+    max_complexity: u64,
+    complexity_metric: ComplexityMetric,
+    distance: Distance,
+) -> io::Result<()> {
+    // Extract zstd level from first strategy (both should have same level in practice)
+    let zstd_level = match &first_strategy {
+        CompressionStrategy::Raw(lvl) |
+        CompressionStrategy::ZigzagDelta(lvl) |
+        CompressionStrategy::TwoDimDelta(lvl) |
+        CompressionStrategy::RunLength(lvl) |
+        CompressionStrategy::BitPacked(lvl) |
+        CompressionStrategy::DeltaOfDelta(lvl) |
+        CompressionStrategy::FrameOfReference(lvl) |
+        CompressionStrategy::HybridRLE(lvl) |
+        CompressionStrategy::OffsetJoint(lvl) |
+        CompressionStrategy::XORDelta(lvl) |
+        CompressionStrategy::Dictionary(lvl) |
+        CompressionStrategy::Simple8(lvl) |
+        CompressionStrategy::StreamVByte(lvl) |
+        CompressionStrategy::FastPFOR(lvl) |
+        CompressionStrategy::Cascaded(lvl) |
+        CompressionStrategy::Simple8bFull(lvl) |
+        CompressionStrategy::SelectiveRLE(lvl) => *lvl,
+        CompressionStrategy::Dual(_, _, lvl) => *lvl,
+        CompressionStrategy::Automatic(lvl) => *lvl,
+        CompressionStrategy::AdaptiveCorrelation(lvl) => *lvl,
+    };
+
+    // Create Dual strategy
+    let dual_strategy = CompressionStrategy::Dual(
+        Box::new(first_strategy),
+        Box::new(second_strategy),
+        zstd_level,
+    );
+
+    compress_paf(
+        input_path,
+        output_path,
+        dual_strategy,
+        tp_type,
+        max_complexity,
+        complexity_metric,
+        distance,
+        false, // use_cigar
+    )
+}
+
 pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Decompressing {} to text format...", input_path);
 
@@ -114,7 +196,7 @@ pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
 
     let header = BinaryPafHeader::read(&mut reader)?;
 
-    if header.version != 1 {
+    if header.version < 1 || header.version > 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unsupported format version: {}", header.version),
@@ -224,6 +306,7 @@ fn compress_paf(
             }
         }
         // Respect explicit user choices
+        CompressionStrategy::Dual(first, second, level) => CompressionStrategy::Dual(first, second, level),
         CompressionStrategy::Raw(level) => CompressionStrategy::Raw(level),
         CompressionStrategy::ZigzagDelta(level) => CompressionStrategy::ZigzagDelta(level),
         CompressionStrategy::TwoDimDelta(level) => CompressionStrategy::TwoDimDelta(level),
@@ -255,7 +338,7 @@ fn compress_paf(
     let header = BinaryPafHeader::new(
         record_count,
         string_table.len() as u64,
-        chosen_strategy,
+        chosen_strategy.clone(),
         tp_type,
         complexity_metric,
         max_complexity,
@@ -294,7 +377,7 @@ fn compress_paf(
         }?;
 
         // Write with chosen strategy
-        record.write(&mut writer, chosen_strategy)?;
+        record.write(&mut writer, chosen_strategy.clone())?;
     }
     writer.flush()?;
 

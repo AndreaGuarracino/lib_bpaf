@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# Ensure Rust/Cargo tools are available
+if [ -f "$HOME/.cargo/env" ]; then
+    source "$HOME/.cargo/env"
+else
+    export PATH="/home/node/.cargo/bin:$PATH"
+fi
+
 # Wrapper script to run comprehensive tests on multiple PAF files
 # Aggregates results into a final report
 
@@ -9,12 +16,12 @@ COMPREHENSIVE_TEST="$SCRIPT_DIR/comprehensive_test.sh"
 
 # Default test files (can override with arguments)
 TEST_FILES=(
-    "${1:-/workspace/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz}"
-    "${2:-/workspace/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.sweepga.paf.gz}"
-    "${3:-/workspace/git/_resources/big-from-fg.tp.20k.paf}"
+    "${1:-/home/guarracino/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz}"
+    "${2:-/home/guarracino/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.sweepga.paf.gz}"
+    "${3:-/home/guarracino/git/_resources/big-from-fg.tp.20k.paf}"
 )
 
-OUTPUT_BASE="${5:-/workspace/git/lib_bpaf/test/bpaf_all_tests}"
+OUTPUT_BASE="${5:-/home/guarracino/git/lib_bpaf/test/bpaf_all_tests}"
 NUM_RECORDS="${6:-0}"  # 0 means use ALL records
 
 mkdir -p "$OUTPUT_BASE"
@@ -22,7 +29,7 @@ mkdir -p "$OUTPUT_BASE"
 # Initialize master TSV file
 MASTER_TSV="$OUTPUT_BASE/all_results.tsv"
 cat > "$MASTER_TSV" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
 TSV_HEADER
 
 echo "###################################################################"
@@ -148,7 +155,7 @@ cat >> "$FINAL_REPORT" << SUMMARY
 
 **Master TSV File:** [\`all_results.tsv\`](./all_results.tsv)
 
-This file contains all test results in tab-separated format with 28 columns:
+This file contains all test results in tab-separated format with 29 columns:
 - Dataset information (name, type, size, records)
 - Encoding metrics (type, runtime, memory, output size)
 - Compression metrics (strategy, runtime, memory, file sizes, ratios)
