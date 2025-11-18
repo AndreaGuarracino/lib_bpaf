@@ -140,6 +140,18 @@ pub enum CompressionStrategy {
     /// - Negligible overhead when runs are absent
     /// - Configurable compression level (max 22, default: 3)
     SelectiveRLE(i32),
+    /// Rice / Golomb coding with block-local parameter
+    /// - Zigzag deltas encoded as unary quotient + fixed remainder bits
+    /// - Chooses k per block to minimize total bits
+    /// - Byte-aligned output keeps O(1) random access
+    /// - Configurable compression level (max 22, default: 3)
+    Rice(i32),
+    /// Canonical Huffman entropy coder
+    /// - Builds per-block codes over zigzag deltas
+    /// - Stores compact code lengths; canonical decoding avoids storing tree
+    /// - Byte-aligned output keeps O(1) random access
+    /// - Configurable compression level (max 22, default: 3)
+    Huffman(i32),
     /// Dual-strategy: apply different strategies to first_values and second_values
     /// - first_strategy for first_values stream
     /// - second_strategy for second_values stream
@@ -180,6 +192,8 @@ impl CompressionStrategy {
                 | "simple8bfull"
                 | "selective-rle"
                 | "selectiverle"
+                | "rice"
+                | "huffman"
         )
     }
 
@@ -248,6 +262,8 @@ impl CompressionStrategy {
             "cascaded" => Ok(CompressionStrategy::Cascaded(compression_level)),
             "simple8b-full" | "simple8bfull" => Ok(CompressionStrategy::Simple8bFull(compression_level)),
             "selective-rle" | "selectiverle" => Ok(CompressionStrategy::SelectiveRLE(compression_level)),
+            "rice" => Ok(CompressionStrategy::Rice(compression_level)),
+            "huffman" => Ok(CompressionStrategy::Huffman(compression_level)),
             _ => Err(format!(
                 "Unsupported compression strategy '{}'. Use --help to see all available strategies.",
                 strategy_name
@@ -349,6 +365,8 @@ impl CompressionStrategy {
             "cascaded" => Ok(CompressionStrategy::Cascaded(level)),
             "simple8b-full" | "simple8bfull" => Ok(CompressionStrategy::Simple8bFull(level)),
             "selective-rle" | "selectiverle" => Ok(CompressionStrategy::SelectiveRLE(level)),
+            "rice" => Ok(CompressionStrategy::Rice(level)),
+            "huffman" => Ok(CompressionStrategy::Huffman(level)),
             _ => Err(format!(
                 "Unsupported compression strategy '{}'. Use --help to see all available strategies.",
                 name
@@ -382,6 +400,8 @@ impl CompressionStrategy {
             "simple8",
             "stream-vbyte",
             "adaptive-correlation",
+            "rice",
+            "huffman",
         ]
     }
 
@@ -411,6 +431,8 @@ impl CompressionStrategy {
             CompressionStrategy::Cascaded(_) => 14,
             CompressionStrategy::Simple8bFull(_) => 15,
             CompressionStrategy::SelectiveRLE(_) => 16,
+            CompressionStrategy::Rice(_) => 17,
+            CompressionStrategy::Huffman(_) => 18,
         }
     }
 
@@ -434,6 +456,8 @@ impl CompressionStrategy {
             14 => Ok(CompressionStrategy::Cascaded(3)),
             15 => Ok(CompressionStrategy::Simple8bFull(3)),
             16 => Ok(CompressionStrategy::SelectiveRLE(3)),
+            17 => Ok(CompressionStrategy::Rice(3)),
+            18 => Ok(CompressionStrategy::Huffman(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported compression strategy code: {}", code),
@@ -464,6 +488,8 @@ impl CompressionStrategy {
             CompressionStrategy::Cascaded(level) => *level,
             CompressionStrategy::Simple8bFull(level) => *level,
             CompressionStrategy::SelectiveRLE(level) => *level,
+            CompressionStrategy::Rice(level) => *level,
+            CompressionStrategy::Huffman(level) => *level,
         }
     }
 }
@@ -530,6 +556,12 @@ impl std::fmt::Display for CompressionStrategy {
             }
             CompressionStrategy::SelectiveRLE(level) => {
                 write!(f, "SelectiveRLE (level {})", level)
+            }
+            CompressionStrategy::Rice(level) => {
+                write!(f, "Rice (level {})", level)
+            }
+            CompressionStrategy::Huffman(level) => {
+                write!(f, "Huffman (level {})", level)
             }
         }
     }

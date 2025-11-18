@@ -117,7 +117,9 @@ pub fn compress_paf_with_cigar_dual(
         | CompressionStrategy::FastPFOR(lvl)
         | CompressionStrategy::Cascaded(lvl)
         | CompressionStrategy::Simple8bFull(lvl)
-        | CompressionStrategy::SelectiveRLE(lvl) => *lvl,
+        | CompressionStrategy::SelectiveRLE(lvl)
+        | CompressionStrategy::Rice(lvl)
+        | CompressionStrategy::Huffman(lvl) => *lvl,
         CompressionStrategy::Dual(_, _, lvl) => *lvl,
         CompressionStrategy::Automatic(lvl) => *lvl,
         CompressionStrategy::AdaptiveCorrelation(lvl) => *lvl,
@@ -225,7 +227,9 @@ pub fn compress_paf_with_tracepoints_dual(
         | CompressionStrategy::FastPFOR(lvl)
         | CompressionStrategy::Cascaded(lvl)
         | CompressionStrategy::Simple8bFull(lvl)
-        | CompressionStrategy::SelectiveRLE(lvl) => *lvl,
+        | CompressionStrategy::SelectiveRLE(lvl)
+        | CompressionStrategy::Rice(lvl)
+        | CompressionStrategy::Huffman(lvl) => *lvl,
         CompressionStrategy::Dual(_, _, lvl) => *lvl,
         CompressionStrategy::Automatic(lvl) => *lvl,
         CompressionStrategy::AdaptiveCorrelation(lvl) => *lvl,

@@ -9,6 +9,7 @@ Binary format for genomic sequence alignments with tracepoints.
   - **Automatic (default)**: Samples data to choose between raw or delta+zigzag encoding
   - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
   - **Raw**: Plain varints + zstd
+  - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, still byte-aligned for random seeks
 - **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
 - **String deduplication**: Shared sequence name table
 - **Byte-aligned encoding**: Enables extremely fast tracepoint extraction
@@ -135,6 +136,12 @@ compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionSt
 // - Selects optimal encoding (FOR, DeltaOfDelta, XORDelta, Dictionary)
 // - Enables O(1) random tracepoint access
 compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::BlockwiseAdaptive(32))?;
+
+// Rice entropy coding: Zigzag + delta + Rice (Golomb) bitstream per block
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Rice(3))?;
+
+// Huffman entropy coding: Zigzag + delta + canonical Huffman per block
+compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionStrategy::Huffman(3))?;
 ```
 
 **Strategy guide:**
@@ -142,6 +149,8 @@ compress_paf_with_tracepoints("alignments.paf", "alignments.bpaf", CompressionSt
 - **ZigzagDelta**: Use when tracepoint values are mostly increasing
 - **Raw**: Use when tracepoint values jump frequently
 - **BlockwiseAdaptive**: Adaptive selection per record using advanced codecs
+- **Rice**: Skewed, small zigzag deltas where Golomb coding beats varints (still byte-aligned)
+- **Huffman**: Highly skewed distributions with a few hot values/zeros
 
 ### Index management
 

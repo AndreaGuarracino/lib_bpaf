@@ -80,6 +80,19 @@ normalize_time_field() {
     fi
 }
 
+# Portable file size (bytes) using Python to avoid GNU/BSD stat differences
+file_size() {
+    local path="$1"
+    python3 - "$path" <<'PY'
+import os, sys
+path = sys.argv[1]
+try:
+    print(os.path.getsize(path))
+except OSError:
+    print(0)
+PY
+}
+
 # Parameters
 INPUT_PAF="${1}"
 OUTPUT_DIR="${2:-/tmp/bpaf_test_output}"
@@ -98,7 +111,7 @@ if [ -z "$INPUT_PAF" ] || [ ! -f "$INPUT_PAF" ]; then
     echo ""
     echo "Test Modes:"
     echo "  single (default) - Test each strategy symmetrically (first==second)"
-    echo "  dual             - Test all 17×17=289 strategy combinations"
+    echo "  dual             - Test all $((${#BASE_STRATEGIES[@]}*${#BASE_STRATEGIES[@]})) strategy combinations"
     echo ""
     echo "Threads:"
     echo "  Number of tests to run in parallel (default: 1)"
@@ -167,7 +180,7 @@ else
 fi
 
 EXTRACTED=$(wc -l < "$OUTPUT_DIR/input_sample.paf")
-SIZE=$(stat -c %s "$OUTPUT_DIR/input_sample.paf" || stat -f %z "$OUTPUT_DIR/input_sample.paf")
+SIZE=$(file_size "$OUTPUT_DIR/input_sample.paf")
 echo "Extracted: $EXTRACTED records ($SIZE bytes)"
 echo ""
 
@@ -473,8 +486,8 @@ if command -v bgzip &> /dev/null; then
             # Extract compression metrics
             BGZIP_TIME[$TP_TYPE]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${TP_TYPE}_bgzip.log" | awk '{print $8}')
             BGZIP_MEM[$TP_TYPE]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${TP_TYPE}_bgzip.log" | awk '{print $6}')
-            BGZIP_SIZE[$TP_TYPE]=$(stat -f%z "${TP_PAF}.gz" || stat -c%s "${TP_PAF}.gz")
-            TP_SIZE[$TP_TYPE]=$(stat -f%z "$TP_PAF" || stat -c%s "$TP_PAF")
+        BGZIP_SIZE[$TP_TYPE]=$(file_size "${TP_PAF}.gz")
+        TP_SIZE[$TP_TYPE]=$(file_size "$TP_PAF")
 
             ratio_bgzip=$(safe_ratio "${TP_SIZE[$TP_TYPE]}" "${BGZIP_SIZE[$TP_TYPE]}" 2)
             echo "    Uncompressed: $(numfmt --to=iec ${TP_SIZE[$TP_TYPE]})"
@@ -507,6 +520,8 @@ BASE_STRATEGIES=(
     "cascaded"
     "simple8b-full"
     "selective-rle"
+    "rice"
+    "huffman"
 )
 
 # Build full strategy list: base+zstd, base-bgzip, and base-nocomp
@@ -548,7 +563,7 @@ test_configuration() {
 
     # Store tracepoint PAF size (only once per type)
     if [ -z "${TP_SIZE[$tp_type]}" ]; then
-        TP_SIZE[$tp_type]=$(stat -c %s "$tp_paf" || stat -f %z "$tp_paf")
+        TP_SIZE[$tp_type]=$(file_size "$tp_paf")
     fi
 
     # Compress - use cigzip for all modes
@@ -585,7 +600,7 @@ test_configuration() {
 
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
     COMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $6}')
-    COMPRESS_SIZE[$key]=$(stat -c %s "$OUTPUT_DIR/${key}.bpaf" || stat -f %z "$OUTPUT_DIR/${key}.bpaf")
+    COMPRESS_SIZE[$key]=$(file_size "$OUTPUT_DIR/${key}.bpaf")
 
     # Extract actual strategies from BPAF header using bpaf-view
     local strategy_output=$("$REPO_DIR/target/release/bpaf-view" --strategies "$OUTPUT_DIR/${key}.bpaf" || echo "unknown	unknown")
@@ -798,11 +813,11 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
     echo "═══════════════════════════════════════════════════"
 
     if [ "$TEST_MODE" = "dual" ]; then
-        # Test all 17×17×3=867 combinations (17 first strategies × 17 second strategies × 3 layers)
+        # Test all first×second×layer combinations
         LAYERS=("" "-bgzip" "-nocomp")
         total_combos=$((${#BASE_STRATEGIES[@]} * ${#BASE_STRATEGIES[@]} * ${#LAYERS[@]}))
         combo_count=0
-        echo "Testing $total_combos dual strategy combinations (17 first × 17 second × 3 layers) with $THREADS threads..."
+        echo "Testing $total_combos dual strategy combinations (${#BASE_STRATEGIES[@]} first × ${#BASE_STRATEGIES[@]} second × ${#LAYERS[@]} layers) with $THREADS threads..."
 
         # Function to run a single test (for parallel execution)
         run_test() {

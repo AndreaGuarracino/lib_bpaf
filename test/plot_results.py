@@ -15,6 +15,31 @@ import matplotlib.patches as mpatches
 from pathlib import Path
 import numpy as np
 
+UNKNOWN = "unknown"
+
+def normalize_strategy_pair(row):
+    """Return (first, second) using fallbacks when values are missing/unknown."""
+    first = str(row.get('strategy_first', '')).strip()
+    second = str(row.get('strategy_second', '')).strip()
+    combined = str(row.get('compression_strategy', '')).strip()
+
+    def is_unknown(val: str) -> bool:
+        return val == "" or val.lower() == UNKNOWN
+
+    if not is_unknown(first) and not is_unknown(second):
+        return first, second
+
+    # Fallback: derive from combined strategy string
+    if "→" in combined:
+        parts = combined.split("→", 1)
+        return parts[0], parts[1]
+    if ":" in combined:
+        parts = combined.split(":", 1)
+        return parts[0], parts[1]
+    if combined:
+        return combined, combined
+    return first or UNKNOWN, second or UNKNOWN
+
 def format_bytes(bytes_val):
     """Convert bytes to human-readable format"""
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -36,12 +61,11 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
     # Sort by compression ratio (best first)
     data = data.sort_values('ratio_orig_to_bpaf', ascending=False)
 
-    # Create strategy labels (combine first → second strategies)
-    strategies = []
-    for _, row in data.iterrows():
-        first = row['strategy_first']
-        second = row['strategy_second']
-        strategies.append(f"{first}→{second}")
+    # Normalize strategy labels (avoid "unknown" when second wasn't parsed)
+    norm_pairs = data.apply(normalize_strategy_pair, axis=1, result_type='expand')
+    data = data.assign(strategy_first_norm=norm_pairs[0], strategy_second_norm=norm_pairs[1])
+
+    strategies = [f"{f}→{s}" for f, s in zip(data['strategy_first_norm'], data['strategy_second_norm'])]
 
     # Create figure with 4 subplots (vertical stack)
     fig, axes = plt.subplots(4, 1, figsize=(72, 32))
@@ -66,6 +90,11 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
         else:
             colors.append('#1f77b4')  # blue for zstd (default)
 
+    def compact_axis(ax, count: int):
+        """Remove extra horizontal padding around bars."""
+        ax.set_xlim(-0.5, max(count - 0.5, 0.5))
+        ax.margins(x=0)
+
     # Plot 1: BPAF File Size
     ax1 = axes[0]
     bars1 = ax1.bar(range(len(strategies)), data['bpaf_size_bytes'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
@@ -76,12 +105,13 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
     ax1.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
     ax1.grid(axis='y', alpha=0.3)
     ax1.ticklabel_format(axis='y', style='plain')
+    compact_axis(ax1, len(strategies))
 
     # Annotate best (smallest)
     best_idx = data['bpaf_size_bytes'].idxmin()
     best_size = data.loc[best_idx, 'bpaf_size_bytes']
-    best_first = data.loc[best_idx, 'strategy_first']
-    best_second = data.loc[best_idx, 'strategy_second']
+    best_first = data.loc[best_idx, 'strategy_first_norm']
+    best_second = data.loc[best_idx, 'strategy_second_norm']
     ax1.text(0.98, 0.98, f'Best: {best_first}→{best_second}\n{format_bytes(best_size)}',
              transform=ax1.transAxes, ha='right', va='top',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8), fontsize=9)
@@ -95,12 +125,13 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
     ax2.set_xticks(range(len(strategies)))
     ax2.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
     ax2.grid(axis='y', alpha=0.3)
+    compact_axis(ax2, len(strategies))
 
     # Annotate best (highest)
     best_idx = data['ratio_orig_to_bpaf'].idxmax()
     best_ratio = data.loc[best_idx, 'ratio_orig_to_bpaf']
-    best_first = data.loc[best_idx, 'strategy_first']
-    best_second = data.loc[best_idx, 'strategy_second']
+    best_first = data.loc[best_idx, 'strategy_first_norm']
+    best_second = data.loc[best_idx, 'strategy_second_norm']
     ax2.text(0.98, 0.98, f'Best: {best_first}→{best_second}\n{best_ratio:.2f}x',
              transform=ax2.transAxes, ha='right', va='top',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8), fontsize=9)
@@ -114,12 +145,13 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
     ax3.set_xticks(range(len(strategies)))
     ax3.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
     ax3.grid(axis='y', alpha=0.3)
+    compact_axis(ax3, len(strategies))
 
     # Annotate best (lowest)
     best_idx = data['seek_mode_b_avg_us'].idxmin()
     best_seek = data.loc[best_idx, 'seek_mode_b_avg_us']
-    best_first = data.loc[best_idx, 'strategy_first']
-    best_second = data.loc[best_idx, 'strategy_second']
+    best_first = data.loc[best_idx, 'strategy_first_norm']
+    best_second = data.loc[best_idx, 'strategy_second_norm']
     ax3.text(0.98, 0.98, f'Fastest: {best_first}→{best_second}\n{best_seek:.2f} μs',
              transform=ax3.transAxes, ha='right', va='top',
              bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8), fontsize=9)
@@ -133,12 +165,13 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
     ax4.set_xticks(range(len(strategies)))
     ax4.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
     ax4.grid(axis='y', alpha=0.3)
+    compact_axis(ax4, len(strategies))
 
     # Annotate fastest
     best_idx = data['compression_runtime_sec'].idxmin()
     best_time = data.loc[best_idx, 'compression_runtime_sec']
-    best_first = data.loc[best_idx, 'strategy_first']
-    best_second = data.loc[best_idx, 'strategy_second']
+    best_first = data.loc[best_idx, 'strategy_first_norm']
+    best_second = data.loc[best_idx, 'strategy_second_norm']
     ax4.text(0.98, 0.98, f'Fastest: {best_first}→{best_second}\n{best_time:.2f} s',
              transform=ax4.transAxes, ha='right', va='top',
              bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8), fontsize=9)
@@ -151,8 +184,8 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
                loc='lower center', ncol=3, frameon=True, fontsize=10,
                bbox_to_anchor=(0.5, -0.02))
 
-    plt.subplots_adjust(left=0.05, right=0.98)
-    plt.tight_layout(rect=[0, 0.02, 1, 0.96])
+    plt.subplots_adjust(left=0.03, right=0.99, wspace=0.15, hspace=0.3)
+    plt.tight_layout(rect=[0.005, 0.01, 0.995, 0.98])
 
     # Save plot
     output_file = output_dir / f'{dataset_name}_metrics.png'

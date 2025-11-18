@@ -539,6 +539,365 @@ fn read_tracepoints<R: Read>(
     }
 }
 
+// ============================================================================
+// BITSTREAM HELPERS
+// ============================================================================
+
+#[derive(Default)]
+struct BitWriter {
+    buffer: Vec<u8>,
+    current: u8,
+    bits_filled: u8,
+}
+
+impl BitWriter {
+    fn write_bit(&mut self, bit: bool) {
+        self.current <<= 1;
+        if bit {
+            self.current |= 1;
+        }
+        self.bits_filled += 1;
+        if self.bits_filled == 8 {
+            self.buffer.push(self.current);
+            self.current = 0;
+            self.bits_filled = 0;
+        }
+    }
+
+    fn write_unary(&mut self, count: u64) {
+        for _ in 0..count {
+            self.write_bit(true);
+        }
+        self.write_bit(false);
+    }
+
+    fn write_bits(&mut self, value: u64, bits: u8) {
+        if bits == 0 {
+            return;
+        }
+        for shift in (0..bits).rev() {
+            let bit = ((value >> (shift as u32)) & 1) != 0;
+            self.write_bit(bit);
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.bits_filled > 0 {
+            self.current <<= 8 - self.bits_filled;
+            self.buffer.push(self.current);
+        }
+        self.buffer
+    }
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    byte_idx: usize,
+    bits_left: u8,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte_idx: 0,
+            bits_left: 0,
+        }
+    }
+
+    fn read_bit(&mut self) -> io::Result<bool> {
+        if self.bits_left == 0 {
+            if self.byte_idx >= self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bit reader exhausted",
+                ));
+            }
+            self.bits_left = 8;
+        }
+        let byte = self.data[self.byte_idx];
+        let bit = (byte & (1 << (self.bits_left - 1))) != 0;
+        self.bits_left -= 1;
+        if self.bits_left == 0 {
+            self.byte_idx += 1;
+        }
+        Ok(bit)
+    }
+
+    fn read_bits(&mut self, bits: u8) -> io::Result<u64> {
+        let mut value = 0u64;
+        for _ in 0..bits {
+            value = (value << 1) | (self.read_bit()? as u64);
+        }
+        Ok(value)
+    }
+
+    fn read_unary(&mut self) -> io::Result<u64> {
+        let mut count = 0u64;
+        loop {
+            let bit = self.read_bit()?;
+            if bit {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(count)
+    }
+}
+
+// ============================================================================
+// RICE / GOLOMB CODING
+// ============================================================================
+
+fn choose_rice_k(values: &[u64]) -> u8 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut best_k = 0;
+    let mut best_bits = u64::MAX;
+    for k in 0..=16 {
+        let mut bits = 0u64;
+        for &v in values {
+            bits += (v >> (k as u32)) + 1 + k as u64; // unary quotient + stop bit + remainder
+        }
+        if bits < best_bits {
+            best_bits = bits;
+            best_k = k;
+        }
+    }
+    best_k
+}
+
+fn encode_rice_values(values: &[u64]) -> io::Result<Vec<u8>> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let k = choose_rice_k(values);
+    let mut writer = BitWriter::default();
+    let mask = if k == 0 { 0 } else { (1u64 << (k as u32)) - 1 };
+    for &v in values {
+        let q = v >> (k as u32);
+        let r = v & mask;
+        writer.write_unary(q);
+        writer.write_bits(r, k);
+    }
+    let mut out = Vec::with_capacity(1 + values.len() / 2);
+    out.push(k as u8);
+    out.extend_from_slice(&writer.finish());
+    Ok(out)
+}
+
+fn decode_rice_values(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
+    if num_items == 0 {
+        return Ok(Vec::new());
+    }
+    if buf.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing Rice header",
+        ));
+    }
+    let k = buf[0];
+    let mut reader = BitReader::new(&buf[1..]);
+    let mut values = Vec::with_capacity(num_items);
+    for _ in 0..num_items {
+        let q = reader.read_unary()?;
+        let r = if k > 0 { reader.read_bits(k)? } else { 0 };
+        values.push((q << (k as u32)) | r);
+    }
+    Ok(values)
+}
+
+// ============================================================================
+// HUFFMAN CODING
+// ============================================================================
+
+#[derive(Clone)]
+struct HuffmanCode {
+    value: u64,
+    len: u8,
+    code: u64,
+}
+
+#[derive(Clone)]
+enum HuffmanNode {
+    Leaf(u64),
+    Internal(Box<HuffmanNode>, Box<HuffmanNode>),
+}
+
+fn build_huffman_tree(freqs: &[(u64, usize)]) -> HuffmanNode {
+    let mut nodes: Vec<(usize, HuffmanNode)> = freqs
+        .iter()
+        .map(|(v, f)| (*f, HuffmanNode::Leaf(*v)))
+        .collect();
+    while nodes.len() > 1 {
+        nodes.sort_by_key(|(f, _)| *f);
+        let (f1, n1) = nodes.remove(0);
+        let (f2, n2) = nodes.remove(0);
+        nodes.push((f1 + f2, HuffmanNode::Internal(Box::new(n1), Box::new(n2))));
+    }
+    nodes.pop().map(|(_, n)| n).unwrap()
+}
+
+fn gather_lengths(node: &HuffmanNode, depth: u8, lens: &mut Vec<(u64, u8)>) {
+    match node {
+        HuffmanNode::Leaf(v) => {
+            // Ensure single-symbol trees still get a length of 1
+            lens.push((*v, depth.max(1)));
+        }
+        HuffmanNode::Internal(left, right) => {
+            gather_lengths(left, depth + 1, lens);
+            gather_lengths(right, depth + 1, lens);
+        }
+    }
+}
+
+fn build_canonical_codes(lengths: &[(u64, u8)]) -> io::Result<Vec<HuffmanCode>> {
+    let mut entries = lengths.to_vec();
+    entries.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut codes = Vec::with_capacity(entries.len());
+    let mut code = 0u64;
+    let mut prev_len = 0u8;
+    for (value, len) in entries {
+        if len == 0 || len > 63 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid Huffman code length: {}", len),
+            ));
+        }
+        if prev_len > 0 {
+            code <<= (len - prev_len) as u32;
+        }
+        codes.push(HuffmanCode { value, len, code });
+        code += 1;
+        prev_len = len;
+    }
+    Ok(codes)
+}
+
+fn huffman_encode(values: &[u64]) -> io::Result<Vec<u8>> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    use std::collections::HashMap;
+    let mut freq: HashMap<u64, usize> = HashMap::new();
+    for &v in values {
+        *freq.entry(v).or_insert(0) += 1;
+    }
+    let mut freq_vec: Vec<(u64, usize)> = freq.into_iter().collect();
+    freq_vec.sort_by_key(|(_, c)| *c);
+
+    let tree = build_huffman_tree(&freq_vec);
+    let mut lengths = Vec::with_capacity(freq_vec.len());
+    gather_lengths(&tree, 0, &mut lengths);
+    let codes = build_canonical_codes(&lengths)?;
+
+    let mut code_lookup = std::collections::HashMap::new();
+    for c in &codes {
+        code_lookup.insert(c.value, (c.code, c.len));
+    }
+
+    // Serialize header: symbol count + (value, length) pairs in canonical order
+    let mut out = Vec::new();
+    write_varint(&mut out, codes.len() as u64)?;
+    let mut lengths_sorted: Vec<(u64, u8)> = codes.iter().map(|c| (c.value, c.len)).collect();
+    lengths_sorted.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    for (value, len) in lengths_sorted.iter() {
+        write_varint(&mut out, *value)?;
+        out.push(*len);
+    }
+
+    // Encode payload
+    let mut writer = BitWriter::default();
+    for &v in values {
+        let (code, len) = code_lookup[&v];
+        writer.write_bits(code, len);
+    }
+    out.extend_from_slice(&writer.finish());
+    Ok(out)
+}
+
+fn huffman_decode(buf: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
+    if num_items == 0 {
+        return Ok(Vec::new());
+    }
+    let mut reader = buf;
+    let symbol_count = read_varint(&mut reader)? as usize;
+    if symbol_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Huffman stream has zero symbols",
+        ));
+    }
+    let mut lengths: Vec<(u64, u8)> = Vec::with_capacity(symbol_count);
+    for _ in 0..symbol_count {
+        let value = read_varint(&mut reader)?;
+        if reader.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Huffman header truncated",
+            ));
+        }
+        let len = reader[0];
+        reader = &reader[1..];
+        lengths.push((value, len));
+    }
+    let codes = build_canonical_codes(&lengths)?;
+
+    #[derive(Default)]
+    struct DecodeNode {
+        left: Option<Box<DecodeNode>>,
+        right: Option<Box<DecodeNode>>,
+        value: Option<u64>,
+    }
+
+    let mut root = DecodeNode::default();
+    for c in &codes {
+        let mut node = &mut root;
+        for shift in (0..c.len).rev() {
+            let bit = (c.code >> (shift as u32)) & 1;
+            if bit == 0 {
+                if node.left.is_none() {
+                    node.left = Some(Box::new(DecodeNode::default()));
+                }
+                node = node.left.as_mut().unwrap();
+            } else {
+                if node.right.is_none() {
+                    node.right = Some(Box::new(DecodeNode::default()));
+                }
+                node = node.right.as_mut().unwrap();
+            }
+        }
+        node.value = Some(c.value);
+    }
+
+    let mut bit_reader = BitReader::new(reader);
+    let mut output = Vec::with_capacity(num_items);
+    for _ in 0..num_items {
+        let mut node = &root;
+        loop {
+            if let Some(v) = node.value {
+                output.push(v);
+                break;
+            }
+            let bit = bit_reader.read_bit()?;
+            node = if !bit {
+                node.left.as_deref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid Huffman bitstream")
+                })?
+            } else {
+                node.right.as_deref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid Huffman bitstream")
+                })?
+            };
+        }
+    }
+
+    Ok(output)
+}
+
 /// Encode tracepoint values based on compression strategy
 #[inline]
 fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::Result<Vec<u8>> {
@@ -795,6 +1154,18 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
         CompressionStrategy::SelectiveRLE(_) => {
             // Selective RLE: detect and encode runs
             buf = crate::hybrids::encode_selective_rle(vals)?;
+        }
+        CompressionStrategy::Rice(_) => {
+            // Rice/Golomb on zigzagged deltas
+            let deltas = delta_encode(vals);
+            let zigzagged: Vec<u64> = deltas.iter().map(|&v| encode_zigzag(v)).collect();
+            buf = encode_rice_values(&zigzagged)?;
+        }
+        CompressionStrategy::Huffman(_) => {
+            // Canonical Huffman on zigzagged deltas
+            let deltas = delta_encode(vals);
+            let zigzagged: Vec<u64> = deltas.iter().map(|&v| encode_zigzag(v)).collect();
+            buf = huffman_encode(&zigzagged)?;
         }
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before encoding")
@@ -1104,6 +1475,37 @@ fn decode_tracepoint_values(
             // Selective RLE decode
             crate::hybrids::decode_selective_rle(buf)
         }
+        CompressionStrategy::Rice(_) => {
+            if num_items == 0 {
+                return Ok(Vec::new());
+            }
+            let zigzagged = decode_rice_values(buf, num_items)?;
+            let mut vals = Vec::with_capacity(num_items);
+            // First value
+            let first = ((zigzagged[0] >> 1) as i64) ^ -((zigzagged[0] & 1) as i64);
+            vals.push(first as u64);
+            for &enc in zigzagged.iter().skip(1) {
+                let delta = ((enc >> 1) as i64) ^ -((enc & 1) as i64);
+                let prev = *vals.last().unwrap() as i64;
+                vals.push((prev + delta) as u64);
+            }
+            Ok(vals)
+        }
+        CompressionStrategy::Huffman(_) => {
+            if num_items == 0 {
+                return Ok(Vec::new());
+            }
+            let zigzagged = huffman_decode(buf, num_items)?;
+            let mut vals = Vec::with_capacity(num_items);
+            let first = ((zigzagged[0] >> 1) as i64) ^ -((zigzagged[0] & 1) as i64);
+            vals.push(first as u64);
+            for &enc in zigzagged.iter().skip(1) {
+                let delta = ((enc >> 1) as i64) ^ -((enc & 1) as i64);
+                let prev = *vals.last().unwrap() as i64;
+                vals.push((prev + delta) as u64);
+            }
+            Ok(vals)
+        }
         CompressionStrategy::Automatic(_) | CompressionStrategy::AdaptiveCorrelation(_) => {
             panic!("Automatic strategies must be resolved before decoding")
         }
@@ -1373,7 +1775,9 @@ fn decode_standard_tracepoints<R: Read>(
         | CompressionStrategy::FastPFOR(_)
         | CompressionStrategy::Cascaded(_)
         | CompressionStrategy::Simple8bFull(_)
-        | CompressionStrategy::SelectiveRLE(_) => {
+        | CompressionStrategy::SelectiveRLE(_)
+        | CompressionStrategy::Rice(_)
+        | CompressionStrategy::Huffman(_) => {
             // These strategies use standard encoding for both streams
             let first_vals = decode_tracepoint_values(&first_buf, num_items, strategy.clone())?;
             let second_vals = decode_tracepoint_values(&second_buf, num_items, strategy)?;
@@ -1747,6 +2151,38 @@ impl AlignmentRecord {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+
+    #[test]
+    fn rice_roundtrip_varied() {
+        let vals = vec![5u64, 7, 9, 15, 15, 200, 210, 205, 300, 301];
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::Rice(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::Rice(3)).unwrap();
+        assert_eq!(vals, decoded);
+    }
+
+    #[test]
+    fn huffman_roundtrip_non_monotonic() {
+        let vals = vec![10u64, 8, 8, 12, 8, 10, 9, 20, 18, 18, 18];
+        let buf = encode_tracepoint_values(&vals, CompressionStrategy::Huffman(3)).unwrap();
+        let decoded =
+            decode_tracepoint_values(&buf, vals.len(), CompressionStrategy::Huffman(3)).unwrap();
+        assert_eq!(vals, decoded);
+    }
+
+    #[test]
+    fn empty_rice_and_huffman() {
+        let empty: Vec<u64> = Vec::new();
+        let r = encode_tracepoint_values(&empty, CompressionStrategy::Rice(3)).unwrap();
+        let h = encode_tracepoint_values(&empty, CompressionStrategy::Huffman(3)).unwrap();
+        assert!(r.is_empty());
+        assert!(h.is_empty());
     }
 }
 
