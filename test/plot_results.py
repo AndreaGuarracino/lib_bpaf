@@ -67,9 +67,9 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
 
     strategies = [f"{f}→{s}" for f, s in zip(data['strategy_first_norm'], data['strategy_second_norm'])]
 
-    # Create figure with 4 subplots (vertical stack)
-    fig, axes = plt.subplots(4, 1, figsize=(72, 32))
-    fig.suptitle(f'Compression Strategy Performance: {dataset_name}', fontsize=16, fontweight='bold', y=0.995)
+    # Create figure with 6 subplots (vertical stack)
+    fig, axes = plt.subplots(6, 1, figsize=(84, 48))
+    fig.suptitle(f'Compression Strategy Performance: {dataset_name}', fontsize=16, fontweight='bold', y=0.997)
 
     # Original file info
     orig_size = data['original_size_bytes'].iloc[0]
@@ -176,16 +176,56 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
              transform=ax4.transAxes, ha='right', va='top',
              bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8), fontsize=9)
 
+    # Plot 5: Verification (checksum) pass/fail
+    ax5 = axes[4]
+    verification = data['verification_passed'].apply(lambda x: 1.0 if str(x).lower() == 'yes' else 0.0)
+    ver_colors = ['#2ca02c' if v >= 0.999 else '#d62728' for v in verification]  # green pass, red fail
+    ax5.bar(range(len(strategies)), verification, color=ver_colors, alpha=0.8, edgecolor='black', linewidth=0.5)
+    ax5.set_xlabel('Compression Strategy', fontweight='bold')
+    ax5.set_ylabel('Verification', fontweight='bold')
+    ax5.set_title('Checksum Validation (1 = pass, 0 = fail)', fontweight='bold')
+    ax5.set_xticks(range(len(strategies)))
+    ax5.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
+    ax5.set_ylim(0, 1.1)
+    ax5.grid(axis='y', alpha=0.3)
+    compact_axis(ax5, len(strategies))
+    if len(verification) > 0:
+        avg_ver = verification.mean() * 100.0
+        ax5.text(0.98, 0.98, f'Pass rate: {avg_ver:.1f}%', transform=ax5.transAxes,
+                 ha='right', va='top',
+                 bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8), fontsize=9)
+
+    # Plot 6: Tracepoint validation ratio (seek success)
+    ax6 = axes[5]
+    seek_ratio = data['seek_success_ratio']
+    seek_colors = ['#2ca02c' if v >= 0.999 else '#d62728' for v in seek_ratio]  # green pass, red fail
+    ax6.bar(range(len(strategies)), seek_ratio, color=seek_colors, alpha=0.8, edgecolor='black', linewidth=0.5)
+    ax6.set_xlabel('Compression Strategy', fontweight='bold')
+    ax6.set_ylabel('Seek Success Ratio', fontweight='bold')
+    ax6.set_title('Tracepoint Validation Ratio (Seek Success)', fontweight='bold')
+    ax6.set_xticks(range(len(strategies)))
+    ax6.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
+    ax6.set_ylim(0, 1.05)
+    ax6.grid(axis='y', alpha=0.3)
+    compact_axis(ax6, len(strategies))
+    best_idx = data['seek_success_ratio'].idxmax()
+    best_val = data.loc[best_idx, 'seek_success_ratio']
+    best_first = data.loc[best_idx, 'strategy_first_norm']
+    best_second = data.loc[best_idx, 'strategy_second_norm']
+    ax6.text(0.98, 0.98, f'Best: {best_first}→{best_second}\n{best_val:.3f}',
+             transform=ax6.transAxes, ha='right', va='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8), fontsize=9)
+
     # Add legend for compression layers
     zstd_patch = mpatches.Patch(color='#1f77b4', alpha=0.7, label='Zstd (default)')
     bgzip_patch = mpatches.Patch(color='#ff7f0e', alpha=0.7, label='BGZIP')
     nocomp_patch = mpatches.Patch(color='#2ca02c', alpha=0.7, label='No compression')
     fig.legend(handles=[zstd_patch, bgzip_patch, nocomp_patch],
                loc='lower center', ncol=3, frameon=True, fontsize=10,
-               bbox_to_anchor=(0.5, -0.02))
+               bbox_to_anchor=(0.5, 0.0))
 
-    plt.subplots_adjust(left=0.03, right=0.99, wspace=0.15, hspace=0.3)
-    plt.tight_layout(rect=[0.005, 0.01, 0.995, 0.98])
+    plt.subplots_adjust(left=0.03, right=0.99, wspace=0.15, hspace=0.35)
+    plt.tight_layout(rect=[0.005, 0.01, 0.995, 0.985])
 
     # Save plot
     output_file = output_dir / f'{dataset_name}_metrics.png'
