@@ -2,6 +2,7 @@
 
 use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
+use rayon::prelude::*;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -149,39 +150,81 @@ fn encode_varint_inline(mut value: u64) -> Vec<u8> {
     bytes
 }
 
-/// Empirical DUAL strategy selection - tests all combinations of first × second × layer
-/// Returns the best performing first strategy, second strategy, and compression layer
-pub(crate) fn analyze_smart_dual_compression(
-    records: &[AlignmentRecord],
+pub(crate) struct SmartDualAnalyzer {
+    first_states: Vec<StreamState>,
+    second_states: Vec<StreamState>,
+    layers: [CompressionLayer; 3],
+    parallel: bool,
+    sample_limit: Option<usize>,
+    processed_records: usize,
+    processed_tracepoints: usize,
     zstd_level: i32,
-) -> (CompressionStrategy, CompressionLayer, CompressionLayer) {
-    use crate::format::CompressionLayer;
+}
 
-    let sample_count = records.len();
-    if sample_count == 0 {
-        panic!("Automatic strategy analysis requires at least one tracepoint");
+impl SmartDualAnalyzer {
+    pub fn new(zstd_level: i32, sample_limit: Option<usize>, parallel: bool) -> Self {
+        let strategies = CompressionStrategy::concrete_strategies(zstd_level);
+        let layers = CompressionLayer::all();
+        let first_states = strategies
+            .iter()
+            .cloned()
+            .map(|s| StreamState::new(s, layers.len()))
+            .collect();
+        let second_states = strategies
+            .into_iter()
+            .map(|s| StreamState::new(s, layers.len()))
+            .collect();
+
+        Self {
+            first_states,
+            second_states,
+            layers,
+            parallel,
+            sample_limit,
+            processed_records: 0,
+            processed_tracepoints: 0,
+            zstd_level,
+        }
     }
 
-    let strategies_to_test = CompressionStrategy::concrete_strategies(zstd_level);
-    let layers = CompressionLayer::all();
-    let num_layers = layers.len();
-    let num_strategies = strategies_to_test.len();
+    pub fn ingest(&mut self, record: &AlignmentRecord) {
+        if let Some(limit) = self.sample_limit {
+            if self.processed_records >= limit {
+                return;
+            }
+        }
 
-    let mut samples: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(sample_count);
-    let mut total_tracepoints = 0usize;
-
-    for record in records {
         match &record.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
                 ensure_tracepoints(&record.tracepoints);
+                self.processed_records += 1;
+                self.processed_tracepoints += tps.len();
+
                 let mut first_vals = Vec::with_capacity(tps.len());
                 let mut second_vals = Vec::with_capacity(tps.len());
                 for &(first, second) in tps {
                     first_vals.push(first as u64);
                     second_vals.push(second as u64);
                 }
-                total_tracepoints += tps.len();
-                samples.push((first_vals, second_vals));
+
+                process_stream_states(
+                    &mut self.first_states,
+                    &self.layers,
+                    &first_vals,
+                    &second_vals,
+                    self.parallel,
+                    "First",
+                    |first, _second, strategy| encode_first_stream(first, strategy),
+                );
+                process_stream_states(
+                    &mut self.second_states,
+                    &self.layers,
+                    &first_vals,
+                    &second_vals,
+                    self.parallel,
+                    "Second",
+                    |first, second, strategy| encode_second_stream(first, second, strategy),
+                );
             }
             _ => {
                 panic!("Automatic strategy analysis requires standard or FASTGA tracepoints");
@@ -189,249 +232,259 @@ pub(crate) fn analyze_smart_dual_compression(
         }
     }
 
-    if samples.is_empty() {
-        panic!("Automatic strategy analysis found no usable tracepoints");
-    }
+    pub fn finalize(self) -> (CompressionStrategy, CompressionLayer, CompressionLayer) {
+        if self.processed_records == 0 {
+            panic!("Automatic strategy analysis requires at least one tracepoint");
+        }
 
-    let mut first_totals = vec![vec![0usize; num_layers]; num_strategies];
-    let mut second_totals = vec![vec![0usize; num_layers]; num_strategies];
-    let mut first_strategy_failed = vec![false; num_strategies];
-    let mut second_strategy_failed = vec![false; num_strategies];
-    let mut first_layer_failed = vec![vec![false; num_layers]; num_strategies];
-    let mut second_layer_failed = vec![vec![false; num_layers]; num_strategies];
+        let mut first_candidates: Vec<(CompressionStrategy, CompressionLayer, usize)> = Vec::new();
+        let mut second_candidates: Vec<(CompressionStrategy, CompressionLayer, usize)> = Vec::new();
+        let mut best_first: Option<(CompressionStrategy, CompressionLayer, usize)> = None;
+        let mut best_second: Option<(CompressionStrategy, CompressionLayer, usize)> = None;
+        let mut worst_first: Option<usize> = None;
+        let mut worst_second: Option<usize> = None;
+        let strategy_count = self.first_states.len();
+        let layer_count = self.layers.len();
 
-    for (first_vals, second_vals) in &samples {
-        for (s_idx, strategy) in strategies_to_test.iter().enumerate() {
-            if first_strategy_failed[s_idx] {
-                continue;
+        for state in self.first_states.into_iter() {
+            for (layer_idx, maybe_size) in state.totals.into_iter().enumerate() {
+                if let Some(size) = maybe_size {
+                    let layer = self.layers[layer_idx];
+                    first_candidates.push((state.strategy.clone(), layer, size));
+                    best_first = match best_first.take() {
+                        Some(current) if current.2 <= size => Some(current),
+                        _ => Some((state.strategy.clone(), layer, size)),
+                    };
+                    worst_first = Some(worst_first.map(|w| w.max(size)).unwrap_or(size));
+                }
             }
-            let encoded = match encode_first_stream(first_vals, strategy) {
-                Ok(buf) => buf,
-                Err(err) => {
-                    debug!(
-                        "First-stream strategy {} failed to encode sample: {}",
-                        strategy, err
-                    );
-                    first_strategy_failed[s_idx] = true;
+        }
+
+        for state in self.second_states.into_iter() {
+            for (layer_idx, maybe_size) in state.totals.into_iter().enumerate() {
+                if let Some(size) = maybe_size {
+                    let layer = self.layers[layer_idx];
+                    second_candidates.push((state.strategy.clone(), layer, size));
+                    best_second = match best_second.take() {
+                        Some(current) if current.2 <= size => Some(current),
+                        _ => Some((state.strategy.clone(), layer, size)),
+                    };
+                    worst_second = Some(worst_second.map(|w| w.max(size)).unwrap_or(size));
+                }
+            }
+        }
+
+        if first_candidates.is_empty() || second_candidates.is_empty() {
+            panic!("Automatic strategy analysis failed: no valid candidates");
+        }
+
+        let (best_first_strategy, best_first_layer, best_first_size) = best_first.unwrap();
+        let (best_second_strategy, best_second_layer, best_second_size) = best_second.unwrap();
+
+        let mut final_first = best_first_strategy.clone();
+        let mut final_first_layer = best_first_layer;
+        let mut final_second = best_second_strategy.clone();
+        let mut final_second_layer = best_second_layer;
+        let mut best_total_size = best_first_size + best_second_size;
+
+        let mut combined_best: Option<(
+            CompressionStrategy,
+            CompressionLayer,
+            CompressionStrategy,
+            CompressionLayer,
+            usize,
+        )> = None;
+        let mut dependent_combo_count = 0usize;
+
+        for (first_strat, first_layer, first_size) in &first_candidates {
+            for (second_strat, second_layer, second_size) in &second_candidates {
+                if !second_depends_on_first(second_strat) {
                     continue;
                 }
-            };
-            let level = strategy.zstd_level();
-            for (l_idx, layer) in layers.iter().enumerate() {
-                if first_layer_failed[s_idx][l_idx] {
-                    continue;
-                }
-                match compress_with_layer(&encoded[..], *layer, level) {
-                    Ok(compressed) => {
-                        let len = compressed.len();
-                        first_totals[s_idx][l_idx] += len + varint_size(len as u64) as usize;
-                    }
-                    Err(err) => {
-                        debug!(
-                            "First-stream strategy {} with layer {:?} failed to compress sample: {}",
-                            strategy, layer, err
-                        );
-                        first_layer_failed[s_idx][l_idx] = true;
+                dependent_combo_count += 1;
+                let total = first_size + second_size;
+                match &mut combined_best {
+                    Some((_, _, _, _, best_total)) if total >= *best_total => {}
+                    _ => {
+                        combined_best = Some((
+                            first_strat.clone(),
+                            *first_layer,
+                            second_strat.clone(),
+                            *second_layer,
+                            total,
+                        ));
                     }
                 }
             }
         }
 
-        for (s_idx, strategy) in strategies_to_test.iter().enumerate() {
-            if second_strategy_failed[s_idx] {
-                continue;
+        if let Some((
+            combo_first,
+            combo_first_layer,
+            combo_second,
+            combo_second_layer,
+            combo_size,
+        )) = combined_best
+        {
+            if combo_size < best_total_size {
+                info!(
+                    "Automatic combined search improved size: {} bytes → {} bytes",
+                    best_total_size, combo_size
+                );
+                final_first = combo_first;
+                final_first_layer = combo_first_layer;
+                final_second = combo_second;
+                final_second_layer = combo_second_layer;
+                best_total_size = combo_size;
             }
-            let encoded = match encode_second_stream(first_vals, second_vals, strategy) {
-                Ok(buf) => buf,
-                Err(err) => {
-                    debug!(
-                        "Second-stream strategy {} failed to encode sample: {}",
-                        strategy, err
-                    );
-                    second_strategy_failed[s_idx] = true;
-                    continue;
-                }
+        }
+
+        let dual_strategy = CompressionStrategy::Dual(
+            Box::new(final_first.clone()),
+            Box::new(final_second.clone()),
+            self.zstd_level,
+        );
+
+        let total_combos = strategy_count * layer_count;
+        info!(
+            "Dual empirical analysis: sampled {} records, {} tracepoints - tested {} combinations per stream ({} strategies × {} layers)",
+            self.processed_records,
+            self.processed_tracepoints,
+            total_combos,
+            strategy_count,
+            layer_count
+        );
+        info!(
+            "  Evaluated {} dependent dual combinations",
+            dependent_combo_count
+        );
+        if let Some(worst) = worst_first {
+            let improvement = if worst > best_first_size {
+                ((worst - best_first_size) as f64 / worst as f64) * 100.0
+            } else {
+                0.0
             };
-            let level = strategy.zstd_level();
-            for (l_idx, layer) in layers.iter().enumerate() {
-                if second_layer_failed[s_idx][l_idx] {
-                    continue;
-                }
-                match compress_with_layer(&encoded[..], *layer, level) {
-                    Ok(compressed) => {
-                        let len = compressed.len();
-                        second_totals[s_idx][l_idx] += len + varint_size(len as u64) as usize;
-                    }
-                    Err(err) => {
-                        debug!(
-                            "Second-stream strategy {} with layer {:?} failed to compress sample: {}",
-                            strategy, layer, err
-                        );
-                        second_layer_failed[s_idx][l_idx] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut first_candidates: Vec<(CompressionStrategy, CompressionLayer, usize)> = Vec::new();
-    let mut second_candidates: Vec<(CompressionStrategy, CompressionLayer, usize)> = Vec::new();
-    let mut best_first: Option<(CompressionStrategy, CompressionLayer, usize)> = None;
-    let mut best_second: Option<(CompressionStrategy, CompressionLayer, usize)> = None;
-    let mut worst_first: Option<usize> = None;
-    let mut worst_second: Option<usize> = None;
-
-    for (s_idx, strategy) in strategies_to_test.iter().enumerate() {
-        if first_strategy_failed[s_idx] {
-            continue;
-        }
-        for (l_idx, layer) in layers.iter().enumerate() {
-            if first_layer_failed[s_idx][l_idx] {
-                continue;
-            }
-            let size = first_totals[s_idx][l_idx];
-            first_candidates.push((strategy.clone(), *layer, size));
-            best_first = match best_first.take() {
-                Some(current) if current.2 <= size => Some(current),
-                _ => Some((strategy.clone(), *layer, size)),
-            };
-            worst_first = Some(worst_first.map(|w| w.max(size)).unwrap_or(size));
-        }
-    }
-
-    for (s_idx, strategy) in strategies_to_test.iter().enumerate() {
-        if second_strategy_failed[s_idx] {
-            continue;
-        }
-        for (l_idx, layer) in layers.iter().enumerate() {
-            if second_layer_failed[s_idx][l_idx] {
-                continue;
-            }
-            let size = second_totals[s_idx][l_idx];
-            second_candidates.push((strategy.clone(), *layer, size));
-            best_second = match best_second.take() {
-                Some(current) if current.2 <= size => Some(current),
-                _ => Some((strategy.clone(), *layer, size)),
-            };
-            worst_second = Some(worst_second.map(|w| w.max(size)).unwrap_or(size));
-        }
-    }
-
-    if first_candidates.is_empty() || second_candidates.is_empty() {
-        panic!("Automatic strategy analysis failed: no valid candidates");
-    }
-
-    let (best_first_strategy, best_first_layer, best_first_size) = best_first.unwrap();
-    let (best_second_strategy, best_second_layer, best_second_size) = best_second.unwrap();
-
-    let mut final_first = best_first_strategy.clone();
-    let mut final_first_layer = best_first_layer;
-    let mut final_second = best_second_strategy.clone();
-    let mut final_second_layer = best_second_layer;
-    let mut best_total_size = best_first_size + best_second_size;
-
-    let mut combined_best: Option<(
-        CompressionStrategy,
-        CompressionLayer,
-        CompressionStrategy,
-        CompressionLayer,
-        usize,
-    )> = None;
-
-    for (first_strat, first_layer, first_size) in &first_candidates {
-        for (second_strat, second_layer, second_size) in &second_candidates {
-            let total = first_size + second_size;
-            match &mut combined_best {
-                Some((_, _, _, _, best_total)) if total >= *best_total => {}
-                _ => {
-                    combined_best = Some((
-                        first_strat.clone(),
-                        *first_layer,
-                        second_strat.clone(),
-                        *second_layer,
-                        total,
-                    ));
-                }
-            }
-        }
-    }
-
-    if let Some((combo_first, combo_first_layer, combo_second, combo_second_layer, combo_size)) =
-        combined_best
-    {
-        if combo_size < best_total_size {
             info!(
-                "Automatic combined search improved size: {} bytes → {} bytes",
-                best_total_size, combo_size
+                "  First stream winner: {} [{}] = {} bytes ({:.2}% smaller than worst)",
+                best_first_strategy,
+                best_first_layer.as_str(),
+                best_first_size,
+                improvement
             );
-            final_first = combo_first;
-            final_first_layer = combo_first_layer;
-            final_second = combo_second;
-            final_second_layer = combo_second_layer;
-            best_total_size = combo_size;
+        }
+        if let Some(worst) = worst_second {
+            let improvement = if worst > best_second_size {
+                ((worst - best_second_size) as f64 / worst as f64) * 100.0
+            } else {
+                0.0
+            };
+            info!(
+                "  Second stream winner: {} [{}] = {} bytes ({:.2}% smaller than worst)",
+                best_second_strategy,
+                best_second_layer.as_str(),
+                best_second_size,
+                improvement
+            );
+        }
+        info!(
+            "Automatic: Selected {} [{}] → {} [{}]",
+            final_first,
+            final_first_layer.as_str(),
+            final_second,
+            final_second_layer.as_str()
+        );
+        debug!(
+            "Automatic combined size estimate: {} bytes",
+            best_total_size
+        );
+
+        (dual_strategy, final_first_layer, final_second_layer)
+    }
+}
+
+struct StreamState {
+    strategy: CompressionStrategy,
+    totals: Vec<Option<usize>>,
+    failed: bool,
+}
+
+impl StreamState {
+    fn new(strategy: CompressionStrategy, layer_count: usize) -> Self {
+        Self {
+            strategy,
+            totals: vec![Some(0usize); layer_count],
+            failed: false,
         }
     }
 
-    let dual_strategy = CompressionStrategy::Dual(
-        Box::new(final_first.clone()),
-        Box::new(final_second.clone()),
-        zstd_level,
-    );
+    fn process_sample<F>(
+        &mut self,
+        layers: &[CompressionLayer; 3],
+        first_vals: &[u64],
+        second_vals: &[u64],
+        encode_fn: &F,
+        stream_label: &str,
+    ) where
+        F: Fn(&[u64], &[u64], &CompressionStrategy) -> io::Result<Vec<u8>>,
+    {
+        if self.failed || self.totals.iter().all(|slot| slot.is_none()) {
+            return;
+        }
 
-    let total_combos = strategies_to_test.len() * layers.len();
-    info!(
-        "Dual empirical analysis: sampled {} records, {} tracepoints - tested {} combinations per stream ({} strategies × {} layers)",
-        samples.len(),
-        total_tracepoints,
-        total_combos,
-        strategies_to_test.len(),
-        layers.len()
-    );
-    info!(
-        "  Evaluated {} dual combinations",
-        first_candidates.len() * second_candidates.len()
-    );
-    if let Some(worst) = worst_first {
-        let improvement = if worst > best_first_size {
-            ((worst - best_first_size) as f64 / worst as f64) * 100.0
-        } else {
-            0.0
+        let encoded = match encode_fn(first_vals, second_vals, &self.strategy) {
+            Ok(buf) => buf,
+            Err(err) => {
+                debug!(
+                    "{}-stream strategy {} failed to encode sample: {}",
+                    stream_label, self.strategy, err
+                );
+                self.failed = true;
+                self.totals.iter_mut().for_each(|slot| *slot = None);
+                return;
+            }
         };
-        info!(
-            "  First stream winner: {} [{}] = {} bytes ({:.2}% smaller than worst)",
-            best_first_strategy,
-            best_first_layer.as_str(),
-            best_first_size,
-            improvement
-        );
-    }
-    if let Some(worst) = worst_second {
-        let improvement = if worst > best_second_size {
-            ((worst - best_second_size) as f64 / worst as f64) * 100.0
-        } else {
-            0.0
-        };
-        info!(
-            "  Second stream winner: {} [{}] = {} bytes ({:.2}% smaller than worst)",
-            best_second_strategy,
-            best_second_layer.as_str(),
-            best_second_size,
-            improvement
-        );
-    }
-    info!(
-        "Automatic: Selected {} [{}] → {} [{}]",
-        final_first,
-        final_first_layer.as_str(),
-        final_second,
-        final_second_layer.as_str()
-    );
-    debug!(
-        "Automatic combined size estimate: {} bytes",
-        best_total_size
-    );
 
-    (dual_strategy, final_first_layer, final_second_layer)
+        let level = self.strategy.zstd_level();
+        for (idx, layer) in layers.iter().enumerate() {
+            if let Some(total) = self.totals[idx] {
+                match compress_with_layer(&encoded[..], *layer, level) {
+                    Ok(compressed) => {
+                        let len = compressed.len();
+                        let var_len = varint_size(len as u64) as usize;
+                        self.totals[idx] = Some(total + len + var_len);
+                    }
+                    Err(err) => {
+                        debug!(
+                            "{}-stream strategy {} with layer {:?} failed to compress sample: {}",
+                            stream_label, self.strategy, layer, err
+                        );
+                        self.totals[idx] = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn process_stream_states<F>(
+    states: &mut [StreamState],
+    layers: &[CompressionLayer; 3],
+    first_vals: &[u64],
+    second_vals: &[u64],
+    parallel: bool,
+    stream_label: &'static str,
+    encode_fn: F,
+) where
+    F: Fn(&[u64], &[u64], &CompressionStrategy) -> io::Result<Vec<u8>> + Sync,
+{
+    let worker = |state: &mut StreamState| {
+        state.process_sample(layers, first_vals, second_vals, &encode_fn, stream_label);
+    };
+    if parallel {
+        states.par_iter_mut().for_each(worker);
+    } else {
+        states.iter_mut().for_each(worker);
+    }
 }
 
 fn encode_first_stream(values: &[u64], strategy: &CompressionStrategy) -> io::Result<Vec<u8>> {
@@ -492,6 +545,13 @@ fn encode_second_stream(
         }
         _ => encode_tracepoint_values(second_vals, strategy.clone()),
     }
+}
+
+fn second_depends_on_first(strategy: &CompressionStrategy) -> bool {
+    matches!(
+        strategy,
+        CompressionStrategy::TwoDimDelta(_) | CompressionStrategy::OffsetJoint(_)
+    )
 }
 
 // ============================================================================

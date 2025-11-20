@@ -44,7 +44,7 @@ pub use binary::{
 // Re-export utility functions for external tools
 pub use utils::{read_varint, varint_size};
 
-use crate::binary::{analyze_smart_dual_compression, decompress_varint};
+use crate::binary::{decompress_varint, SmartDualAnalyzer};
 
 use crate::utils::open_paf_reader;
 
@@ -320,13 +320,18 @@ fn compress_paf(
 
     // Pass 1: Build string table + collect sample for analysis
     let mut string_table = StringTable::new();
-    let mut sample = Vec::new();
     let mut record_count = 0u64;
 
-    let sample_cap = match &strategy {
-        CompressionStrategy::AutomaticFast(_) => Some(FAST_SAMPLE_SIZE),
-        CompressionStrategy::AutomaticSlow(_) => None,
-        _ => Some(FAST_SAMPLE_SIZE),
+    let mut analyzer = match &strategy {
+        CompressionStrategy::AutomaticFast(level) => Some(SmartDualAnalyzer::new(
+            *level,
+            Some(FAST_SAMPLE_SIZE),
+            false,
+        )),
+        CompressionStrategy::AutomaticSlow(level) => {
+            Some(SmartDualAnalyzer::new(*level, None, true))
+        }
+        _ => None,
     };
 
     let input = open_paf_reader(input_path)?;
@@ -362,12 +367,8 @@ fn compress_paf(
             }
         };
 
-        let should_sample = match sample_cap {
-            Some(cap) => sample.len() < cap,
-            None => true,
-        };
-        if should_sample {
-            sample.push(record);
+        if let Some(an) = analyzer.as_mut() {
+            an.ingest(&record);
         }
         record_count += 1;
     }
@@ -382,16 +383,17 @@ fn compress_paf(
 
     // Choose strategy based on user's preference
     let (chosen_strategy, first_layer, second_layer) = match strategy {
-        CompressionStrategy::AutomaticFast(level) => {
-            // Run empirical compression test per stream (limited sample)
-            let (dual_strategy, best_first_layer, best_second_layer) =
-                analyze_smart_dual_compression(&sample, level);
-            (dual_strategy, best_first_layer, best_second_layer)
+        CompressionStrategy::AutomaticFast(_) => {
+            let analyzer = analyzer
+                .take()
+                .expect("Automatic-fast analyzer should be initialized");
+            analyzer.finalize()
         }
-        CompressionStrategy::AutomaticSlow(level) => {
-            let (dual_strategy, best_first_layer, best_second_layer) =
-                analyze_smart_dual_compression(&sample, level);
-            (dual_strategy, best_first_layer, best_second_layer)
+        CompressionStrategy::AutomaticSlow(_) => {
+            let analyzer = analyzer
+                .take()
+                .expect("Automatic-slow analyzer should be initialized");
+            analyzer.finalize()
         }
         // Respect explicit user choices - use user-specified layer
         strategy => (strategy, user_specified_layer, user_specified_layer),
