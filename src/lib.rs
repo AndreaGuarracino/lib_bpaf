@@ -34,7 +34,8 @@ use crate::utils::{parse_u8, parse_usize};
 pub use index::{build_index, BpafIndex};
 pub use reader::{
     read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset,
-    read_variable_tracepoints_at_offset, BpafReader, RecordIterator,
+    read_standard_tracepoints_at_offset_with_strategies, read_variable_tracepoints_at_offset,
+    BpafReader, RecordIterator,
 };
 
 // Re-export utility functions for external tools
@@ -85,6 +86,7 @@ pub fn compress_paf_with_cigar(
     compress_paf(
         input_path,
         output_path,
+        strategy.clone(),
         strategy,
         layer,
         tp_type,
@@ -92,18 +94,6 @@ pub fn compress_paf_with_cigar(
         complexity_metric,
         distance,
         true, // use_cigar
-    )
-}
-
-fn make_dual_strategy(
-    first_strategy: CompressionStrategy,
-    second_strategy: CompressionStrategy,
-) -> CompressionStrategy {
-    let zstd_level = first_strategy.zstd_level();
-    CompressionStrategy::Dual(
-        Box::new(first_strategy),
-        Box::new(second_strategy),
-        zstd_level,
     )
 }
 
@@ -118,12 +108,11 @@ pub fn compress_paf_with_cigar_dual(
     complexity_metric: ComplexityMetric,
     distance: Distance,
 ) -> io::Result<()> {
-    let dual_strategy = make_dual_strategy(first_strategy, second_strategy);
-
     compress_paf(
         input_path,
         output_path,
-        dual_strategy,
+        first_strategy,
+        second_strategy,
         layer,
         tp_type,
         max_complexity,
@@ -146,6 +135,7 @@ pub fn compress_paf_with_tracepoints(
     compress_paf(
         input_path,
         output_path,
+        strategy.clone(),
         strategy,
         layer,
         tp_type,
@@ -198,12 +188,11 @@ pub fn compress_paf_with_tracepoints_dual(
     complexity_metric: ComplexityMetric,
     distance: Distance,
 ) -> io::Result<()> {
-    let dual_strategy = make_dual_strategy(first_strategy, second_strategy);
-
     compress_paf(
         input_path,
         output_path,
-        dual_strategy,
+        first_strategy,
+        second_strategy,
         layer,
         tp_type,
         max_complexity,
@@ -219,13 +208,19 @@ pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
     let (input, header, _after_header_pos) = open_with_footer(input_path)?;
     let reader = BufReader::new(input);
 
-    let strategy = header.strategy()?;
+    let (first_strategy, second_strategy) = header.strategies()?;
     info!(
-        "Reading {} records ({} unique sequence names) [{}]",
-        header.num_records, header.num_strings, strategy
+        "Reading {} records ({} unique sequence names) [{} / {}]",
+        header.num_records, header.num_strings, first_strategy, second_strategy
     );
 
-    decompress_varint(reader, output_path, &header, strategy)
+    decompress_varint(
+        reader,
+        output_path,
+        &header,
+        first_strategy,
+        second_strategy,
+    )
 }
 
 // ============================================================================
@@ -235,7 +230,8 @@ pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
 fn compress_paf(
     input_path: &str,
     output_path: &str,
-    strategy: CompressionStrategy,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
     user_specified_layer: format::CompressionLayer,
     tp_type: TracepointType,
     max_complexity: u64,
@@ -244,9 +240,10 @@ fn compress_paf(
     use_cigar: bool,
 ) -> io::Result<()> {
     info!(
-        "Compressing PAF with {} using {} strategy...",
+        "Compressing PAF with {} using strategies {} / {}...",
         if use_cigar { "CIGAR" } else { "TRACEPOINTS" },
-        strategy
+        first_strategy,
+        second_strategy
     );
 
     const FAST_SAMPLE_SIZE: usize = 1000; // Sample size for automatic-fast analysis
@@ -255,13 +252,13 @@ fn compress_paf(
     let mut string_table = StringTable::new();
     let mut record_count = 0u64;
 
-    let mut analyzer = match &strategy {
-        CompressionStrategy::AutomaticFast(level) => Some(SmartDualAnalyzer::new(
-            *level,
-            Some(FAST_SAMPLE_SIZE),
-            false,
-        )),
-        CompressionStrategy::AutomaticSlow(level) => {
+    let mut analyzer = match (&first_strategy, &second_strategy) {
+        (CompressionStrategy::AutomaticFast(level), _)
+        | (_, CompressionStrategy::AutomaticFast(level)) => {
+            Some(SmartDualAnalyzer::new(*level, Some(FAST_SAMPLE_SIZE), false))
+        }
+        (CompressionStrategy::AutomaticSlow(level), _)
+        | (_, CompressionStrategy::AutomaticSlow(level)) => {
             Some(SmartDualAnalyzer::new(*level, None, true))
         }
         _ => None,
@@ -322,21 +319,17 @@ fn compress_paf(
     }
 
     // Choose strategy based on user's preference
-    let (chosen_strategy, first_layer, second_layer) = match strategy {
-        CompressionStrategy::AutomaticFast(_) => {
-            let analyzer = analyzer
-                .take()
-                .expect("Automatic-fast analyzer should be initialized");
-            analyzer.finalize()
+    let (chosen_first, chosen_second, first_layer, second_layer) = match analyzer {
+        Some(analyzer) => {
+            let (first_strat, first_layer, second_strat, second_layer) = analyzer.finalize_pair();
+            (first_strat, second_strat, first_layer, second_layer)
         }
-        CompressionStrategy::AutomaticSlow(_) => {
-            let analyzer = analyzer
-                .take()
-                .expect("Automatic-slow analyzer should be initialized");
-            analyzer.finalize()
-        }
-        // Respect explicit user choices - use user-specified layer
-        strategy => (strategy, user_specified_layer, user_specified_layer),
+        None => (
+            first_strategy,
+            second_strategy,
+            user_specified_layer,
+            user_specified_layer,
+        ),
     };
 
     // Pass 2: Stream write - Header → StringTable → Records
@@ -351,7 +344,8 @@ fn compress_paf(
     let header = BinaryPafHeader::new(
         record_count,
         string_table.len() as u64,
-        chosen_strategy.clone(),
+        chosen_first.clone(),
+        chosen_second.clone(),
         first_layer,
         second_layer,
         tp_type,
@@ -380,7 +374,8 @@ fn compress_paf(
         // Write with chosen strategy and layer
         record.write(
             &mut writer,
-            chosen_strategy.clone(),
+            chosen_first.clone(),
+            chosen_second.clone(),
             first_layer,
             second_layer,
         )?;
@@ -394,10 +389,11 @@ fn compress_paf(
     output.sync_all()?;
 
     info!(
-        "Compressed {} records ({} unique sequence names) with {} strategy",
+        "Compressed {} records ({} unique sequence names) with strategies {} / {}",
         record_count,
         string_table.len(),
-        chosen_strategy
+        chosen_first,
+        chosen_second
     );
     Ok(())
 }

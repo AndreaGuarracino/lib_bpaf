@@ -180,12 +180,6 @@ pub enum CompressionStrategy {
     /// - Byte-aligned output keeps O(1) random access
     /// - Configurable compression level (max 22, default: 3)
     Huffman(i32),
-    /// Dual-strategy: apply different strategies to first_values and second_values
-    /// - first_strategy for first_values stream
-    /// - second_strategy for second_values stream
-    /// - Optimal when streams have different statistical properties (5-15% improvement on CIGAR data)
-    /// - Configurable compression level (max 22, default: 3)
-    Dual(Box<CompressionStrategy>, Box<CompressionStrategy>, i32),
 }
 
 impl CompressionStrategy {
@@ -223,7 +217,7 @@ impl CompressionStrategy {
         )
     }
 
-    /// Return every concrete strategy variant (excludes meta-strategies such as Automatic/Dual)
+    /// Return every concrete strategy variant (excludes meta-strategies such as Automatic)
     pub fn concrete_strategies(level: i32) -> Vec<Self> {
         vec![
             CompressionStrategy::Raw(level),
@@ -251,13 +245,7 @@ impl CompressionStrategy {
     /// Parse strategy from string with compression layer
     /// Formats:
     ///   - Single: "strategy", "strategy,level", "strategy-bgzip", "strategy-nocomp"
-    ///   - Dual: "strategy1:strategy2", "strategy1:strategy2,level", "strategy1:strategy2-bgzip"
     pub fn from_str_with_layer(s: &str) -> Result<(Self, CompressionLayer), String> {
-        // Check if this is a dual strategy (contains ':')
-        if s.contains(':') {
-            return Self::parse_dual_strategy(s);
-        }
-
         let parts: Vec<&str> = s.split(',').collect();
         let mut strategy_name = parts[0].to_lowercase();
 
@@ -299,56 +287,6 @@ impl CompressionStrategy {
                 level
             ))
         }
-    }
-
-    /// Parse dual strategy from string (format: "strategy1:strategy2" or "strategy1:strategy2,level")
-    fn parse_dual_strategy(s: &str) -> Result<(Self, CompressionLayer), String> {
-        // Split by comma first to extract level/layer
-        let parts: Vec<&str> = s.split(',').collect();
-        let strategy_part = parts[0];
-
-        // Extract compression layer from suffix
-        let (clean_part, layer) = if strategy_part.ends_with("-bgzip") {
-            (
-                strategy_part.trim_end_matches("-bgzip"),
-                CompressionLayer::Bgzip,
-            )
-        } else if strategy_part.ends_with("-nocomp") {
-            (
-                strategy_part.trim_end_matches("-nocomp"),
-                CompressionLayer::Nocomp,
-            )
-        } else {
-            (strategy_part, CompressionLayer::Zstd)
-        };
-
-        // Split by colon to get both strategies
-        let strat_parts: Vec<&str> = clean_part.split(':').collect();
-        if strat_parts.len() != 2 {
-            return Err(format!(
-                "Dual strategy must be in format 'strategy1:strategy2', got '{}'",
-                s
-            ));
-        }
-
-        let first_name = strat_parts[0].trim().to_lowercase();
-        let second_name = strat_parts[1].trim().to_lowercase();
-
-        let compression_level = Self::parse_level(&parts, 3)?;
-
-        // Parse first strategy
-        let first_strategy = Self::parse_single_strategy(&first_name, compression_level)?;
-        // Parse second strategy
-        let second_strategy = Self::parse_single_strategy(&second_name, compression_level)?;
-
-        Ok((
-            CompressionStrategy::Dual(
-                Box::new(first_strategy),
-                Box::new(second_strategy),
-                compression_level,
-            ),
-            layer,
-        ))
     }
 
     /// Parse a single strategy name into a CompressionStrategy enum
@@ -420,9 +358,6 @@ impl CompressionStrategy {
             CompressionStrategy::AutomaticFast(_) | CompressionStrategy::AutomaticSlow(_) => {
                 panic!("Automatic strategies must be resolved before writing")
             }
-            CompressionStrategy::Dual(_, _, _) => {
-                254 // Special code indicating dual strategy (sub-strategies follow)
-            }
             CompressionStrategy::Raw(_) => 0,
             CompressionStrategy::ZigzagDelta(_) => 1,
             CompressionStrategy::TwoDimDelta(_) => 2,
@@ -479,7 +414,6 @@ impl CompressionStrategy {
         match self {
             CompressionStrategy::AutomaticFast(level) => *level,
             CompressionStrategy::AutomaticSlow(level) => *level,
-            CompressionStrategy::Dual(_, _, level) => *level,
             CompressionStrategy::Raw(level) => *level,
             CompressionStrategy::ZigzagDelta(level) => *level,
             CompressionStrategy::TwoDimDelta(level) => *level,
@@ -511,9 +445,6 @@ impl std::fmt::Display for CompressionStrategy {
             }
             CompressionStrategy::AutomaticSlow(level) => {
                 write!(f, "AutomaticSlow (level {})", level)
-            }
-            CompressionStrategy::Dual(first, second, level) => {
-                write!(f, "Dual({} : {}, level {})", first, second, level)
             }
             CompressionStrategy::Raw(level) => {
                 write!(f, "Raw (level {})", level)
@@ -590,12 +521,27 @@ pub struct BinaryPafHeader {
     pub(crate) distance: Distance,
 }
 
+const STRATEGY_MASK: u8 = 0b0011_1111;
+const LAYER_SHIFT: u8 = 6;
+
+fn encode_strategy_with_layer(code: u8, layer: CompressionLayer) -> u8 {
+    (layer.to_u8() << LAYER_SHIFT) | (code & STRATEGY_MASK)
+}
+
+fn decode_strategy_with_layer(value: u8) -> io::Result<(CompressionLayer, u8)> {
+    let layer_bits = value >> LAYER_SHIFT;
+    let layer =
+        CompressionLayer::from_u8(layer_bits).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok((layer, value & STRATEGY_MASK))
+}
+
 impl BinaryPafHeader {
     /// Create header with strategy
     pub(crate) fn new(
         num_records: u64,
         num_strings: u64,
-        strategy: CompressionStrategy,
+        first_strategy: CompressionStrategy,
+        second_strategy: CompressionStrategy,
         first_layer: CompressionLayer,
         second_layer: CompressionLayer,
         tracepoint_type: TracepointType,
@@ -603,13 +549,8 @@ impl BinaryPafHeader {
         max_complexity: u64,
         distance: Distance,
     ) -> Self {
-        let (first_strategy_code, second_strategy_code) = match &strategy {
-            CompressionStrategy::Dual(first, second, _level) => (first.to_code(), second.to_code()),
-            _ => {
-                let code = strategy.to_code();
-                (code, code) // For single strategies, write same code twice
-            }
-        };
+        let first_strategy_code = first_strategy.to_code();
+        let second_strategy_code = second_strategy.to_code();
 
         Self {
             version: BPAF_VERSION,
@@ -641,23 +582,18 @@ impl BinaryPafHeader {
         self.num_strings
     }
 
-    /// Get compression strategy
-    pub fn strategy(&self) -> io::Result<CompressionStrategy> {
-        if self.first_strategy_code != self.second_strategy_code {
-            // Dual strategy: different codes for first and second values
-            let first_strat = CompressionStrategy::from_code(self.first_strategy_code)?;
-            let second_strat = CompressionStrategy::from_code(self.second_strategy_code)?;
+    /// Get compression strategies (first, second)
+    pub fn strategies(&self) -> io::Result<(CompressionStrategy, CompressionStrategy)> {
+        Ok((
+            CompressionStrategy::from_code(self.first_strategy_code)?,
+            CompressionStrategy::from_code(self.second_strategy_code)?,
+        ))
+    }
 
-            // Use default level 3 when reading (level only matters for encoding)
-            Ok(CompressionStrategy::Dual(
-                Box::new(first_strat),
-                Box::new(second_strat),
-                3,
-            ))
-        } else {
-            // Single strategy: same code for both values
-            CompressionStrategy::from_code(self.first_strategy_code)
-        }
+    /// Backward-compatible accessor that returns the first strategy.
+    /// Prefer `strategies()` when you need both streams.
+    pub fn strategy(&self) -> io::Result<CompressionStrategy> {
+        CompressionStrategy::from_code(self.first_strategy_code)
     }
 
     /// Get strategy for first values
@@ -702,13 +638,15 @@ impl BinaryPafHeader {
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(BPAF_MAGIC)?;
-        writer.write_all(&[
-            self.version,
-            self.first_layer.to_u8(),
-            self.second_layer.to_u8(),
+        writer.write_all(&[self.version])?;
+        writer.write_all(&[encode_strategy_with_layer(
             self.first_strategy_code,
+            self.first_layer,
+        )])?;
+        writer.write_all(&[encode_strategy_with_layer(
             self.second_strategy_code,
-        ])?;
+            self.second_layer,
+        )])?;
 
         write_varint(writer, self.num_records)?;
         write_varint(writer, self.num_strings)?;
@@ -726,9 +664,9 @@ impl BinaryPafHeader {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid magic"));
         }
 
-        // Fixed header layout (version 1):
-        // [version][first_layer][second_layer][first_strategy][second_strategy]
-        let mut header_bytes = [0u8; 5];
+        // Header layout (version 1)
+        // [version][first_strategy|layer][second_strategy|layer]
+        let mut header_bytes = [0u8; 3];
         reader.read_exact(&mut header_bytes)?;
         let version = header_bytes[0];
         if version != BPAF_VERSION {
@@ -737,12 +675,8 @@ impl BinaryPafHeader {
                 format!("Unsupported format version: {}", version),
             ));
         }
-        let first_layer = CompressionLayer::from_u8(header_bytes[1])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let second_layer = CompressionLayer::from_u8(header_bytes[2])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let first_strategy_code = header_bytes[3];
-        let second_strategy_code = header_bytes[4];
+        let (first_layer, first_strategy_code) = decode_strategy_with_layer(header_bytes[1])?;
+        let (second_layer, second_strategy_code) = decode_strategy_with_layer(header_bytes[2])?;
 
         let num_records = read_varint(reader)?;
         let num_strings = read_varint(reader)?;
@@ -913,19 +847,22 @@ mod footer_tests {
     #[test]
     fn open_with_footer_validates() {
         // Build a minimal fake file: header (magic + fixed bytes), string table (empty), footer.
-        // Header layout: magic(4) + version(1) + first_layer(1) + second_layer(1)
-        // + first_strategy(1) + second_strategy(1) + num_records(varint)
+        // Header layout: magic(4) + version(1)
+        // + first_strategy_with_layer(1) + second_strategy_with_layer(1) + num_records(varint)
         // + num_strings(varint) + tp_type(1) + complexity_metric(1)
         // + max_complexity(varint) + distance (Distance::Edit = 0)
         let mut file_bytes = Vec::new();
         file_bytes.extend_from_slice(BPAF_MAGIC);
         file_bytes.push(BPAF_VERSION);
-        // layers
-        file_bytes.push(CompressionLayer::Zstd.to_u8());
-        file_bytes.push(CompressionLayer::Zstd.to_u8());
-        // strategies
-        file_bytes.push(CompressionStrategy::Raw(3).to_code());
-        file_bytes.push(CompressionStrategy::Raw(3).to_code());
+        // strategies + layers packed
+        file_bytes.push(encode_strategy_with_layer(
+            CompressionStrategy::Raw(3).to_code(),
+            CompressionLayer::Zstd,
+        ));
+        file_bytes.push(encode_strategy_with_layer(
+            CompressionStrategy::Raw(3).to_code(),
+            CompressionLayer::Zstd,
+        ));
         // num_records / num_strings
         write_varint(&mut file_bytes, 1).unwrap();
         write_varint(&mut file_bytes, 0).unwrap();

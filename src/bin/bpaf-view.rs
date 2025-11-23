@@ -107,8 +107,11 @@ fn main() -> io::Result<()> {
     println!("Number of records: {}", header.num_records());
     println!("Number of unique strings: {}", header.num_strings());
 
-    let strategy = header.strategy()?;
-    println!("Compression strategy: {}", strategy);
+    let (first_strategy, second_strategy) = header.strategies()?;
+    println!(
+        "Compression strategies: {} / {}",
+        first_strategy, second_strategy
+    );
     println!("First stream layer: {}", header.first_layer().as_str());
     println!("Second stream layer: {}", header.second_layer().as_str());
 

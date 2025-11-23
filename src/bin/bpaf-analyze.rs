@@ -35,8 +35,8 @@ impl BpafSizeAnalysis {
         // Calculate header field sizes
         let magic_size = 4u64; // "BPAF" magic bytes
         let version_size = 1u64; // version byte
-        let layer_size = 1u64; // bytes per compression layer entry
-        let strategy_size = 2u64; // first + second strategy codes
+        let layer_size = 0u64; // packed into strategy bytes (bits 7-6)
+        let strategy_size = 2u64; // first + second strategy codes (with layer bits)
         let num_records_varint = varint_size(self.num_records);
         let num_strings_varint = varint_size(self.num_strings);
         let tp_type_size = 1u64; // TracepointType byte
@@ -60,19 +60,19 @@ impl BpafSizeAnalysis {
             header.version()
         );
         println!(
-            "  First layer:                {:>12} bytes - value: {}",
+            "  First layer (packed):       {:>12} bytes - value: {}",
             layer_size,
             header.first_layer().as_str()
         );
         println!(
-            "  Second layer:               {:>12} bytes - value: {}",
+            "  Second layer (packed):      {:>12} bytes - value: {}",
             layer_size,
             header.second_layer().as_str()
         );
         println!(
             "  Strategy codes:             {:>12} bytes - value: {:?}",
             strategy_size,
-            header.strategy().unwrap()
+            header.strategies().unwrap()
         );
         println!(
             "  Num records (varint):       {:>12} bytes - value: {}",

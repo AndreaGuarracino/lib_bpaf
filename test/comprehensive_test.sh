@@ -305,8 +305,10 @@ use std::env;
 use std::time::Instant;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use lib_bpaf::{BpafReader, read_standard_tracepoints_at_offset,
-               read_variable_tracepoints_at_offset, read_mixed_tracepoints_at_offset};
+use lib_bpaf::{
+    read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset_with_strategies,
+    read_variable_tracepoints_at_offset, BpafReader,
+};
 
 fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
     let file = File::open(path).expect("reference PAF open failed");
@@ -343,7 +345,7 @@ fn main() {
     let reference_paf = &args[6];
 
     let mut reader = BpafReader::open(bpaf_path).unwrap();
-    let strategy = reader.header().strategy().unwrap();
+    let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
     let first_layer = reader.header().first_layer();
     let second_layer = reader.header().second_layer();
     let reference = parse_reference(reference_paf, num_records as usize);
@@ -357,7 +359,8 @@ fn main() {
         positions.insert((rng % num_records) as u64);
     }
 
-    let offsets: Vec<u64> = positions.iter()
+    let offsets: Vec<u64> = positions
+        .iter()
         .map(|&pos| reader.get_tracepoint_offset(pos).unwrap())
         .collect();
     drop(reader);
@@ -372,10 +375,11 @@ fn main() {
         // Warmup
         for _ in 0..3 {
             let _ = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset(
+                "standard" => read_standard_tracepoints_at_offset_with_strategies(
                     &mut file,
                     offset,
-                    strategy.clone(),
+                    first_strategy.clone(),
+                    second_strategy.clone(),
                     first_layer,
                     second_layer,
                 ),
@@ -389,10 +393,11 @@ fn main() {
         for _ in 0..iterations_per_pos {
             let start = Instant::now();
             let result = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset(
+                "standard" => read_standard_tracepoints_at_offset_with_strategies(
                     &mut file,
                     offset,
-                    strategy.clone(),
+                    first_strategy.clone(),
+                    second_strategy.clone(),
                     first_layer,
                     second_layer,
                 ),

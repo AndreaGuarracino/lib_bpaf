@@ -6,11 +6,11 @@ Binary format for genomic sequence alignments with tracepoints.
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Automatic-Fast (default)**: Samples the first 1,000 records and tests every concrete strategy × compression layer per stream, then locks in the best first/second combination
-  - **Automatic-Slow**: Runs the same exhaustive search but evaluates all records (highest compression fidelity)
+  - **Automatic-Fast (default)**: Samples the first 1,000 records and tests every concrete strategy × compression layer per stream (19×3 per stream, plus dependent combos), then locks in the best first/second pair; ties favor faster seek strategies/layers
+  - **Automatic-Slow**: Same exhaustive search over all records with the same tie-break (favor faster seeking)
   - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
   - **Raw**: Plain varints + zstd
-  - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, still byte-aligned for random seeks
+  - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, byte-aligned for random seeks
 - **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
 - **String deduplication**: Shared sequence name table
 - **Byte-aligned encoding**: Enables extremely fast tracepoint extraction
@@ -25,10 +25,7 @@ Binary format for genomic sequence alignments with tracepoints.
 ### Header (metadata + strategy)
 - Magic: `BPAF` (4 bytes)
 - Version: `1` (1 byte)
-- First compression layer: `0=Zstd, 1=Bgzip, 2=Nocomp` (1 byte)
-- Second compression layer: `0=Zstd, 1=Bgzip, 2=Nocomp` (1 byte)
-- First strategy code: `0-20` (1 byte)
-- Second strategy code: `0-20` (1 byte)
+- Strategy bytes (2): bits 7–6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5–0 = strategy code (`0-18`)
 - Record count: varint
 - String count: varint
 - Tracepoint type: `1` byte
@@ -43,7 +40,7 @@ Binary format for genomic sequence alignments with tracepoints.
 - String count: varint
 - Footer length: `u32` little-endian trailer
 
-Readers validate header/footer agreement and fail fast if the footer is missing or truncated. To repair older files that lack a footer, use `test/fix_footer.py file.bpaf` (appends one based on the header counts).
+Readers validate header/footer agreement and fail fast if the footer is missing or truncated.
 
 ### Records (per alignment)
 - **PAF fields**: varints for positions, 1-byte strand/quality
@@ -89,7 +86,7 @@ match &tracepoints {
 For maximum speed when you have pre-computed offsets:
 
 ```rust
-use lib_bpaf::{read_standard_tracepoints_at_offset,
+use lib_bpaf::{read_standard_tracepoints_at_offset_with_strategies,
                read_variable_tracepoints_at_offset,
                read_mixed_tracepoints_at_offset,
                CompressionStrategy, CompressionLayer};
@@ -100,15 +97,17 @@ let mut file = File::open("alignments.bpaf")?;
 
 // Pre-computed offsets, strategy, and layer from index/header
 let offset = 123456;
-let strategy = CompressionStrategy::ZigzagDelta(3);
+let first_strategy = CompressionStrategy::ZigzagDelta(3);
+let second_strategy = CompressionStrategy::ZigzagDelta(3);
 let first_layer = CompressionLayer::Zstd; // or read from BinaryPafHeader
 let second_layer = CompressionLayer::Zstd;
 
 // Direct tracepoint decoding - no BpafReader overhead
-let standard_tps = read_standard_tracepoints_at_offset(
+let standard_tps = read_standard_tracepoints_at_offset_with_strategies(
     &mut file,
     offset,
-    strategy,
+    first_strategy,
+    second_strategy,
     first_layer,
     second_layer,
 )?;

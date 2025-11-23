@@ -103,11 +103,11 @@ impl BpafReader {
     pub fn get_alignment_record_at_offset(&mut self, offset: u64) -> io::Result<AlignmentRecord> {
         self.file.seek(SeekFrom::Start(offset))?;
 
-        // Read with strategy from header
-        let strategy = self.header.strategy()?;
+        let (first_strategy, second_strategy) = self.header.strategies()?;
         read_record(
             &mut self.file,
-            strategy,
+            first_strategy,
+            second_strategy,
             self.header.tracepoint_type,
             self.header.first_layer,
             self.header.second_layer,
@@ -160,12 +160,13 @@ impl BpafReader {
         let max_complexity = self.header.max_complexity;
 
         // Read tracepoints with strategy from header
-        let strategy = self.header.strategy()?;
+        let (first_strategy, second_strategy) = self.header.strategies()?;
         let tracepoints = read_tracepoints_at_offset(
             &mut self.file,
             tracepoint_offset,
             tp_type,
-            strategy,
+            first_strategy,
+            second_strategy,
             self.header.first_layer,
             self.header.second_layer,
         )?;
@@ -196,11 +197,32 @@ pub fn read_standard_tracepoints_at_offset<R: Read + Seek>(
     first_layer: CompressionLayer,
     second_layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, usize)>> {
+    read_standard_tracepoints_at_offset_with_strategies(
+        file,
+        offset,
+        strategy.clone(),
+        strategy,
+        first_layer,
+        second_layer,
+    )
+}
+
+/// Decode standard tracepoints with explicit strategies for first/second streams.
+#[inline]
+pub fn read_standard_tracepoints_at_offset_with_strategies<R: Read + Seek>(
+    file: &mut R,
+    offset: u64,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    first_layer: CompressionLayer,
+    second_layer: CompressionLayer,
+) -> io::Result<Vec<(usize, usize)>> {
     let data = read_tracepoints_at_offset(
         file,
         offset,
         TracepointType::Standard,
-        strategy,
+        first_strategy,
+        second_strategy,
         first_layer,
         second_layer,
     )?;
@@ -225,6 +247,7 @@ pub fn read_variable_tracepoints_at_offset<R: Read + Seek>(
         offset,
         TracepointType::Variable,
         CompressionStrategy::Raw(0), // strategy ignored for variable
+        CompressionStrategy::Raw(0),
         CompressionLayer::Nocomp,
         CompressionLayer::Nocomp,
     )?;
@@ -249,6 +272,7 @@ pub fn read_mixed_tracepoints_at_offset<R: Read + Seek>(
         offset,
         TracepointType::Mixed,
         CompressionStrategy::Raw(0), // strategy ignored for mixed
+        CompressionStrategy::Raw(0),
         CompressionLayer::Nocomp,
         CompressionLayer::Nocomp,
     )?;
