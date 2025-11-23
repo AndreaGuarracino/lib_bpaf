@@ -1,6 +1,5 @@
 //! Data structures for Binary PAF format
 
-use crate::binary::BINARY_MAGIC;
 use crate::{utils::*, Distance};
 use lib_tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 use std::collections::HashMap;
@@ -9,6 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// Compression layer to use for final compression
 pub const BPAF_VERSION: u8 = 1;
+pub const BPAF_MAGIC: &[u8; 4] = b"BPAF";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressionLayer {
@@ -701,7 +701,7 @@ impl BinaryPafHeader {
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(BINARY_MAGIC)?;
+        writer.write_all(BPAF_MAGIC)?;
         writer.write_all(&[
             self.version,
             self.first_layer.to_u8(),
@@ -722,7 +722,7 @@ impl BinaryPafHeader {
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
-        if &magic != BINARY_MAGIC {
+        if &magic != BPAF_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid magic"));
         }
 
@@ -778,11 +778,6 @@ impl BinaryPafHeader {
     }
 }
 
-// Footer to mark a fully written BPAF file. If a crash happens before this is
-// appended (or it is truncated), readers will reject the file.
-pub const BPAF_FOOTER_MAGIC: &[u8; 7] = b"BPAFEND";
-pub const BPAF_FOOTER_VERSION: u8 = 1;
-
 pub struct BinaryPafFooter {
     pub(crate) num_records: u64,
     pub(crate) num_strings: u64,
@@ -799,8 +794,8 @@ impl BinaryPafFooter {
     /// Write footer as: [magic][version][num_records][num_strings][footer_len_le]
     pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(BPAF_FOOTER_MAGIC);
-        buf.push(BPAF_FOOTER_VERSION);
+        buf.extend_from_slice(BPAF_MAGIC);
+        buf.push(BPAF_VERSION);
         write_varint(&mut buf, self.num_records)?;
         write_varint(&mut buf, self.num_strings)?;
 
@@ -849,9 +844,9 @@ impl BinaryPafFooter {
         reader.read_exact(&mut buf)?;
 
         let mut cursor = std::io::Cursor::new(buf);
-        let mut magic = [0u8; BPAF_FOOTER_MAGIC.len()];
+        let mut magic = [0u8; BPAF_MAGIC.len()];
         cursor.read_exact(&mut magic)?;
-        if magic != *BPAF_FOOTER_MAGIC {
+        if magic != *BPAF_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Missing BPAF footer magic",
@@ -860,7 +855,7 @@ impl BinaryPafFooter {
 
         let mut version = [0u8; 1];
         cursor.read_exact(&mut version)?;
-        if version[0] != BPAF_FOOTER_VERSION {
+        if version[0] != BPAF_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unsupported BPAF footer version: {}", version[0]),
@@ -923,7 +918,7 @@ mod footer_tests {
         // + num_strings(varint) + tp_type(1) + complexity_metric(1)
         // + max_complexity(varint) + distance (Distance::Edit = 0)
         let mut file_bytes = Vec::new();
-        file_bytes.extend_from_slice(BINARY_MAGIC);
+        file_bytes.extend_from_slice(BPAF_MAGIC);
         file_bytes.push(BPAF_VERSION);
         // layers
         file_bytes.push(CompressionLayer::Zstd.to_u8());

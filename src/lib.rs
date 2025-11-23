@@ -24,14 +24,13 @@ pub use lib_wfa2::affine_wavefront::Distance;
 
 pub use format::{
     AlignmentRecord, BinaryPafHeader, CompressionLayer, CompressionStrategy, StringTable, Tag,
-    TagValue,
+    TagValue, BPAF_MAGIC,
 };
 pub use lib_tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::format::{parse_tag, open_with_footer, BinaryPafFooter};
 use crate::utils::{parse_u8, parse_usize};
 
-pub use binary::BINARY_MAGIC;
 pub use index::{build_index, BpafIndex};
 pub use reader::{
     read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset,
@@ -67,7 +66,7 @@ pub fn is_binary_paf(path: &str) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let mut magic = [0u8; 4];
     match file.read_exact(&mut magic) {
-        Ok(()) => Ok(&magic == BINARY_MAGIC),
+        Ok(()) => Ok(&magic == BPAF_MAGIC),
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e),
     }

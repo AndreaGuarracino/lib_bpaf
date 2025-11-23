@@ -14,16 +14,17 @@ Binary format for genomic sequence alignments with tracepoints.
 - **Tracepoint support**: Standard, Mixed, Variable, and FastGA representations
 - **String deduplication**: Shared sequence name table
 - **Byte-aligned encoding**: Enables extremely fast tracepoint extraction
+- **Crash-safety footer**: Files carry a footer written at close; missing footers are rejected on read
 
 ## Format
 
 ```
-[Header] → [StringTable] → [Records]
+[Header] → [StringTable] → [Records] → [Footer]
 ```
 
 ### Header (metadata + strategy)
 - Magic: `BPAF` (4 bytes)
-- Version: `2` (1 byte)
+- Version: `1` (1 byte)
 - First compression layer: `0=Zstd, 1=Bgzip, 2=Nocomp` (1 byte)
 - Second compression layer: `0=Zstd, 1=Bgzip, 2=Nocomp` (1 byte)
 - First strategy code: `0-20` (1 byte)
@@ -34,6 +35,15 @@ Binary format for genomic sequence alignments with tracepoints.
 - Complexity metric: `1` byte
 - Max complexity / spacing: varint
 - Distance parameters: serialized to match `lib_wfa2::Distance`
+
+### Footer (written on close)
+- Magic: `BPAF` (4 bytes)
+- Version: `1` (1 byte)
+- Record count: varint
+- String count: varint
+- Footer length: `u32` little-endian trailer
+
+Readers validate header/footer agreement and fail fast if the footer is missing or truncated. To repair older files that lack a footer, use `test/fix_footer.py file.bpaf` (appends one based on the header counts).
 
 ### Records (per alignment)
 - **PAF fields**: varints for positions, 1-byte strand/quality
