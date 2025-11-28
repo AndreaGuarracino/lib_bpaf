@@ -9,6 +9,39 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 pub const TPA_VERSION: u8 = 1;
 pub const TPA_MAGIC: &[u8; 4] = b"TPA\0";
 
+/// Write the common prefix shared by header and footer: magic, version, record_count, string_count
+fn write_common_prefix<W: Write>(writer: &mut W, num_records: u64, num_strings: u64) -> io::Result<()> {
+    writer.write_all(TPA_MAGIC)?;
+    writer.write_all(&[TPA_VERSION])?;
+    write_varint(writer, num_records)?;
+    write_varint(writer, num_strings)?;
+    Ok(())
+}
+
+/// Read and validate the common prefix: magic, version, record_count, string_count
+fn read_common_prefix<R: Read>(reader: &mut R) -> io::Result<(u8, u64, u64)> {
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != TPA_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid TPA magic"));
+    }
+
+    let mut version_buf = [0u8; 1];
+    reader.read_exact(&mut version_buf)?;
+    let version = version_buf[0];
+    if version != TPA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported TPA version: {}", version),
+        ));
+    }
+
+    let num_records = read_varint(reader)?;
+    let num_strings = read_varint(reader)?;
+
+    Ok((version, num_records, num_strings))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressionLayer {
     /// Zstd compression (default)
@@ -720,8 +753,10 @@ impl TpaHeader {
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(TPA_MAGIC)?;
-        writer.write_all(&[self.version])?;
+        // Common prefix (same as footer)
+        write_common_prefix(writer, self.num_records, self.num_strings)?;
+
+        // Header-specific fields
         writer.write_all(&[encode_strategy_with_layer(
             self.first_strategy_code,
             self.first_layer,
@@ -730,9 +765,6 @@ impl TpaHeader {
             self.second_strategy_code,
             self.second_layer,
         )])?;
-
-        write_varint(writer, self.num_records)?;
-        write_varint(writer, self.num_strings)?;
         writer.write_all(&[self.tracepoint_type.to_u8()])?;
         writer.write_all(&[self.complexity_metric.to_u8()])?;
         write_varint(writer, self.max_complexity as u64)?;
@@ -741,30 +773,15 @@ impl TpaHeader {
     }
 
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let mut magic = [0u8; 4];
-        reader.read_exact(&mut magic)?;
-        if &magic != TPA_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid TPA magic"));
-        }
+        // Common prefix (same as footer)
+        let (version, num_records, num_strings) = read_common_prefix(reader)?;
 
-        // Header layout (version 1)
-        // [version][first_strategy|layer][second_strategy|layer]
-        let mut header_bytes = [0u8; 3];
-        reader.read_exact(&mut header_bytes)?;
-        let version = header_bytes[0];
-        if version != TPA_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported format version: {}", version),
-            ));
-        }
-        let (first_layer, first_strategy_code) = decode_strategy_with_layer(header_bytes[1])?;
-        let (second_layer, second_strategy_code) = decode_strategy_with_layer(header_bytes[2])?;
+        // Header-specific fields
+        let mut strategy_bytes = [0u8; 2];
+        reader.read_exact(&mut strategy_bytes)?;
+        let (first_layer, first_strategy_code) = decode_strategy_with_layer(strategy_bytes[0])?;
+        let (second_layer, second_strategy_code) = decode_strategy_with_layer(strategy_bytes[1])?;
 
-        let num_records = read_varint(reader)?;
-        let num_strings = read_varint(reader)?;
-
-        // Read tracepoint metadata from header
         let mut tp_type_buf = [0u8; 1];
         reader.read_exact(&mut tp_type_buf)?;
         let tracepoint_type = TracepointType::from_u8(tp_type_buf[0])
@@ -808,13 +825,10 @@ impl TpaFooter {
         }
     }
 
-    /// Write footer as: [magic][version][num_records][num_strings][footer_len_le]
+    /// Write footer as: [common_prefix][footer_len_le]
     pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(TPA_MAGIC);
-        buf.push(TPA_VERSION);
-        write_varint(&mut buf, self.num_records)?;
-        write_varint(&mut buf, self.num_strings)?;
+        write_common_prefix(&mut buf, self.num_records, self.num_strings)?;
 
         let footer_len: u32 = buf
             .len()
@@ -861,26 +875,7 @@ impl TpaFooter {
         reader.read_exact(&mut buf)?;
 
         let mut cursor = std::io::Cursor::new(buf);
-        let mut magic = [0u8; TPA_MAGIC.len()];
-        cursor.read_exact(&mut magic)?;
-        if magic != *TPA_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Missing TPA footer magic",
-            ));
-        }
-
-        let mut version = [0u8; 1];
-        cursor.read_exact(&mut version)?;
-        if version[0] != TPA_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported TPA footer version: {}", version[0]),
-            ));
-        }
-
-        let num_records = read_varint(&mut cursor)?;
-        let num_strings = read_varint(&mut cursor)?;
+        let (_version, num_records, num_strings) = read_common_prefix(&mut cursor)?;
 
         Ok(Self {
             num_records,
@@ -930,14 +925,18 @@ mod footer_tests {
     #[test]
     fn open_with_footer_validates() {
         // Build a minimal fake file: header (magic + fixed bytes), string table (empty), footer.
-        // Header layout: magic(4) + version(1)
-        // + first_strategy_with_layer(1) + second_strategy_with_layer(1) + num_records(varint)
-        // + num_strings(varint) + tp_type(1) + complexity_metric(1)
-        // + max_complexity(varint) + distance (Distance::Edit = 0)
+        // Header layout: magic(4) + version(1) + num_records(varint) + num_strings(varint)
+        // + first_strategy_with_layer(1) + second_strategy_with_layer(1)
+        // + tp_type(1) + complexity_metric(1) + max_complexity(varint) + distance
         let mut file_bytes = Vec::new();
+
+        // Common prefix (same order as footer)
         file_bytes.extend_from_slice(TPA_MAGIC);
         file_bytes.push(TPA_VERSION);
-        // strategies + layers packed
+        write_varint(&mut file_bytes, 1).unwrap(); // num_records
+        write_varint(&mut file_bytes, 0).unwrap(); // num_strings
+
+        // Header-specific fields
         file_bytes.push(encode_strategy_with_layer(
             CompressionStrategy::Raw(3).to_code().unwrap(),
             CompressionLayer::Zstd,
@@ -946,15 +945,9 @@ mod footer_tests {
             CompressionStrategy::Raw(3).to_code().unwrap(),
             CompressionLayer::Zstd,
         ));
-        // num_records / num_strings
-        write_varint(&mut file_bytes, 1).unwrap();
-        write_varint(&mut file_bytes, 0).unwrap();
-        // tracepoint type + complexity metric
         file_bytes.push(TracepointType::Standard.to_u8());
         file_bytes.push(ComplexityMetric::EditDistance.to_u8());
-        // max_complexity
-        write_varint(&mut file_bytes, 0).unwrap();
-        // distance: Distance::Edit serialized by write_distance
+        write_varint(&mut file_bytes, 0).unwrap(); // max_complexity
         write_distance(&mut file_bytes, &Distance::Edit).unwrap();
 
         // string table is empty

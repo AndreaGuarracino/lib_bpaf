@@ -563,6 +563,12 @@ done
 STRATEGIES+=("automatic")       # default: level=3, sample_size=1000
 STRATEGIES+=("automatic,3,0")   # full file: level=3, sample_size=0
 
+# Define AUTO_STRATEGIES for dual mode testing
+AUTO_STRATEGIES=(
+    "automatic"
+    "automatic,3,0"
+)
+
 # Test function
 test_configuration() {
     local tp_type="$1"
