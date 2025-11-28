@@ -18,7 +18,7 @@ fi
 #
 # Arguments:
 #   num_records  - Number of records to test per file (default: 50, 0 = all records)
-#   output_base  - Output directory for all test results (default: ./test/bpaf_all_tests)
+#   output_base  - Output directory for all test results (default: ./test/tpa_all_tests)
 #   paf1..pafN   - Input PAF files to test (default: 3 standard test files)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,7 +36,7 @@ shift $((OPTIND-1))
 
 # Parse arguments
 NUM_RECORDS="${1:-100}"  # 0 means use ALL records
-OUTPUT_BASE="${2:-$SCRIPT_DIR/bpaf_all_tests}"
+OUTPUT_BASE="${2:-$SCRIPT_DIR/tpa_all_tests}"
 
 # Default test files
 DEFAULT_FILES=(
@@ -59,11 +59,11 @@ mkdir -p "$OUTPUT_BASE"
 # Initialize master TSV file
 MASTER_TSV="$OUTPUT_BASE/all_results.tsv"
 cat > "$MASTER_TSV" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_layer_first	compression_layer_second	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	compression_layer_first	compression_layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
 TSV_HEADER
 
 echo "###################################################################"
-echo "# lib_bpaf - Complete Test Suite"
+echo "# tpa - Complete Test Suite"
 echo "###################################################################"
 echo ""
 echo "Running comprehensive tests on ${#TEST_FILES[@]} files..."
@@ -98,7 +98,7 @@ if [ ${#VALID_FILES[@]} -eq 0 ]; then
     echo ""
     echo "Arguments:"
     echo "  num_records  - Number of records to test per file (default: 50)"
-    echo "  output_base  - Output directory (default: ./test/bpaf_all_tests)"
+    echo "  output_base  - Output directory (default: ./test/tpa_all_tests)"
     echo "  paf1..pafN   - Input PAF files to test"
     echo ""
     echo "Default test files:"
@@ -154,7 +154,7 @@ TOTAL_TIME=$((END_TIME - START_TIME))
 FINAL_REPORT="$OUTPUT_BASE/FINAL_REPORT.md"
 
 cat > "$FINAL_REPORT" << HEADER
-# lib_bpaf Complete Test Suite - Aggregated Results
+# tpa Complete Test Suite - Aggregated Results
 
 **Test Date:** $(date +%Y-%m-%d)
 **Total Files Tested:** ${#VALID_FILES[@]}
@@ -233,7 +233,7 @@ cat >> "$FINAL_REPORT" << FOOTER
 - **Distance Metric:** gap-affine (penalties: 5,8,2)
 - **Tracepoint Types Tested:** standard, variable, mixed (if CIGAR input)
 - **Compression Strategies:** raw, zigzag-delta, 2d-delta, rle, bit-packed, delta-of-delta, frame-of-reference, hybrid-rle, offset-joint, xor-delta, dictionary, simple8, stream-vbyte, fastpfor, cascaded, simple8b-full, selective-rle, rice, huffman, bgzip
-- **Seek Modes:** Mode A (BpafReader), Mode B (standalone functions)
+- **Seek Modes:** Mode A (TpaReader), Mode B (standalone functions)
 
 ## What Was Tested
 

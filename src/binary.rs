@@ -1,4 +1,4 @@
-//! Binary I/O operations for BPAF format
+//! Binary I/O operations for TPA format
 
 use tracepoints::{MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
@@ -839,7 +839,7 @@ pub(crate) fn read_header_and_footer<R: Read + Seek>(
     reader: &mut R,
 ) -> io::Result<(BinaryPafHeader, u64)> {
     let header = BinaryPafHeader::read(reader)?;
-    if header.version != BPAF_VERSION {
+    if header.version != TPA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unsupported format version: {}", header.version),

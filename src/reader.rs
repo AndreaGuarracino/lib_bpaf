@@ -3,7 +3,7 @@ use crate::format::{
     AlignmentRecord, BinaryPafHeader, CompressionLayer, CompressionStrategy, StringTable,
     open_with_footer,
 };
-use crate::index::{build_index, BpafIndex};
+use crate::index::{build_index, TpaIndex};
 use crate::utils::read_varint;
 use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
@@ -11,27 +11,27 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-pub struct BpafReader {
+pub struct TpaReader {
     file: File,
-    index: BpafIndex,
+    index: TpaIndex,
     header: BinaryPafHeader,
     string_table: StringTable,
     string_table_pos: u64,
 }
 
-impl BpafReader {
-    /// Open a BPAF file with index (builds index if .bpaf.idx doesn't exist)
-    pub fn open(bpaf_path: &str) -> io::Result<Self> {
-        let (file, header, string_table_pos) = open_with_footer(bpaf_path)?;
+impl TpaReader {
+    /// Open a TPA file with index (builds index if .tpa.idx doesn't exist)
+    pub fn open(tpa_path: &str) -> io::Result<Self> {
+        let (file, header, string_table_pos) = open_with_footer(tpa_path)?;
 
-        let idx_path = format!("{}.idx", bpaf_path);
+        let idx_path = format!("{}.idx", tpa_path);
 
         let index = if Path::new(&idx_path).exists() {
             debug!("Loading existing index: {}", idx_path);
-            BpafIndex::load(&idx_path)?
+            TpaIndex::load(&idx_path)?
         } else {
             info!("No index found, building...");
-            let idx = build_index(bpaf_path)?;
+            let idx = build_index(tpa_path)?;
             idx.save(&idx_path)?;
             debug!("Index saved to {}", idx_path);
             idx
@@ -184,7 +184,7 @@ impl BpafReader {
 }
 
 // ============================================================================
-// STANDALONE FUNCTIONS (NO BPAFREADER OVERHEAD)
+// STANDALONE FUNCTIONS (NO TPAREADER OVERHEAD)
 // ============================================================================
 
 /// Fastest access: decode standard tracepoints directly from file at offset.
@@ -286,7 +286,7 @@ pub fn read_mixed_tracepoints_at_offset<R: Read + Seek>(
 }
 
 pub struct RecordIterator<'a> {
-    reader: &'a mut BpafReader,
+    reader: &'a mut TpaReader,
     current_id: u64,
 }
 

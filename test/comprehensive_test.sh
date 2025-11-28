@@ -95,7 +95,7 @@ PY
 
 # Parameters
 INPUT_PAF="${1}"
-OUTPUT_DIR="${2:-/tmp/bpaf_test_output}"
+OUTPUT_DIR="${2:-/tmp/tpa_test_output}"
 MAX_COMPLEXITY="${3:-32}"
 COMPLEXITY_METRIC="${4:-edit-distance}"
 NUM_RECORDS="${5:-20000}"
@@ -128,7 +128,7 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 echo "========================================="
-echo "lib_bpaf Comprehensive Test Suite"
+echo "tpa Comprehensive Test Suite"
 echo "========================================="
 echo "Input:       $INPUT_PAF"
 echo "Output:      $OUTPUT_DIR"
@@ -191,8 +191,8 @@ if [ ! -f "$CIGZIP" ]; then
     cargo build --release 2>&1 | tail -3
 fi
 
-if [ ! -f "$REPO_DIR/target/release/liblib_bpaf.rlib" ]; then
-    echo "=== Building lib_bpaf ==="
+if [ ! -f "$REPO_DIR/target/release/libtpa.rlib" ]; then
+    echo "=== Building tpa ==="
     cd "$REPO_DIR"
     cargo build --release 2>&1 | tail -3
 fi
@@ -201,14 +201,14 @@ fi
 echo "=== Building seek test programs ==="
 cd "$REPO_DIR"
 
-# Mode A: BpafReader with index
+# Mode A: TpaReader with index
 cat > /tmp/seek_mode_a.rs << 'RUST_A'
 use std::env;
 use std::time::Instant;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use lib_bpaf::BpafReader;
-use lib_bpaf::TracepointData;
+use tpa::TpaReader;
+use tpa::TracepointData;
 
 fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
     let file = File::open(path).expect("reference PAF open failed");
@@ -237,13 +237,13 @@ fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let bpaf_path = &args[1];
+    let tpa_path = &args[1];
     let num_records: u64 = args[2].parse().unwrap();
     let num_positions: usize = args[3].parse().unwrap();
     let iterations_per_pos: usize = args[4].parse().unwrap();
     let reference_paf = &args[5];
 
-    let mut reader = BpafReader::open(bpaf_path).unwrap();
+    let mut reader = TpaReader::open(tpa_path).unwrap();
     let reference = parse_reference(reference_paf, num_records as usize);
 
     // Generate random positions
@@ -305,9 +305,9 @@ use std::env;
 use std::time::Instant;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use lib_bpaf::{
+use tpa::{
     read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset_with_strategies,
-    read_variable_tracepoints_at_offset, BpafReader,
+    read_variable_tracepoints_at_offset, TpaReader,
 };
 
 fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
@@ -337,14 +337,14 @@ fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let bpaf_path = &args[1];
+    let tpa_path = &args[1];
     let num_records: u64 = args[2].parse().unwrap();
     let num_positions: usize = args[3].parse().unwrap();
     let iterations_per_pos: usize = args[4].parse().unwrap();
     let tp_type = &args[5];
     let reference_paf = &args[6];
 
-    let mut reader = BpafReader::open(bpaf_path).unwrap();
+    let mut reader = TpaReader::open(tpa_path).unwrap();
     let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
     let first_layer = reader.header().first_layer();
     let second_layer = reader.header().second_layer();
@@ -365,7 +365,7 @@ fn main() {
         .collect();
     drop(reader);
 
-    let mut file = File::open(bpaf_path).unwrap();
+    let mut file = File::open(tpa_path).unwrap();
     let mut sum_us = 0u128;
     let mut sum_sq_us = 0u128;
     let mut success = 0usize;
@@ -438,14 +438,14 @@ fn main() {
 RUST_B
 
 if ! rustc --edition 2021 -O /tmp/seek_mode_a.rs \
-    -L target/release/deps --extern lib_bpaf=target/release/liblib_bpaf.rlib \
+    -L target/release/deps --extern tpa=target/release/libtpa.rlib \
     -o /tmp/seek_mode_a 2>&1; then
     echo "✗ Error: Failed to compile seek_mode_a"
     exit 1
 fi
 
 if ! rustc --edition 2021 -O /tmp/seek_mode_b.rs \
-    -L target/release/deps --extern lib_bpaf=target/release/liblib_bpaf.rlib \
+    -L target/release/deps --extern tpa=target/release/libtpa.rlib \
     -o /tmp/seek_mode_b 2>&1; then
     echo "✗ Error: Failed to compile seek_mode_b"
     exit 1
@@ -591,7 +591,7 @@ test_configuration() {
     if [ "$TEST_MODE" = "dual" ]; then
         if [ $is_auto -eq 1 ]; then
             echo "      [$first_strategy] compress starting..." >&2
-            /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
+            /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
                 --strategy "$first_strategy" 2>&1 | \
@@ -599,7 +599,7 @@ test_configuration() {
             echo "      [$first_strategy] compress finished" >&2
         else
             # Use cigzip with dual strategies (--strategy and --strategy-second)
-            /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
+            /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
                 --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
                 --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
                 --strategy "$first_strategy,3" --strategy-second "$second_strategy,3" 2>&1 | \
@@ -612,7 +612,7 @@ test_configuration() {
             strategy_arg="${first_strategy},0"
         fi
 
-        /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.bpaf" \
+        /usr/bin/time -v $CIGZIP compress -i "$tp_paf" -o "$OUTPUT_DIR/${key}.tpa" \
             --type "$tp_type" --max-complexity "$MAX_COMPLEXITY" \
             --complexity-metric "$COMPLEXITY_METRIC" --distance gap-affine --penalties 5,8,2 \
             --strategy "$strategy_arg" 2>&1 | tee "$OUTPUT_DIR/${key}_compress.log" >/dev/null
@@ -620,10 +620,10 @@ test_configuration() {
 
     COMPRESS_TIME[$key]=$(grep "Elapsed (wall clock)" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $8}')
     COMPRESS_MEM[$key]=$(grep "Maximum resident set size" "$OUTPUT_DIR/${key}_compress.log" | awk '{print $6}')
-    COMPRESS_SIZE[$key]=$(file_size "$OUTPUT_DIR/${key}.bpaf")
+    COMPRESS_SIZE[$key]=$(file_size "$OUTPUT_DIR/${key}.tpa")
 
-    # Extract actual strategies from BPAF header using bpaf-view
-    local strategy_output=$("$REPO_DIR/target/release/bpaf-view" --strategies "$OUTPUT_DIR/${key}.bpaf" || echo "unknown\tunknown\tunknown\tunknown")
+    # Extract actual strategies from TPA header using tpa-view
+    local strategy_output=$("$REPO_DIR/target/release/tpa-view" --strategies "$OUTPUT_DIR/${key}.tpa" || echo "unknown\tunknown\tunknown\tunknown")
     read -r first_strat second_strat first_layer second_layer <<< "$strategy_output"
     STRATEGY_FIRST[$key]="$first_strat"
     STRATEGY_SECOND[$key]="$second_strat"
@@ -633,11 +633,11 @@ test_configuration() {
     # Decompress
     if [ $is_auto -eq 1 ]; then
         echo "      [$first_strategy] decompress starting..." >&2
-        /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \
+        /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.tpa" \
             -o "$OUTPUT_DIR/${key}_decomp.paf" 2>&1 | tee "$OUTPUT_DIR/${key}_decompress.log" >&2
         echo "      [$first_strategy] decompress finished" >&2
     else
-        /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.bpaf" \
+        /usr/bin/time -v $CIGZIP decompress -i "$OUTPUT_DIR/${key}.tpa" \
             -o "$OUTPUT_DIR/${key}_decomp.paf" 2>&1 | tee "$OUTPUT_DIR/${key}_decompress.log" >/dev/null
     fi
     
@@ -675,13 +675,13 @@ test_configuration() {
     fi
     
     # Seek Mode A: 10 positions × 10 iterations (for quick testing)
-    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_paf" || echo "0 0 0")
+    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_paf" || echo "0 0 0")
     read -r seek_a_avg seek_a_std seek_a_ratio <<< "$seek_a_result"
     SEEK_A[$key]="$seek_a_avg"
     SEEK_A_STDDEV[$key]="$seek_a_std"
 
     # Seek Mode B: 10 positions × 10 iterations (for quick testing)
-    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.bpaf" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0")
+    local seek_b_result=$(/tmp/seek_mode_b "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0")
     read -r seek_b_avg seek_b_std seek_b_ratio <<< "$seek_b_result"
     SEEK_B[$key]="$seek_b_avg"
     SEEK_B_STDDEV[$key]="$seek_b_std"
@@ -707,7 +707,7 @@ test_configuration() {
             echo "first=$first_strategy"
             echo "second=$second_strategy"
             echo "key=$key"
-            echo "bpaf=$OUTPUT_DIR/${key}.bpaf"
+            echo "tpa=$OUTPUT_DIR/${key}.tpa"
             echo "decomp=$OUTPUT_DIR/${key}_decomp.paf"
             echo "compress_log=$OUTPUT_DIR/${key}_compress.log"
             echo "decompress_log=$OUTPUT_DIR/${key}_decompress.log"
@@ -753,16 +753,16 @@ output_tsv_row() {
 
     # Calculate ratios with guards to avoid division by zero or empty values
     local tp_size_bytes=${TP_SIZE[$tp_type]:-0}
-    local bpaf_size_bytes=${COMPRESS_SIZE[$key]:-0}
+    local tpa_size_bytes=${COMPRESS_SIZE[$key]:-0}
 
     local ratio_orig_to_tp
     ratio_orig_to_tp=$(safe_ratio "$SIZE" "$tp_size_bytes" 3)
 
-    local ratio_tp_to_bpaf
-    ratio_tp_to_bpaf=$(safe_ratio "$tp_size_bytes" "$bpaf_size_bytes" 3)
+    local ratio_tp_to_tpa
+    ratio_tp_to_tpa=$(safe_ratio "$tp_size_bytes" "$tpa_size_bytes" 3)
 
-    local ratio_orig_to_bpaf
-    ratio_orig_to_bpaf=$(safe_ratio "$SIZE" "$bpaf_size_bytes" 3)
+    local ratio_orig_to_tpa
+    ratio_orig_to_tpa=$(safe_ratio "$SIZE" "$tpa_size_bytes" 3)
 
     # Convert times to seconds
     local encode_time_sec=$(time_to_seconds "$(normalize_time_field "${ENCODE_TIME[$tp_type]}")")
@@ -806,10 +806,10 @@ output_tsv_row() {
         "${LAYER_SECOND[$key]}" \
         "$compress_time_sec" \
         "$compress_mem_mb" \
-        "$bpaf_size_bytes" \
+        "$tpa_size_bytes" \
         "$ratio_orig_to_tp" \
-        "$ratio_tp_to_bpaf" \
-        "$ratio_orig_to_bpaf" \
+        "$ratio_tp_to_tpa" \
+        "$ratio_orig_to_tpa" \
         "$decompress_time_sec" \
         "$decompress_mem_mb" \
         "$verified_text" \
@@ -827,7 +827,7 @@ output_tsv_row() {
 # Initialize TSV file with header
 TSV_FILE="$OUTPUT_DIR/results.tsv"
 cat > "$TSV_FILE" << TSV_HEADER
-dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	layer_first	layer_second	compression_runtime_sec	compression_memory_mb	bpaf_size_bytes	ratio_orig_to_tp	ratio_tp_to_bpaf	ratio_orig_to_bpaf	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
+dataset_name	dataset_type	original_size_bytes	num_records	encoding_type	encoding_runtime_sec	encoding_memory_mb	tp_file_size_bytes	max_complexity	complexity_metric	compression_strategy	strategy_first	strategy_second	layer_first	layer_second	compression_runtime_sec	compression_memory_mb	tpa_size_bytes	ratio_orig_to_tp	ratio_tp_to_tpa	ratio_orig_to_tpa	decompression_runtime_sec	decompression_memory_mb	verification_passed	seek_positions_tested	seek_iterations_per_position	seek_total_tests	seek_mode_a_avg_us	seek_mode_a_stddev_us	seek_mode_b_avg_us	seek_mode_b_stddev_us	seek_success_ratio
 TSV_HEADER
 
 # Run all tests
@@ -903,9 +903,9 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
             echo "Testing ${auto_name} meta-strategy (selects best per stream from $((${#BASE_STRATEGIES[@]} * ${#LAYER_SUFFIXES[@]})) combinations)..."
             test_configuration "$TP_TYPE" "$auto_name"
 
-            # Extract the strategies that automatic mode selected from the BPAF header
-            auto_bpaf="$OUTPUT_DIR/${TP_TYPE}_${auto_name}.bpaf"
-            selected_strategies=$("$REPO_DIR/target/release/bpaf-view" --strategies "$auto_bpaf")
+            # Extract the strategies that automatic mode selected from the TPA header
+            auto_tpa="$OUTPUT_DIR/${TP_TYPE}_${auto_name}.tpa"
+            selected_strategies=$("$REPO_DIR/target/release/tpa-view" --strategies "$auto_tpa")
             first_selected=$(echo "$selected_strategies" | cut -f1)
             second_selected=$(echo "$selected_strategies" | cut -f2)
             first_layer_selected=$(echo "$selected_strategies" | cut -f3)
@@ -978,7 +978,7 @@ else
 - Original Input (CIGAR PAF): $SIZE bytes ($(python3 - <<'PY'\nsize = int($SIZE)\nprint(f\"{size/1024/1024:.2f}\")\nPY\n) MB)
 - Tracepoint PAF ($TP_TYPE): $tp_size_bytes bytes ($tp_size_mb MB)
 
-| Strategy | Compressed Size (bytes) | BPAF Ratio | End-to-End Ratio | Compress Time | Compress Mem (KB) | Decompress Time | Decompress Mem (KB) | Seek A (μs) | Seek B (μs) | Verified |
+| Strategy | Compressed Size (bytes) | TPA Ratio | End-to-End Ratio | Compress Time | Compress Mem (KB) | Decompress Time | Decompress Mem (KB) | Seek A (μs) | Seek B (μs) | Verified |
 |----------|-------------------------|------------|------------------|---------------|-------------------|-----------------|---------------------|-------------|-------------|----------|
 SECTION
 
@@ -986,11 +986,11 @@ SECTION
             key="${TP_TYPE}_${STRATEGY}"
 
             # Calculate both ratios
-            bpaf_ratio=$(safe_ratio "$tp_size_bytes" "${COMPRESS_SIZE[$key]}" 2)
+            tpa_ratio=$(safe_ratio "$tp_size_bytes" "${COMPRESS_SIZE[$key]}" 2)
             e2e_ratio=$(safe_ratio "$SIZE" "${COMPRESS_SIZE[$key]}" 2)
 
             cat >> "$REPORT" << ROW
-| $STRATEGY | ${COMPRESS_SIZE[$key]} | ${bpaf_ratio}x | ${e2e_ratio}x | ${COMPRESS_TIME[$key]} | ${COMPRESS_MEM[$key]} | ${DECOMPRESS_TIME[$key]} | ${DECOMPRESS_MEM[$key]} | ${SEEK_A[$key]} | ${SEEK_B[$key]} | ${VERIFIED[$key]} |
+| $STRATEGY | ${COMPRESS_SIZE[$key]} | ${tpa_ratio}x | ${e2e_ratio}x | ${COMPRESS_TIME[$key]} | ${COMPRESS_MEM[$key]} | ${DECOMPRESS_TIME[$key]} | ${DECOMPRESS_MEM[$key]} | ${SEEK_A[$key]} | ${SEEK_B[$key]} | ${VERIFIED[$key]} |
 ROW
         done
 
@@ -1004,21 +1004,21 @@ cat >> "$REPORT" << FOOTER
 
 ## Compression Ratio Legend
 
-- **BPAF Ratio:** Tracepoint PAF size / BPAF size
-  - Measures BPAF compression strategy effectiveness only
+- **TPA Ratio:** Tracepoint PAF size / TPA size
+  - Measures TPA compression strategy effectiveness only
   - Use this to compare strategy performance
   - Fair comparison across all strategies
 
-- **End-to-End Ratio:** Original input size / BPAF size
+- **End-to-End Ratio:** Original input size / TPA size
   - Measures total compression from original input
   - Includes CIGAR→tracepoint conversion gains (if applicable)
   - Higher for CIGAR inputs due to format conversion
 
-**Note:** For CIGAR PAF inputs, End-to-End ratio includes both format conversion (~6-10x) and BPAF compression. For tracepoint PAF inputs, both ratios are identical.
+**Note:** For CIGAR PAF inputs, End-to-End ratio includes both format conversion (~6-10x) and TPA compression. For tracepoint PAF inputs, both ratios are identical.
 
 ## Seek Mode Legend
 
-- **Mode A:** BpafReader with index (general use)
+- **Mode A:** TpaReader with index (general use)
 - **Mode B:** Standalone functions (ultimate performance)
 
 ## Verification

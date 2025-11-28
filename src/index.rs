@@ -6,15 +6,15 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, Write};
 
 /// File offset index for O(1) random access.
-pub struct BpafIndex {
-    /// File offset for each record (byte position in .bpaf file)
+pub struct TpaIndex {
+    /// File offset for each record (byte position in .tpa file)
     offsets: Vec<u64>,
 }
 
-impl BpafIndex {
-    const INDEX_MAGIC: &'static [u8; 4] = b"BPAI";
+impl TpaIndex {
+    const INDEX_MAGIC: &'static [u8; 4] = b"TPAI";
 
-    /// Save index to .bpaf.idx file
+    /// Save index to .tpa.idx file
     pub fn save(&self, idx_path: &str) -> io::Result<()> {
         let mut file = File::create(idx_path)?;
 
@@ -30,7 +30,7 @@ impl BpafIndex {
         Ok(())
     }
 
-    /// Load index from .bpaf.idx file
+    /// Load index from .tpa.idx file
     pub fn load(idx_path: &str) -> io::Result<Self> {
         let file = File::open(idx_path)?;
         let mut reader = BufReader::new(file);
@@ -79,11 +79,11 @@ impl BpafIndex {
     }
 }
 
-/// Build an index from a BPAF file by scanning record offsets.
-pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
-    info!("Building index for {}", bpaf_path);
+/// Build an index from a TPA file by scanning record offsets.
+pub fn build_index(tpa_path: &str) -> io::Result<TpaIndex> {
+    info!("Building index for {}", tpa_path);
 
-    let file = File::open(bpaf_path)?;
+    let file = File::open(tpa_path)?;
     let mut reader = BufReader::with_capacity(131072, file);
 
     let (header, _after_header) = read_header_and_footer(&mut reader)?;
@@ -96,5 +96,5 @@ pub fn build_index(bpaf_path: &str) -> io::Result<BpafIndex> {
     }
 
     info!("Index built: {} records", offsets.len());
-    Ok(BpafIndex { offsets })
+    Ok(TpaIndex { offsets })
 }

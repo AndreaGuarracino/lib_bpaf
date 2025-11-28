@@ -1,11 +1,11 @@
-use lib_bpaf::{is_binary_paf, varint_size, BinaryPafHeader, StringTable};
+use tpa::{is_tpa_file, varint_size, BinaryPafHeader, StringTable};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 
-/// Structure to hold detailed size analysis of a BPAF file
+/// Structure to hold detailed size analysis of a TPA file
 #[derive(Debug)]
-struct BpafSizeAnalysis {
+struct TpaSizeAnalysis {
     // File sections in bytes (as stored in the file)
     total_file_size: u64,
     header_size: u64,
@@ -22,7 +22,7 @@ struct BpafSizeAnalysis {
     sequence_length_varints: u64,
 }
 
-impl BpafSizeAnalysis {
+impl TpaSizeAnalysis {
     fn format_percentage(pct: f64) -> String {
         if pct < 0.0001 && pct > 0.0 {
             "< 0.0001%".to_string()
@@ -33,7 +33,7 @@ impl BpafSizeAnalysis {
 
     fn print_report(&self, header: &BinaryPafHeader, magic: &[u8; 4]) {
         // Calculate header field sizes
-        let magic_size = 4u64; // "BPAF" magic bytes
+        let magic_size = 4u64; // "TPA\0" magic bytes
         let version_size = 1u64; // version byte
         let layer_size = 0u64; // packed into strategy bytes (bits 7-6)
         let strategy_size = 2u64; // first + second strategy codes (with layer bits)
@@ -43,13 +43,13 @@ impl BpafSizeAnalysis {
         let complexity_metric_size = 1u64; // ComplexityMetric byte
         let max_complexity_varint = varint_size(header.max_complexity());
         let distance_size = match header.distance() {
-            lib_bpaf::Distance::Edit => 1u64,
-            lib_bpaf::Distance::GapAffine { .. } => 1 + 3 * 4, // code + 3 i32 values
-            lib_bpaf::Distance::GapAffine2p { .. } => 1 + 5 * 4, // code + 5 i32 values
+            tpa::Distance::Edit => 1u64,
+            tpa::Distance::GapAffine { .. } => 1 + 3 * 4, // code + 3 i32 values
+            tpa::Distance::GapAffine2p { .. } => 1 + 5 * 4, // code + 5 i32 values
         };
 
         let magic_str = String::from_utf8_lossy(magic);
-        println!("=== BPAF Header ==============");
+        println!("=== TPA Header ==============");
         println!(
             "  Magic bytes:                {:>12} bytes - value: \"{}\"",
             magic_size, magic_str
@@ -74,7 +74,7 @@ impl BpafSizeAnalysis {
             strategy_size,
             header.strategies().unwrap_or_else(|e| {
                 eprintln!("Warning: failed to decode strategies: {}", e);
-                (lib_bpaf::CompressionStrategy::Raw(3), lib_bpaf::CompressionStrategy::Raw(3))
+                (tpa::CompressionStrategy::Raw(3), tpa::CompressionStrategy::Raw(3))
             })
         );
         println!(
@@ -155,7 +155,7 @@ impl BpafSizeAnalysis {
     }
 }
 
-fn analyze_bpaf_size(path: &str) -> io::Result<(BpafSizeAnalysis, BinaryPafHeader, [u8; 4])> {
+fn analyze_tpa_size(path: &str) -> io::Result<(TpaSizeAnalysis, BinaryPafHeader, [u8; 4])> {
     let file = File::open(path)?;
     let total_file_size = file.metadata()?.len();
     let mut reader = BufReader::new(file);
@@ -199,7 +199,7 @@ fn analyze_bpaf_size(path: &str) -> io::Result<(BpafSizeAnalysis, BinaryPafHeade
     // Calculate records section by subtraction
     let records_section_size = total_file_size - header_size - string_table_size;
 
-    let analysis = BpafSizeAnalysis {
+    let analysis = TpaSizeAnalysis {
         total_file_size,
         header_size,
         string_table_size,
@@ -218,19 +218,19 @@ fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() != 2 {
-        eprintln!("Usage: {} <file.bpaf>", args[0]);
-        eprintln!("\nAnalyzes a BPAF file and reports detailed size breakdown.");
+        eprintln!("Usage: {} <file.tpa>", args[0]);
+        eprintln!("\nAnalyzes a TPA file and reports detailed size breakdown.");
         std::process::exit(1);
     }
 
     let path = &args[1];
 
-    if !is_binary_paf(path)? {
-        eprintln!("Error: '{}' is not a valid BPAF file", path);
+    if !is_tpa_file(path)? {
+        eprintln!("Error: '{}' is not a valid TPA file", path);
         std::process::exit(1);
     }
 
-    let (analysis, header, magic) = analyze_bpaf_size(path)?;
+    let (analysis, header, magic) = analyze_tpa_size(path)?;
     analysis.print_report(&header, &magic);
 
     Ok(())

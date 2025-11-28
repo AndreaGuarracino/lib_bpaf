@@ -1,5 +1,5 @@
-/// Demo of seekable BPAF reader with O(1) random access and performance profiling
-use lib_bpaf::{BpafReader, TracepointData};
+/// Demo of seekable TPA reader with O(1) random access and performance profiling
+use tpa::{TpaReader, TracepointData};
 use std::time::Instant;
 
 /// Helper to display ComplexityMetric (doesn't implement Debug)
@@ -13,19 +13,19 @@ fn complexity_metric_str(metric: tracepoints::ComplexityMetric) -> &'static str 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <file.bpaf> [mode] [record_ids...]", args[0]);
+        eprintln!("Usage: {} <file.tpa> [mode] [record_ids...]", args[0]);
         eprintln!("\nModes:");
         eprintln!("  full       - Full alignment record access (default)");
         eprintln!("  tracepoint - Tracepoint-only access (optimized)");
         eprintln!("  profile    - Profile both access methods");
         eprintln!("\nExamples:");
-        eprintln!("  {} alignments.bpaf full 0 100 500 1000", args[0]);
-        eprintln!("  {} alignments.bpaf tracepoint 0 100 500 1000", args[0]);
-        eprintln!("  {} alignments.bpaf profile", args[0]);
+        eprintln!("  {} alignments.tpa full 0 100 500 1000", args[0]);
+        eprintln!("  {} alignments.tpa tracepoint 0 100 500 1000", args[0]);
+        eprintln!("  {} alignments.tpa profile", args[0]);
         std::process::exit(1);
     }
 
-    let bpaf_path = &args[1];
+    let tpa_path = &args[1];
 
     // Determine mode and where record IDs start
     let (mode, record_ids_start) = if args.len() > 2 {
@@ -37,9 +37,9 @@ fn main() -> std::io::Result<()> {
         ("full", 2)
     };
 
-    // Open BPAF file - builds index if it doesn't exist
-    println!("Opening {}...", bpaf_path);
-    let mut reader = BpafReader::open(bpaf_path)?;
+    // Open TPA file - builds index if it doesn't exist
+    println!("Opening {}...", tpa_path);
+    let mut reader = TpaReader::open(tpa_path)?;
 
     println!("File info:");
     println!("  Total records: {}", reader.len());
@@ -59,7 +59,7 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn demo_full_access(reader: &mut BpafReader, args: &[String]) -> std::io::Result<()> {
+fn demo_full_access(reader: &mut TpaReader, args: &[String]) -> std::io::Result<()> {
     let record_ids: Vec<u64> = if args.is_empty() {
         (0..5.min(reader.len() as u64)).collect()
     } else {
@@ -113,7 +113,7 @@ fn demo_full_access(reader: &mut BpafReader, args: &[String]) -> std::io::Result
     Ok(())
 }
 
-fn demo_tracepoint_access(reader: &mut BpafReader, args: &[String]) -> std::io::Result<()> {
+fn demo_tracepoint_access(reader: &mut TpaReader, args: &[String]) -> std::io::Result<()> {
     let record_ids: Vec<u64> = if args.is_empty() {
         (0..5.min(reader.len() as u64)).collect()
     } else {
@@ -154,7 +154,7 @@ fn demo_tracepoint_access(reader: &mut BpafReader, args: &[String]) -> std::io::
     Ok(())
 }
 
-fn profile_methods(reader: &mut BpafReader) -> std::io::Result<()> {
+fn profile_methods(reader: &mut TpaReader) -> std::io::Result<()> {
     println!("=== Performance Profiling ===\n");
 
     // Generate test record IDs: random access pattern

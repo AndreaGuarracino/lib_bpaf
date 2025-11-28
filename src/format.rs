@@ -1,4 +1,4 @@
-//! Data structures for Binary PAF format
+//! Data structures for TracePoint Alignment (TPA) format
 
 use crate::{utils::*, Distance};
 use tracepoints::{ComplexityMetric, TracepointData, TracepointType};
@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-pub const BPAF_VERSION: u8 = 1;
-pub const BPAF_MAGIC: &[u8; 4] = b"BPAF";
+pub const TPA_VERSION: u8 = 1;
+pub const TPA_MAGIC: &[u8; 4] = b"TPA\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressionLayer {
@@ -19,9 +19,9 @@ pub enum CompressionLayer {
     Nocomp,
 }
 
-/// Open a BPAF file, validate its footer, and return the file, parsed header,
+/// Open a TPA file, validate its footer, and return the file, parsed header,
 /// and byte offset where the string table starts (immediately after the header).
-/// Use this for any BPAF open path to avoid duplicating header/footer validation.
+/// Use this for any TPA open path to avoid duplicating header/footer validation.
 pub fn open_with_footer(path: &str) -> io::Result<(File, BinaryPafHeader, u64)> {
     let mut file = File::open(path)?;
     let (header, string_table_offset) = crate::binary::read_header_and_footer(&mut file)?;
@@ -636,7 +636,7 @@ impl BinaryPafHeader {
         let second_strategy_code = second_strategy.to_code()?;
 
         Ok(Self {
-            version: BPAF_VERSION,
+            version: TPA_VERSION,
             first_strategy_code,
             second_strategy_code,
             first_layer,
@@ -720,7 +720,7 @@ impl BinaryPafHeader {
     }
 
     pub(crate) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(BPAF_MAGIC)?;
+        writer.write_all(TPA_MAGIC)?;
         writer.write_all(&[self.version])?;
         writer.write_all(&[encode_strategy_with_layer(
             self.first_strategy_code,
@@ -743,8 +743,8 @@ impl BinaryPafHeader {
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
-        if &magic != BPAF_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid magic"));
+        if &magic != TPA_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid TPA magic"));
         }
 
         // Header layout (version 1)
@@ -752,7 +752,7 @@ impl BinaryPafHeader {
         let mut header_bytes = [0u8; 3];
         reader.read_exact(&mut header_bytes)?;
         let version = header_bytes[0];
-        if version != BPAF_VERSION {
+        if version != TPA_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unsupported format version: {}", version),
@@ -811,8 +811,8 @@ impl BinaryPafFooter {
     /// Write footer as: [magic][version][num_records][num_strings][footer_len_le]
     pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(BPAF_MAGIC);
-        buf.push(BPAF_VERSION);
+        buf.extend_from_slice(TPA_MAGIC);
+        buf.push(TPA_VERSION);
         write_varint(&mut buf, self.num_records)?;
         write_varint(&mut buf, self.num_strings)?;
 
@@ -833,7 +833,7 @@ impl BinaryPafFooter {
         if file_len < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "File too small to contain BPAF footer length",
+                "File too small to contain TPA footer length",
             ));
         }
 
@@ -845,14 +845,14 @@ impl BinaryPafFooter {
         if footer_len + 4 > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid BPAF footer length",
+                "Invalid TPA footer length",
             ));
         }
 
         let back = i64::try_from(footer_len + 4).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "BPAF footer length does not fit in i64",
+                "TPA footer length does not fit in i64",
             )
         })?;
         reader.seek(SeekFrom::End(-back))?;
@@ -861,21 +861,21 @@ impl BinaryPafFooter {
         reader.read_exact(&mut buf)?;
 
         let mut cursor = std::io::Cursor::new(buf);
-        let mut magic = [0u8; BPAF_MAGIC.len()];
+        let mut magic = [0u8; TPA_MAGIC.len()];
         cursor.read_exact(&mut magic)?;
-        if magic != *BPAF_MAGIC {
+        if magic != *TPA_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Missing BPAF footer magic",
+                "Missing TPA footer magic",
             ));
         }
 
         let mut version = [0u8; 1];
         cursor.read_exact(&mut version)?;
-        if version[0] != BPAF_VERSION {
+        if version[0] != TPA_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unsupported BPAF footer version: {}", version[0]),
+                format!("Unsupported TPA footer version: {}", version[0]),
             ));
         }
 
@@ -935,8 +935,8 @@ mod footer_tests {
         // + num_strings(varint) + tp_type(1) + complexity_metric(1)
         // + max_complexity(varint) + distance (Distance::Edit = 0)
         let mut file_bytes = Vec::new();
-        file_bytes.extend_from_slice(BPAF_MAGIC);
-        file_bytes.push(BPAF_VERSION);
+        file_bytes.extend_from_slice(TPA_MAGIC);
+        file_bytes.push(TPA_VERSION);
         // strategies + layers packed
         file_bytes.push(encode_strategy_with_layer(
             CompressionStrategy::Raw(3).to_code().unwrap(),

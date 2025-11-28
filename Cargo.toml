@@ -1,11 +1,11 @@
 [package]
-name = "lib_bpaf"
+name = "tpa"
 version = "0.1.0"
 edition = "2021"
 authors = ["Andrea Guarracino <aguarra1@uthsc.edu>"]
-description = "Binary PAF (BPAF) format library for efficient storage and random access of sequence alignments with tracepoints"
+description = "TracePoint Alignment (TPA) format for efficient storage and random access of sequence alignments with tracepoints"
 license = "MIT"
-repository = "https://github.com/AndreaGuarracino/lib_bpaf"
+repository = "https://github.com/AndreaGuarracino/tpa"
 
 [dependencies]
 zstd = "0.13"
@@ -22,12 +22,16 @@ noodles = { version = "0.100.0", features = ["bgzf"] }
 rand = "0.8"
 
 [[bin]]
-name = "bpaf-analyze"
-path = "src/bin/bpaf-analyze.rs"
+name = "tpa-analyze"
+path = "src/bin/tpa-analyze.rs"
 
 [[bin]]
-name = "bpaf-viz"
-path = "src/bin/bpaf-viz.rs"
+name = "tpa-view"
+path = "src/bin/tpa-view.rs"
+
+[[bin]]
+name = "tpa-viz"
+path = "src/bin/tpa-viz.rs"
 required-features = ["viz"]
 
 [features]

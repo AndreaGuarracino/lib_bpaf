@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Plot lib_bpaf compression test results from all_results.tsv
+Plot tpa compression test results from all_results.tsv
 
 Usage:
     python3 plot_results.py [path_to_all_results.tsv]
 
-Defaults to: ../test/bpaf_all_tests/all_results.tsv (relative to this script)
+Defaults to: ../test/tpa_all_tests/all_results.tsv (relative to this script)
 """
 
 import sys
@@ -61,7 +61,7 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
         return
 
     # Sort by compression ratio (best first)
-    data = data.sort_values('ratio_orig_to_bpaf', ascending=False)
+    data = data.sort_values('ratio_orig_to_tpa', ascending=False)
 
     # Normalize strategy labels (avoid "unknown" when second wasn't parsed)
     norm_pairs = data.apply(normalize_strategy_pair, axis=1, result_type='expand')
@@ -97,11 +97,11 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
         ax.set_xlim(-0.5, max(count - 0.5, 0.5))
         ax.margins(x=0)
 
-    # Plot 1: BPAF File Size
+    # Plot 1: TPA File Size
     ax1 = axes[0]
-    bars1 = ax1.bar(range(len(strategies)), data['bpaf_size_bytes'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
+    bars1 = ax1.bar(range(len(strategies)), data['tpa_size_bytes'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
     ax1.set_xlabel('Compression Strategy', fontweight='bold')
-    ax1.set_ylabel('BPAF File Size (bytes)', fontweight='bold')
+    ax1.set_ylabel('TPA File Size (bytes)', fontweight='bold')
     ax1.set_title('Final Compressed File Size', fontweight='bold')
     ax1.set_xticks(range(len(strategies)))
     ax1.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
@@ -110,28 +110,28 @@ def plot_dataset_metrics(df, dataset_name, output_dir):
     compact_axis(ax1, len(strategies))
 
     # Annotate best (smallest)
-    best_idx = data['bpaf_size_bytes'].idxmin()
-    best_size = data.loc[best_idx, 'bpaf_size_bytes']
+    best_idx = data['tpa_size_bytes'].idxmin()
+    best_size = data.loc[best_idx, 'tpa_size_bytes']
     best_first = data.loc[best_idx, 'strategy_first_norm']
     best_second = data.loc[best_idx, 'strategy_second_norm']
     ax1.text(0.98, 0.98, f'Best: {best_first}→{best_second}\n{format_bytes(best_size)}',
              transform=ax1.transAxes, ha='right', va='top',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8), fontsize=9)
 
-    # Plot 2: Compression Ratio (Original → BPAF)
+    # Plot 2: Compression Ratio (Original → TPA)
     ax2 = axes[1]
-    bars2 = ax2.bar(range(len(strategies)), data['ratio_orig_to_bpaf'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
+    bars2 = ax2.bar(range(len(strategies)), data['ratio_orig_to_tpa'], color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
     ax2.set_xlabel('Compression Strategy', fontweight='bold')
     ax2.set_ylabel('Compression Ratio (x)', fontweight='bold')
-    ax2.set_title('End-to-End Compression Ratio (Original → BPAF)', fontweight='bold')
+    ax2.set_title('End-to-End Compression Ratio (Original → TPA)', fontweight='bold')
     ax2.set_xticks(range(len(strategies)))
     ax2.set_xticklabels(strategies, rotation=90, ha='right', fontsize=8)
     ax2.grid(axis='y', alpha=0.3)
     compact_axis(ax2, len(strategies))
 
     # Annotate best (highest)
-    best_idx = data['ratio_orig_to_bpaf'].idxmax()
-    best_ratio = data.loc[best_idx, 'ratio_orig_to_bpaf']
+    best_idx = data['ratio_orig_to_tpa'].idxmax()
+    best_ratio = data.loc[best_idx, 'ratio_orig_to_tpa']
     best_first = data.loc[best_idx, 'strategy_first_norm']
     best_second = data.loc[best_idx, 'strategy_second_norm']
     ax2.text(0.98, 0.98, f'Best: {best_first}→{best_second}\n{best_ratio:.2f}x',
@@ -254,13 +254,13 @@ def generate_summary_table(df, output_dir):
             f.write(f"- **Original Size**: {format_bytes(data['original_size_bytes'].iloc[0])}\n\n")
 
             # Best compression ratio
-            best_ratio_idx = data['ratio_orig_to_bpaf'].idxmax()
+            best_ratio_idx = data['ratio_orig_to_tpa'].idxmax()
             f.write(f"### Best Compression Ratio\n")
             first = data.loc[best_ratio_idx, 'strategy_first']
             second = data.loc[best_ratio_idx, 'strategy_second']
             f.write(f"- **Strategy**: {first}→{second}\n")
-            f.write(f"- **Ratio**: {data.loc[best_ratio_idx, 'ratio_orig_to_bpaf']:.2f}x\n")
-            f.write(f"- **BPAF Size**: {format_bytes(data.loc[best_ratio_idx, 'bpaf_size_bytes'])}\n\n")
+            f.write(f"- **Ratio**: {data.loc[best_ratio_idx, 'ratio_orig_to_tpa']:.2f}x\n")
+            f.write(f"- **TPA Size**: {format_bytes(data.loc[best_ratio_idx, 'tpa_size_bytes'])}\n\n")
 
             # Fastest seek
             best_seek_idx = data['seek_mode_b_avg_us'].idxmin()
@@ -269,7 +269,7 @@ def generate_summary_table(df, output_dir):
             second = data.loc[best_seek_idx, 'strategy_second']
             f.write(f"- **Strategy**: {first}→{second}\n")
             f.write(f"- **Time**: {data.loc[best_seek_idx, 'seek_mode_b_avg_us']:.2f} μs\n")
-            f.write(f"- **Ratio**: {data.loc[best_seek_idx, 'ratio_orig_to_bpaf']:.2f}x\n\n")
+            f.write(f"- **Ratio**: {data.loc[best_seek_idx, 'ratio_orig_to_tpa']:.2f}x\n\n")
 
             # Fastest compression
             best_comp_idx = data['compression_runtime_sec'].idxmin()
@@ -278,16 +278,16 @@ def generate_summary_table(df, output_dir):
             second = data.loc[best_comp_idx, 'strategy_second']
             f.write(f"- **Strategy**: {first}→{second}\n")
             f.write(f"- **Time**: {data.loc[best_comp_idx, 'compression_runtime_sec']:.2f} s\n")
-            f.write(f"- **Ratio**: {data.loc[best_comp_idx, 'ratio_orig_to_bpaf']:.2f}x\n\n")
+            f.write(f"- **Ratio**: {data.loc[best_comp_idx, 'ratio_orig_to_tpa']:.2f}x\n\n")
 
             # Best overall (balance of ratio and seek time)
-            data['score'] = data['ratio_orig_to_bpaf'] / (data['seek_mode_b_avg_us'] / 10.0)
+            data['score'] = data['ratio_orig_to_tpa'] / (data['seek_mode_b_avg_us'] / 10.0)
             best_overall_idx = data['score'].idxmax()
             f.write(f"### Best Overall Balance (Ratio/Seek)\n")
             first = data.loc[best_overall_idx, 'strategy_first']
             second = data.loc[best_overall_idx, 'strategy_second']
             f.write(f"- **Strategy**: {first}→{second}\n")
-            f.write(f"- **Ratio**: {data.loc[best_overall_idx, 'ratio_orig_to_bpaf']:.2f}x\n")
+            f.write(f"- **Ratio**: {data.loc[best_overall_idx, 'ratio_orig_to_tpa']:.2f}x\n")
             f.write(f"- **Seek**: {data.loc[best_overall_idx, 'seek_mode_b_avg_us']:.2f} μs\n\n")
 
             f.write("---\n\n")
@@ -302,7 +302,7 @@ def main():
     else:
         # Default path relative to script location
         script_dir = Path(__file__).parent
-        tsv_file = script_dir / 'bpaf_all_tests' / 'all_results.tsv'
+        tsv_file = script_dir / 'tpa_all_tests' / 'all_results.tsv'
 
     if not tsv_file.exists():
         print(f"Error: TSV file not found: {tsv_file}")
@@ -318,8 +318,8 @@ def main():
         'tp_file_size_bytes', 'max_complexity', 'complexity_metric',
         'compression_strategy', 'strategy_first', 'strategy_second',
         'layer_first', 'layer_second', 'compression_runtime_sec',
-        'compression_memory_mb', 'bpaf_size_bytes', 'ratio_orig_to_tp',
-        'ratio_tp_to_bpaf', 'ratio_orig_to_bpaf', 'decompression_runtime_sec',
+        'compression_memory_mb', 'tpa_size_bytes', 'ratio_orig_to_tp',
+        'ratio_tp_to_tpa', 'ratio_orig_to_tpa', 'decompression_runtime_sec',
         'decompression_memory_mb', 'verification_passed',
         'seek_positions_tested', 'seek_iterations_per_position',
         'seek_total_tests', 'seek_mode_a_avg_us', 'seek_mode_a_stddev_us',
@@ -340,8 +340,8 @@ def main():
     numeric_cols = [
         'original_size_bytes', 'num_records', 'encoding_runtime_sec', 'encoding_memory_mb',
         'tp_file_size_bytes', 'max_complexity', 'compression_runtime_sec',
-        'compression_memory_mb', 'bpaf_size_bytes', 'ratio_orig_to_tp', 'ratio_tp_to_bpaf',
-        'ratio_orig_to_bpaf', 'decompression_runtime_sec', 'decompression_memory_mb',
+        'compression_memory_mb', 'tpa_size_bytes', 'ratio_orig_to_tp', 'ratio_tp_to_tpa',
+        'ratio_orig_to_tpa', 'decompression_runtime_sec', 'decompression_memory_mb',
         'seek_positions_tested', 'seek_iterations_per_position', 'seek_total_tests',
         'seek_mode_a_avg_us', 'seek_mode_a_stddev_us', 'seek_mode_b_avg_us',
         'seek_mode_b_stddev_us', 'seek_success_ratio'

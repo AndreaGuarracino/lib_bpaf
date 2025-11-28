@@ -3,13 +3,13 @@
 /// Auto-detects and benchmarks:
 /// - CIGAR PAF files (.paf.gz with cg:Z: tags)
 /// - Tracepoint PAF files (.paf.gz with tp:Z: tags)
-/// - BPAF files (.bpaf)
+/// - TPA files (.tpa)
 ///
 /// Usage: seek_bench <file> <num_records> <num_positions> <iterations>
 ///
 /// Examples:
 ///   seek_bench alignments.paf.gz 10000 100 100     # Auto-detect CIGAR or tracepoint
-///   seek_bench alignments.bpaf 10000 100 100       # BPAF format
+///   seek_bench alignments.tpa 10000 100 100        # TPA format
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, Read};
@@ -19,15 +19,15 @@ use std::time::Instant;
 use noodles::bgzf::io::Reader as BgzfReader;
 use noodles::bgzf::VirtualPosition;
 
-// For BPAF files
-use lib_bpaf::BpafReader;
+// For TPA files
+use tpa::TpaReader;
 
 enum FileFormat {
     CigarPafBgz,
     TracepointPafBgz,
     CigarPafPlain,
     TracepointPafPlain,
-    Bpaf,
+    Tpa,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,12 +39,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         eprintln!();
         eprintln!("Auto-detects format:");
-        eprintln!("  *.bpaf           - BPAF binary format");
+        eprintln!("  *.tpa            - TPA binary format");
         eprintln!("  *.paf.gz cg:Z:   - Bgzipped CIGAR PAF");
         eprintln!("  *.paf.gz tp:Z:   - Bgzipped tracepoint PAF");
         eprintln!();
         eprintln!("Example:");
-        eprintln!("  {} alignments.bpaf 10000 100 100", args[0]);
+        eprintln!("  {} alignments.tpa 10000 100 100", args[0]);
         std::process::exit(1);
     }
 
@@ -62,9 +62,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let format = detect_format(file_path)?;
 
     match format {
-        FileFormat::Bpaf => {
-            eprintln!("Format: BPAF");
-            benchmark_bpaf(file_path, num_records, num_positions, iterations)?;
+        FileFormat::Tpa => {
+            eprintln!("Format: TPA");
+            benchmark_tpa(file_path, num_records, num_positions, iterations)?;
         }
         FileFormat::CigarPafBgz => {
             eprintln!("Format: CIGAR PAF (bgzipped)");
@@ -89,8 +89,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn detect_format(path: &str) -> Result<FileFormat, Box<dyn std::error::Error>> {
     // Check extension
-    if path.ends_with(".bpaf") {
-        return Ok(FileFormat::Bpaf);
+    if path.ends_with(".tpa") {
+        return Ok(FileFormat::Tpa);
     }
 
     if path.ends_with(".paf.gz") || path.ends_with(".paf") {
@@ -128,13 +128,13 @@ fn detect_format(path: &str) -> Result<FileFormat, Box<dyn std::error::Error>> {
     Err(format!("Unknown file format: {}", path).into())
 }
 
-fn benchmark_bpaf(
+fn benchmark_tpa(
     path: &str,
     num_records: usize,
     num_positions: usize,
     iterations: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut reader = BpafReader::open(path)?;
+    let mut reader = TpaReader::open(path)?;
     let total_records = reader.header().num_records() as usize;
     let test_records = if num_records == 0 {
         total_records
@@ -175,7 +175,7 @@ fn benchmark_bpaf(
         }
     }
 
-    print_stats("BPAF", &times);
+    print_stats("TPA", &times);
     Ok(())
 }
 

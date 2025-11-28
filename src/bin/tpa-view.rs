@@ -1,12 +1,12 @@
-use lib_bpaf::BpafReader;
+use tpa::TpaReader;
 use std::env;
 use std::io::{self, Write};
 use std::process;
 
 fn print_usage() {
-    eprintln!("Usage: bpaf-view [OPTIONS] <bpaf-file>");
+    eprintln!("Usage: tpa-view [OPTIONS] <tpa-file>");
     eprintln!();
-    eprintln!("Display BPAF file contents:");
+    eprintln!("Display TPA file contents:");
     eprintln!("  - Header information");
     eprintln!("  - String table");
     eprintln!("  - Alignment records in PAF format with tp:Z: tags");
@@ -55,23 +55,23 @@ fn main() -> io::Result<()> {
 
     // Parse arguments
     let mut strategies_only = false;
-    let mut bpaf_path = None;
+    let mut tpa_path = None;
 
     for arg in args.iter().skip(1) {
         if arg == "--strategies" {
             strategies_only = true;
         } else if !arg.starts_with("--") {
-            bpaf_path = Some(arg.as_str());
+            tpa_path = Some(arg.as_str());
         }
     }
 
-    let Some(bpaf_path) = bpaf_path else {
+    let Some(tpa_path) = tpa_path else {
         print_usage();
         process::exit(1);
     };
 
-    // Open BPAF file
-    let reader = BpafReader::open(bpaf_path)?;
+    // Open TPA file
+    let reader = TpaReader::open(tpa_path)?;
 
     // If --strategies flag, output strategies and exit
     if strategies_only {
@@ -91,7 +91,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let mut reader = BpafReader::open(bpaf_path)?;
+    let mut reader = TpaReader::open(tpa_path)?;
 
     // Load string table
     reader.load_string_table()?;
@@ -100,7 +100,7 @@ fn main() -> io::Result<()> {
     let string_table = reader.string_table_ref().clone();
 
     // Print header
-    println!("=== BPAF Header ===");
+    println!("=== TPA Header ===");
     println!("Format version: {}", header.version());
     println!("Number of records: {}", header.num_records());
     println!("Number of unique strings: {}", header.num_strings());
@@ -174,9 +174,9 @@ fn main() -> io::Result<()> {
         for tag in &record.tags {
             let key = String::from_utf8_lossy(&tag.key);
             match &tag.value {
-                lib_bpaf::TagValue::Int(v) => write!(writer, "\t{}:i:{}", key, v)?,
-                lib_bpaf::TagValue::Float(v) => write!(writer, "\t{}:f:{}", key, v)?,
-                lib_bpaf::TagValue::String(s) => write!(writer, "\t{}:Z:{}", key, s)?,
+                tpa::TagValue::Int(v) => write!(writer, "\t{}:i:{}", key, v)?,
+                tpa::TagValue::Float(v) => write!(writer, "\t{}:f:{}", key, v)?,
+                tpa::TagValue::String(s) => write!(writer, "\t{}:Z:{}", key, s)?,
             }
         }
 

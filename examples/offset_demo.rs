@@ -1,5 +1,5 @@
 /// Demo of offset-based access using direct file offsets
-use lib_bpaf::{BpafReader, TracepointData};
+use tpa::{TpaReader, TracepointData};
 use std::time::Instant;
 
 /// Helper to display ComplexityMetric (doesn't implement Debug)
@@ -13,18 +13,18 @@ fn complexity_metric_str(metric: tracepoints::ComplexityMetric) -> &'static str 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <file.bpaf> <offset>", args[0]);
+        eprintln!("Usage: {} <file.tpa> <offset>", args[0]);
         eprintln!("\nExample:");
-        eprintln!("  {} alignments.bpaf 123456", args[0]);
+        eprintln!("  {} alignments.tpa 123456", args[0]);
         std::process::exit(1);
     }
 
-    let bpaf_path = &args[1];
+    let tpa_path = &args[1];
     let offset: u64 = args[2].parse().expect("Invalid offset");
 
-    println!("Opening {}...", bpaf_path);
+    println!("Opening {}...", tpa_path);
     let start = Instant::now();
-    let mut reader = BpafReader::open(bpaf_path)?;
+    let mut reader = TpaReader::open(tpa_path)?;
     let open_time = start.elapsed();
 
     println!(

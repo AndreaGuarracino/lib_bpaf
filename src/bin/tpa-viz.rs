@@ -1,9 +1,9 @@
-//! BPAF Visualizer - Minimal genome alignment dot plot viewer
+//! TPA Visualizer - Minimal genome alignment dot plot viewer
 //!
-//! Usage: cargo run --example bpaf-viz -- <file.bpaf>
+//! Usage: cargo run --features viz --bin tpa-viz -- <file.tpa>
 
 use eframe::egui;
-use lib_bpaf::{AlignmentRecord, BpafReader};
+use tpa::{AlignmentRecord, TpaReader};
 use std::collections::HashMap;
 use std::env;
 
@@ -85,9 +85,9 @@ impl ViewState {
 // ============================================================================
 
 impl Plot {
-    fn from_bpaf(path: &str) -> std::io::Result<Self> {
-        println!("Loading BPAF file: {}", path);
-        let mut reader = BpafReader::open(path)?;
+    fn from_tpa(path: &str) -> std::io::Result<Self> {
+        println!("Loading TPA file: {}", path);
+        let mut reader = TpaReader::open(path)?;
 
         // Build sequence tables
         let mut query_seqs: HashMap<u64, (String, u64)> = HashMap::new();
@@ -231,7 +231,7 @@ impl Plot {
 // GUI Application
 // ============================================================================
 
-struct BpafViz {
+struct TpaViz {
     plot: Plot,
     view: ViewState,
     drag_start: Option<egui::Pos2>,
@@ -240,7 +240,7 @@ struct BpafViz {
     reverse_color: egui::Color32,
 }
 
-impl BpafViz {
+impl TpaViz {
     fn new(plot: Plot) -> Self {
         let view = ViewState::new(plot.query_total_len, plot.target_total_len);
         Self {
@@ -346,7 +346,7 @@ impl BpafViz {
     }
 }
 
-impl eframe::App for BpafViz {
+impl eframe::App for TpaViz {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -380,23 +380,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: {} <file.bpaf>", args[0]);
+        eprintln!("Usage: {} <file.tpa>", args[0]);
         std::process::exit(1);
     }
 
-    let plot = Plot::from_bpaf(&args[1])?;
+    let plot = Plot::from_tpa(&args[1])?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 900.0])
-            .with_title("BPAF Visualizer"),
+            .with_title("TPA Visualizer"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "BPAF Visualizer",
+        "TPA Visualizer",
         options,
-        Box::new(|_cc| Ok(Box::new(BpafViz::new(plot)))),
+        Box::new(|_cc| Ok(Box::new(TpaViz::new(plot)))),
     )?;
 
     Ok(())

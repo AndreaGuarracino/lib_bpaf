@@ -1200,23 +1200,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
-name = "lib_bpaf"
-version = "0.1.0"
-dependencies = [
- "bgzip",
- "eframe",
- "env_logger",
- "flate2",
- "lib_wfa2",
- "log",
- "noodles",
- "rand",
- "rayon",
- "tracepoints",
- "zstd",
-]
-
-[[package]]
 name = "lib_wfa2"
 version = "0.1.0"
 source = "git+https://github.com/AndreaGuarracino/lib_wfa2#ec37a25059effb8a0a18c8726f236128f51145de"
@@ -2379,6 +2362,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0cbe268d35bdb4bb5a56a2de88d0ad0eb70af5384a99d648cd4b3d04039800e"
 dependencies = [
  "winnow",
+]
+
+[[package]]
+name = "tpa"
+version = "0.1.0"
+dependencies = [
+ "bgzip",
+ "eframe",
+ "env_logger",
+ "flate2",
+ "lib_wfa2",
+ "log",
+ "noodles",
+ "rand",
+ "rayon",
+ "tracepoints",
+ "zstd",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
-//! Binary PAF format for efficient storage of sequence alignments with tracepoints
+//! TracePoint Alignment (TPA) format for efficient storage of sequence alignments with tracepoints
 //!
 //! Format: [Header] → [StringTable] → [Records] → [Footer]
-//! - Header: Magic "BPAF" + version + metadata
+//! - Header: Magic "TPA\0" + version + metadata
 //! - StringTable: Deduplicated sequence names with lengths
 //! - Records: Core PAF fields + compressed tracepoints
 //! - Footer: Crash-safety marker with record/string counts
@@ -26,18 +26,18 @@ pub use lib_wfa2::affine_wavefront::Distance;
 
 pub use format::{
     AlignmentRecord, BinaryPafHeader, CompressionConfig, CompressionLayer, CompressionStrategy,
-    StringTable, Tag, TagValue, BPAF_MAGIC,
+    StringTable, Tag, TagValue, TPA_MAGIC,
 };
 pub use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 use crate::format::{parse_tag, open_with_footer, BinaryPafFooter};
 use crate::utils::{parse_u8, parse_usize};
 
-pub use index::{build_index, BpafIndex};
+pub use index::{build_index, TpaIndex};
 pub use reader::{
     read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset,
     read_standard_tracepoints_at_offset_with_strategies, read_variable_tracepoints_at_offset,
-    BpafReader, RecordIterator,
+    TpaReader, RecordIterator,
 };
 
 // Re-export utility functions for external tools
@@ -66,41 +66,41 @@ pub(crate) fn ensure_tracepoints(data: &TracepointData) -> io::Result<()> {
 // PUBLIC API
 // ============================================================================
 
-pub fn is_binary_paf(path: &str) -> io::Result<bool> {
+pub fn is_tpa_file(path: &str) -> io::Result<bool> {
     if path == "-" {
         return Ok(false);
     }
     let mut file = File::open(path)?;
     let mut magic = [0u8; 4];
     match file.read_exact(&mut magic) {
-        Ok(()) => Ok(&magic == BPAF_MAGIC),
+        Ok(()) => Ok(&magic == TPA_MAGIC),
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e),
     }
 }
 
-/// Compress a PAF file to BPAF format
+/// Compress a PAF file to TPA format
 ///
 /// # Example
 /// ```no_run
-/// use lib_bpaf::{compress_paf_to_bpaf, CompressionConfig, CompressionStrategy, CompressionLayer};
+/// use tpa::{compress_paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
 ///
 /// // Simple usage with defaults (Automatic, Zstd, Standard tracepoints)
-/// compress_paf_to_bpaf("input.paf", "output.bpaf", CompressionConfig::new())?;
+/// compress_paf_to_tpa("input.paf", "output.tpa", CompressionConfig::new())?;
 ///
 /// // With specific strategy
-/// compress_paf_to_bpaf(
+/// compress_paf_to_tpa(
 ///     "input.paf",
-///     "output.bpaf",
+///     "output.tpa",
 ///     CompressionConfig::new()
 ///         .strategy(CompressionStrategy::ZigzagDelta(3))
 ///         .layer(CompressionLayer::Zstd),
 /// )?;
 ///
 /// // Dual strategy with CIGAR input
-/// compress_paf_to_bpaf(
+/// compress_paf_to_tpa(
 ///     "input.paf",
-///     "output.bpaf",
+///     "output.tpa",
 ///     CompressionConfig::new()
 ///         .dual_strategy(
 ///             CompressionStrategy::Raw(3),
@@ -110,7 +110,7 @@ pub fn is_binary_paf(path: &str) -> io::Result<bool> {
 /// )?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
-pub fn compress_paf_to_bpaf(
+pub fn compress_paf_to_tpa(
     input_path: &str,
     output_path: &str,
     config: CompressionConfig,
@@ -130,7 +130,7 @@ pub fn compress_paf_to_bpaf(
     )
 }
 
-pub fn decompress_bpaf(input_path: &str, output_path: &str) -> io::Result<()> {
+pub fn decompress_tpa(input_path: &str, output_path: &str) -> io::Result<()> {
     info!("Decompressing {} to text format...", input_path);
 
     let (input, header, _after_header_pos) = open_with_footer(input_path)?;

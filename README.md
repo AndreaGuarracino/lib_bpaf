@@ -1,6 +1,6 @@
-# lib_bpaf
+# tpa
 
-Binary format for genomic sequence alignments with tracepoints.
+TracePoint Alignment (TPA) format - binary format for efficient storage and random access of sequence alignments with tracepoints.
 
 ## Features
 
@@ -22,7 +22,7 @@ Binary format for genomic sequence alignments with tracepoints.
 ```
 
 ### Header (metadata + strategy)
-- Magic: `BPAF` (4 bytes)
+- Magic: `TPA\0` (4 bytes)
 - Version: `1` (1 byte)
 - Strategy bytes (2): bits 7–6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5–0 = strategy code (`0-18`)
 - Record count: varint
@@ -33,7 +33,7 @@ Binary format for genomic sequence alignments with tracepoints.
 - Distance parameters: serialized to match `lib_wfa2::Distance`
 
 ### Footer (written on close)
-- Magic: `BPAF` (4 bytes)
+- Magic: `TPA\0` (4 bytes)
 - Version: `1` (1 byte)
 - Record count: varint
 - String count: varint
@@ -54,7 +54,7 @@ Readers validate header/footer agreement and fail fast if the footer is missing 
 
 ```toml
 [dependencies]
-lib_bpaf = { git = "https://github.com/AndreaGuarracino/lib_bpaf" }
+tpa = { git = "https://github.com/AndreaGuarracino/tpa" }
 ```
 
 ## Quick Start
@@ -62,10 +62,10 @@ lib_bpaf = { git = "https://github.com/AndreaGuarracino/lib_bpaf" }
 ### Read with random access
 
 ```rust
-use lib_bpaf::{BpafReader, TracepointType};
+use tpa::{TpaReader, TracepointType};
 
 // Open with index for O(1) record access
-let mut reader = BpafReader::open("alignments.bpaf")?;
+let mut reader = TpaReader::open("alignments.tpa")?;
 println!("Total records: {}", reader.len());
 
 // Jump to any record instantly
@@ -85,14 +85,14 @@ match &tracepoints {
 For maximum speed when you have pre-computed offsets:
 
 ```rust
-use lib_bpaf::{read_standard_tracepoints_at_offset_with_strategies,
+use tpa::{read_standard_tracepoints_at_offset_with_strategies,
                read_variable_tracepoints_at_offset,
                read_mixed_tracepoints_at_offset,
                CompressionStrategy, CompressionLayer};
 use std::fs::File;
 
 // Open file once (reuse for multiple seeks)
-let mut file = File::open("alignments.bpaf")?;
+let mut file = File::open("alignments.tpa")?;
 
 // Pre-computed offsets, strategy, and layer from index/header
 let offset = 123456;
@@ -101,7 +101,7 @@ let second_strategy = CompressionStrategy::ZigzagDelta(3);
 let first_layer = CompressionLayer::Zstd; // or read from BinaryPafHeader
 let second_layer = CompressionLayer::Zstd;
 
-// Direct tracepoint decoding - no BpafReader overhead
+// Direct tracepoint decoding - no TpaReader overhead
 let standard_tps = read_standard_tracepoints_at_offset_with_strategies(
     &mut file,
     offset,
@@ -131,44 +131,44 @@ for record in reader.iter_records() {
 ### Compression
 
 ```rust
-use lib_bpaf::{compress_paf_to_bpaf, CompressionConfig, CompressionStrategy, CompressionLayer};
+use tpa::{compress_paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
 
 // Automatic (default): samples 1000 records to find best strategy
-compress_paf_to_bpaf("alignments.paf", "alignments.bpaf", CompressionConfig::new())?;
+compress_paf_to_tpa("alignments.paf", "alignments.tpa", CompressionConfig::new())?;
 
 // Automatic with custom sample size (500 records)
-compress_paf_to_bpaf(
+compress_paf_to_tpa(
     "alignments.paf",
-    "alignments.bpaf",
+    "alignments.tpa",
     CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 500)),
 )?;
 
 // Automatic with entire file analysis (sample_size = 0)
-compress_paf_to_bpaf(
+compress_paf_to_tpa(
     "alignments.paf",
-    "alignments.bpaf",
+    "alignments.tpa",
     CompressionConfig::new().strategy(CompressionStrategy::Automatic(3, 0)),
 )?;
 
 // ZigzagDelta: Delta + zigzag transform + varint + zstd
-compress_paf_to_bpaf(
+compress_paf_to_tpa(
     "alignments.paf",
-    "alignments.bpaf",
+    "alignments.tpa",
     CompressionConfig::new().strategy(CompressionStrategy::ZigzagDelta(3)),
 )?;
 
 // Dual strategy: different strategies for first/second values
-compress_paf_to_bpaf(
+compress_paf_to_tpa(
     "alignments.paf",
-    "alignments.bpaf",
+    "alignments.tpa",
     CompressionConfig::new()
         .dual_strategy(CompressionStrategy::Raw(3), CompressionStrategy::TwoDimDelta(3)),
 )?;
 
 // From CIGAR input (converts to tracepoints)
-compress_paf_to_bpaf(
+compress_paf_to_tpa(
     "alignments.paf",
-    "alignments.bpaf",
+    "alignments.tpa",
     CompressionConfig::new().from_cigar(),
 )?;
 ```
@@ -183,14 +183,14 @@ compress_paf_to_bpaf(
 ### Index management
 
 ```rust
-use lib_bpaf::{build_index, BpafIndex};
+use tpa::{build_index, TpaIndex};
 
 // Build index for random access
-let index = build_index("alignments.bpaf")?;
-index.save("alignments.bpaf.idx")?;
+let index = build_index("alignments.tpa")?;
+index.save("alignments.tpa.idx")?;
 
 // Load existing index
-let index = BpafIndex::load("alignments.bpaf.idx")?;
+let index = TpaIndex::load("alignments.tpa.idx")?;
 ```
 
 ## Examples
@@ -200,20 +200,20 @@ let index = BpafIndex::load("alignments.bpaf.idx")?;
 cargo build --release --examples
 
 # Show first 5 records
-./target/release/examples/seek_demo alignments.bpaf
+./target/release/examples/seek_demo alignments.tpa
 
 # O(1) random access demo
-./target/release/examples/seek_demo alignments.bpaf 0 100 500 1000
+./target/release/examples/seek_demo alignments.tpa 0 100 500 1000
 
 # Offset-based access demo
-./target/release/examples/offset_demo alignments.bpaf
+./target/release/examples/offset_demo alignments.tpa
 ```
 
 ## Index Format
 
-`.bpaf.idx` file structure:
+`.tpa.idx` file structure:
 ```
-Magic:     BPAI (4 bytes)
+Magic:     TPAI (4 bytes)
 Version:   1 (1 byte)
 Count:     varint (number of records)
 Offsets:   varint[] (byte positions)
