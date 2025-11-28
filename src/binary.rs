@@ -697,7 +697,7 @@ pub fn write_paf_line_with_tracepoints<W: Write>(
 pub(crate) fn decompress_varint<R: Read>(
     mut reader: R,
     output_path: &str,
-    header: &BinaryPafHeader,
+    header: &TpaHeader,
     first_strategy: CompressionStrategy,
     second_strategy: CompressionStrategy,
 ) -> io::Result<()> {
@@ -837,8 +837,8 @@ pub(crate) fn read_tracepoints<R: Read>(
 /// Read header, validate footer, and reset position to just after the header.
 pub(crate) fn read_header_and_footer<R: Read + Seek>(
     reader: &mut R,
-) -> io::Result<(BinaryPafHeader, u64)> {
-    let header = BinaryPafHeader::read(reader)?;
+) -> io::Result<(TpaHeader, u64)> {
+    let header = TpaHeader::read(reader)?;
     if header.version != TPA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -847,7 +847,7 @@ pub(crate) fn read_header_and_footer<R: Read + Seek>(
     }
 
     let after_header = reader.stream_position()?;
-    let footer = BinaryPafFooter::read_from_end(reader)?;
+    let footer = TpaFooter::read_from_end(reader)?;
     footer.validate_against(&header)?;
     reader.seek(SeekFrom::Start(after_header))?;
     Ok((header, after_header))

@@ -25,12 +25,12 @@ use tracepoints::{
 pub use lib_wfa2::affine_wavefront::Distance;
 
 pub use format::{
-    AlignmentRecord, BinaryPafHeader, CompressionConfig, CompressionLayer, CompressionStrategy,
+    AlignmentRecord, TpaHeader, CompressionConfig, CompressionLayer, CompressionStrategy,
     StringTable, Tag, TagValue, TPA_MAGIC,
 };
 pub use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
-use crate::format::{parse_tag, open_with_footer, BinaryPafFooter};
+use crate::format::{parse_tag, open_with_footer, TpaFooter};
 use crate::utils::{parse_u8, parse_usize};
 
 pub use index::{build_index, TpaIndex};
@@ -258,7 +258,7 @@ fn compress_paf_internal(
     })?;
 
     // Write header with chosen strategy
-    let header = BinaryPafHeader::new(
+    let header = TpaHeader::new(
         record_count,
         string_table.len() as u64,
         chosen_first.clone(),
@@ -301,7 +301,7 @@ fn compress_paf_internal(
     drop(writer);
 
     // Append footer to mark the file as complete
-    let footer = BinaryPafFooter::new(record_count, string_table.len() as u64);
+    let footer = TpaFooter::new(record_count, string_table.len() as u64);
     footer.write(&mut output)?;
     output.sync_all()?;
 

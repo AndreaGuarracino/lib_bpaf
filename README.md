@@ -98,7 +98,7 @@ let mut file = File::open("alignments.tpa")?;
 let offset = 123456;
 let first_strategy = CompressionStrategy::ZigzagDelta(3);
 let second_strategy = CompressionStrategy::ZigzagDelta(3);
-let first_layer = CompressionLayer::Zstd; // or read from BinaryPafHeader
+let first_layer = CompressionLayer::Zstd; // or read from TpaafHeader
 let second_layer = CompressionLayer::Zstd;
 
 // Direct tracepoint decoding - no TpaReader overhead

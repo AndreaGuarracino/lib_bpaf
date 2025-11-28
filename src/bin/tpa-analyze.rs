@@ -1,4 +1,4 @@
-use tpa::{is_tpa_file, varint_size, BinaryPafHeader, StringTable};
+use tpa::{is_tpa_file, varint_size, TpaHeader, StringTable};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
@@ -31,7 +31,7 @@ impl TpaSizeAnalysis {
         }
     }
 
-    fn print_report(&self, header: &BinaryPafHeader, magic: &[u8; 4]) {
+    fn print_report(&self, header: &TpaHeader, magic: &[u8; 4]) {
         // Calculate header field sizes
         let magic_size = 4u64; // "TPA\0" magic bytes
         let version_size = 1u64; // version byte
@@ -155,7 +155,7 @@ impl TpaSizeAnalysis {
     }
 }
 
-fn analyze_tpa_size(path: &str) -> io::Result<(TpaSizeAnalysis, BinaryPafHeader, [u8; 4])> {
+fn analyze_tpa_size(path: &str) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 4])> {
     let file = File::open(path)?;
     let total_file_size = file.metadata()?.len();
     let mut reader = BufReader::new(file);
@@ -169,7 +169,7 @@ fn analyze_tpa_size(path: &str) -> io::Result<(TpaSizeAnalysis, BinaryPafHeader,
 
     // Read header and track position
     let start_pos = reader.stream_position()?;
-    let header = BinaryPafHeader::read(&mut reader)?;
+    let header = TpaHeader::read(&mut reader)?;
     let header_end_pos = reader.stream_position()?;
     let header_size = header_end_pos - start_pos;
 

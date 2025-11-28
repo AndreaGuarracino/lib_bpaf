@@ -1,6 +1,6 @@
 use crate::binary::{read_record, read_tracepoints_at_offset};
 use crate::format::{
-    AlignmentRecord, BinaryPafHeader, CompressionLayer, CompressionStrategy, StringTable,
+    AlignmentRecord, TpaHeader, CompressionLayer, CompressionStrategy, StringTable,
     open_with_footer,
 };
 use crate::index::{build_index, TpaIndex};
@@ -14,7 +14,7 @@ use std::path::Path;
 pub struct TpaReader {
     file: File,
     index: TpaIndex,
-    header: BinaryPafHeader,
+    header: TpaHeader,
     string_table: StringTable,
     string_table_pos: u64,
 }
@@ -59,7 +59,7 @@ impl TpaReader {
     }
 
     /// Get header information
-    pub fn header(&self) -> &BinaryPafHeader {
+    pub fn header(&self) -> &TpaHeader {
         &self.header
     }
 

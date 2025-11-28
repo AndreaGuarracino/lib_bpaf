@@ -22,7 +22,7 @@ pub enum CompressionLayer {
 /// Open a TPA file, validate its footer, and return the file, parsed header,
 /// and byte offset where the string table starts (immediately after the header).
 /// Use this for any TPA open path to avoid duplicating header/footer validation.
-pub fn open_with_footer(path: &str) -> io::Result<(File, BinaryPafHeader, u64)> {
+pub fn open_with_footer(path: &str) -> io::Result<(File, TpaHeader, u64)> {
     let mut file = File::open(path)?;
     let (header, string_table_offset) = crate::binary::read_header_and_footer(&mut file)?;
     Ok((file, header, string_table_offset))
@@ -590,7 +590,7 @@ impl std::fmt::Display for CompressionStrategy {
     }
 }
 
-pub struct BinaryPafHeader {
+pub struct TpaHeader {
     pub(crate) version: u8,
     pub(crate) first_strategy_code: u8,
     pub(crate) second_strategy_code: u8,
@@ -618,7 +618,7 @@ fn decode_strategy_with_layer(value: u8) -> io::Result<(CompressionLayer, u8)> {
     Ok((layer, value & STRATEGY_MASK))
 }
 
-impl BinaryPafHeader {
+impl TpaHeader {
     /// Create header with strategy
     pub(crate) fn new(
         num_records: u64,
@@ -795,12 +795,12 @@ impl BinaryPafHeader {
     }
 }
 
-pub struct BinaryPafFooter {
+pub struct TpaFooter {
     pub(crate) num_records: u64,
     pub(crate) num_strings: u64,
 }
 
-impl BinaryPafFooter {
+impl TpaFooter {
     pub fn new(num_records: u64, num_strings: u64) -> Self {
         Self {
             num_records,
@@ -888,7 +888,7 @@ impl BinaryPafFooter {
         })
     }
 
-    pub fn validate_against(&self, header: &BinaryPafHeader) -> io::Result<()> {
+    pub fn validate_against(&self, header: &TpaHeader) -> io::Result<()> {
         if self.num_records != header.num_records {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -918,11 +918,11 @@ mod footer_tests {
 
     #[test]
     fn footer_roundtrip() {
-        let footer = BinaryPafFooter::new(10, 5);
+        let footer = TpaFooter::new(10, 5);
         let mut data = Vec::new();
         footer.write(&mut data).unwrap();
         let mut cursor = Cursor::new(data);
-        let read_back = BinaryPafFooter::read_from_end(&mut cursor).unwrap();
+        let read_back = TpaFooter::read_from_end(&mut cursor).unwrap();
         assert_eq!(read_back.num_records, 10);
         assert_eq!(read_back.num_strings, 5);
     }
@@ -960,7 +960,7 @@ mod footer_tests {
         // string table is empty
 
         // footer
-        let footer = BinaryPafFooter::new(1, 0);
+        let footer = TpaFooter::new(1, 0);
         footer.write(&mut file_bytes).unwrap();
 
         let mut cursor = Cursor::new(file_bytes);
