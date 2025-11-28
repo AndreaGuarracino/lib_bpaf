@@ -403,15 +403,14 @@ fn seek_rank(strategy: &CompressionStrategy) -> u8 {
         CompressionStrategy::HybridRLE(_) => 7,
         CompressionStrategy::XORDelta(_) => 8,
         CompressionStrategy::DeltaOfDelta(_) => 9,
-        CompressionStrategy::Simple8(_) => 10,
-        CompressionStrategy::Simple8bFull(_) => 11,
-        CompressionStrategy::StreamVByte(_) => 12,
-        CompressionStrategy::Dictionary(_) => 13,
-        CompressionStrategy::Rice(_) => 14,
-        CompressionStrategy::Huffman(_) => 15,
-        CompressionStrategy::FastPFOR(_) => 16,
-        CompressionStrategy::Cascaded(_) => 17,
-        CompressionStrategy::SelectiveRLE(_) => 18,
+        CompressionStrategy::Simple8bFull(_) => 10,
+        CompressionStrategy::StreamVByte(_) => 11,
+        CompressionStrategy::Dictionary(_) => 12,
+        CompressionStrategy::Rice(_) => 13,
+        CompressionStrategy::Huffman(_) => 14,
+        CompressionStrategy::FastPFOR(_) => 15,
+        CompressionStrategy::Cascaded(_) => 16,
+        CompressionStrategy::SelectiveRLE(_) => 17,
         CompressionStrategy::Automatic(_, _) => 255,
     }
 }
@@ -1452,8 +1451,9 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             }
         }
         CompressionStrategy::HybridRLE(_) => {
-            // Will be handled specially in write_tracepoints (RLE for target, varint for query)
-            // For now, use regular varint
+            // HybridRLE design: varint for first values (query offsets), RLE for second values (target offsets).
+            // This function encodes first values only - uses plain varint (same as Raw).
+            // The RLE part is in encode_second_stream() for the second/target stream.
             for &val in vals {
                 write_varint(&mut buf, val)?;
             }
@@ -1499,12 +1499,6 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
             // Write indices
             for &idx in &indices {
                 write_varint(&mut buf, idx as u64)?;
-            }
-        }
-        CompressionStrategy::Simple8(_) => {
-            // Varint encoding (see Simple8bFull for word-packed variant)
-            for &val in vals {
-                write_varint(&mut buf, val)?;
             }
         }
         CompressionStrategy::StreamVByte(_) => {
@@ -1797,14 +1791,6 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
-        CompressionStrategy::Simple8(_) => {
-            // Simple8 decode (simplified: just varint)
-            let mut vals = Vec::with_capacity(num_items);
-            for _ in 0..num_items {
-                vals.push(read_varint(&mut reader)?);
-            }
-            Ok(vals)
-        }
         CompressionStrategy::StreamVByte(_) => {
             // Stream VByte decode
             if num_items == 0 {
@@ -1840,11 +1826,11 @@ fn decode_tracepoint_values(
         }
         CompressionStrategy::FastPFOR(_) => {
             // FastPFOR decode
-            crate::hybrids::decode_fastpfor(buf)
+            crate::hybrids::decode_fastpfor(buf, num_items)
         }
         CompressionStrategy::Cascaded(_) => {
             // Cascaded decode
-            crate::hybrids::decode_cascaded(buf)
+            crate::hybrids::decode_cascaded(buf, num_items)
         }
         CompressionStrategy::Simple8bFull(_) => {
             // Simple8b-RLE Full decode
@@ -1865,7 +1851,7 @@ fn decode_tracepoint_values(
                 words.push(word);
                 i += 8;
             }
-            crate::hybrids::decode_simple8b_full(&words)
+            crate::hybrids::decode_simple8b_full(&words, num_items)
         }
         CompressionStrategy::SelectiveRLE(_) => {
             // Selective RLE decode

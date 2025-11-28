@@ -82,22 +82,16 @@ pub fn encode_fastpfor(vals: &[u64]) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-pub fn decode_fastpfor(data: &[u8]) -> io::Result<Vec<u64>> {
+pub fn decode_fastpfor(data: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
     let mut result = Vec::new();
     let mut reader = data;
 
-    while !reader.is_empty() {
+    while !reader.is_empty() && result.len() < num_items {
         // Read block header
-        let block_size = read_varint(&mut reader)? as usize; // Block size
+        let block_size = read_varint(&mut reader)? as usize;
 
-        if reader.is_empty() {
-            break;
-        }
         let min_val = read_varint(&mut reader)?;
 
-        if reader.is_empty() {
-            break;
-        }
         let mut base_bits_buf = [0u8; 1];
         reader.read_exact(&mut base_bits_buf)?;
         let base_bits = base_bits_buf[0];
@@ -107,10 +101,6 @@ pub fn decode_fastpfor(data: &[u8]) -> io::Result<Vec<u64>> {
         // Read base values
         let mut block_vals = Vec::with_capacity(block_size);
         for _ in 0..block_size {
-            if reader.is_empty() {
-                break;
-            }
-
             let base_val = match base_bits {
                 1..=8 => {
                     let mut buf = [0u8; 1];
@@ -130,9 +120,6 @@ pub fn decode_fastpfor(data: &[u8]) -> io::Result<Vec<u64>> {
 
         // Apply exceptions
         for _ in 0..exception_count {
-            if reader.len() < 2 {
-                break;
-            }
             let mut idx_buf = [0u8; 2];
             reader.read_exact(&mut idx_buf)?;
             let idx = idx_buf[0] as usize | ((idx_buf[1] as usize) << 8);
@@ -145,6 +132,20 @@ pub fn decode_fastpfor(data: &[u8]) -> io::Result<Vec<u64>> {
         }
 
         result.extend(block_vals);
+    }
+
+    // Truncate to expected count (last block may have extra values)
+    result.truncate(num_items);
+
+    if result.len() != num_items {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "FastPFOR decode count mismatch: expected {}, got {}",
+                num_items,
+                result.len()
+            ),
+        ));
     }
 
     Ok(result)
@@ -231,9 +232,15 @@ pub fn encode_cascaded(vals: &[u64]) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
+pub fn decode_cascaded(data: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
     if data.is_empty() {
-        return Ok(Vec::new());
+        if num_items == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Cascaded decode: empty data but expected {} items", num_items),
+        ));
     }
 
     let mode = data[0];
@@ -269,13 +276,19 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
         2 => {
             // Delta mode
             if reader.is_empty() {
-                return Ok(result);
+                if num_items == 0 {
+                    return Ok(result);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Cascaded delta mode: empty data but expected {} items", num_items),
+                ));
             }
 
             let mut prev = read_varint(&mut reader)?;
             result.push(prev);
 
-            while !reader.is_empty() {
+            while !reader.is_empty() && result.len() < num_items {
                 let zigzag = read_varint(&mut reader)?;
                 prev = (prev as i64).wrapping_add(decode_zigzag(zigzag)) as u64;
                 result.push(prev);
@@ -284,9 +297,20 @@ pub fn decode_cascaded(data: &[u8]) -> io::Result<Vec<u64>> {
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Unknown cascaded mode",
+                format!("Unknown cascaded mode: {}", mode),
             ));
         }
+    }
+
+    if result.len() != num_items {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Cascaded decode count mismatch: expected {}, got {}",
+                num_items,
+                result.len()
+            ),
+        ));
     }
 
     Ok(result)
@@ -354,7 +378,9 @@ pub fn decode_selective_rle(data: &[u8]) -> io::Result<Vec<u64>> {
     Ok(result)
 }
 
-/// Simple8b with 16 selector modes packing multiple integers into 64-bit words
+/// Simple8b word-packed encoding: packs multiple integers into 64-bit words.
+/// Uses 4-bit selector (top bits) to indicate packing mode.
+/// Selectors 0-13 pack multiple values; selector 15 is fallback for values >60 bits.
 pub fn encode_simple8b_full(vals: &[u64]) -> io::Result<Vec<u64>> {
     let mut result = Vec::new();
     let mut i = 0;
@@ -363,24 +389,9 @@ pub fn encode_simple8b_full(vals: &[u64]) -> io::Result<Vec<u64>> {
         // Find best selector for next values
         let remaining = vals.len() - i;
 
-        // Try different packing modes (selector determines how many ints and how many bits each)
-        // Selector 0: 60 1-bit values
-        // Selector 1: 30 2-bit values
-        // Selector 2: 20 3-bit values
-        // Selector 3: 15 4-bit values
-        // Selector 4: 12 5-bit values
-        // Selector 5: 10 6-bit values
-        // Selector 6: 8 7-bit values
-        // Selector 7: 7 8-bit values
-        // Selector 8: 6 10-bit values
-        // Selector 9: 5 12-bit values
-        // Selector 10: 4 15-bit values
-        // Selector 11: 3 20-bit values
-        // Selector 12: 2 30-bit values
-        // Selector 13: 1 60-bit value
-        // Selector 14: RLE (value + count)
-        // Selector 15: Uncompressed
-
+        // Packing modes: (count, bits_per_value)
+        // Selector 0-13: pack 'count' values using 'bits' bits each
+        // Selector 15: single value using up to 60 bits (fallback)
         let modes = [
             (60, 1),
             (30, 2),
@@ -439,8 +450,8 @@ pub fn encode_simple8b_full(vals: &[u64]) -> io::Result<Vec<u64>> {
     Ok(result)
 }
 
-pub fn decode_simple8b_full(words: &[u64]) -> io::Result<Vec<u64>> {
-    let mut result = Vec::new();
+pub fn decode_simple8b_full(words: &[u64], num_items: usize) -> io::Result<Vec<u64>> {
+    let mut result = Vec::with_capacity(num_items);
 
     let modes = [
         (60, 1),
@@ -460,6 +471,10 @@ pub fn decode_simple8b_full(words: &[u64]) -> io::Result<Vec<u64>> {
     ];
 
     for &word in words {
+        if result.len() >= num_items {
+            break;
+        }
+
         let selector = word >> 60;
         let data = word & ((1u64 << 60) - 1);
 
@@ -472,13 +487,27 @@ pub fn decode_simple8b_full(words: &[u64]) -> io::Result<Vec<u64>> {
             };
 
             for j in 0..count {
+                if result.len() >= num_items {
+                    break;
+                }
                 let val = (data >> (j * bits)) & mask;
                 result.push(val);
             }
         } else {
-            // Uncompressed
+            // Uncompressed (selector 15)
             result.push(data);
         }
+    }
+
+    if result.len() != num_items {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Simple8bFull decode count mismatch: expected {}, got {}",
+                num_items,
+                result.len()
+            ),
+        ));
     }
 
     Ok(result)

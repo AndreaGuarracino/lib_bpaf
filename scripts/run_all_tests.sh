@@ -232,7 +232,7 @@ cat >> "$FINAL_REPORT" << FOOTER
 - **Complexity Metric:** edit-distance
 - **Distance Metric:** gap-affine (penalties: 5,8,2)
 - **Tracepoint Types Tested:** standard, variable, mixed (if CIGAR input)
-- **Compression Strategies:** raw, zigzag-delta, 2d-delta, rle, bit-packed, delta-of-delta, frame-of-reference, hybrid-rle, offset-joint, xor-delta, dictionary, simple8, stream-vbyte, fastpfor, cascaded, simple8b-full, selective-rle, rice, huffman, bgzip
+- **Compression Strategies:** raw, zigzag-delta, 2d-delta, rle, bit-packed, delta-of-delta, frame-of-reference, hybrid-rle, offset-joint, xor-delta, dictionary, stream-vbyte, fastpfor, cascaded, simple8b-full, selective-rle, rice, huffman, bgzip
 - **Seek Modes:** Mode A (TpaReader), Mode B (standalone functions)
 
 ## What Was Tested

@@ -34,7 +34,6 @@ fn strategy_to_name(strat: &str) -> String {
         "OffsetJoint" => "offset-joint",
         "XORDelta" => "xor-delta",
         "Dictionary" => "dictionary",
-        "Simple8" => "simple8",
         "StreamVByte" => "stream-vbyte",
         "FastPFOR" => "fastpfor",
         "Cascaded" => "cascaded",

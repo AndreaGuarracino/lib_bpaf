@@ -277,11 +277,6 @@ pub enum CompressionStrategy {
     /// - Optimal for repeated delta patterns (5.4x average compression)
     /// - Configurable compression level (max 22, default: 3)
     Dictionary(i32),
-    /// Simple8b-RLE style encoding
-    /// - Pack multiple small integers into 64-bit words with RLE mode
-    /// - Optimal for runs and small values (4+ billion ints/sec)
-    /// - Configurable compression level (max 22, default: 3)
-    Simple8(i32),
     /// Stream VByte byte-aligned encoding
     /// - Separated control and data bytes for SIMD acceleration
     /// - Optimal for byte-range data (1.1-4.0 billion ints/sec)
@@ -344,7 +339,6 @@ impl CompressionStrategy {
             CompressionStrategy::OffsetJoint(level),
             CompressionStrategy::XORDelta(level),
             CompressionStrategy::Dictionary(level),
-            CompressionStrategy::Simple8(level),
             CompressionStrategy::StreamVByte(level),
             CompressionStrategy::FastPFOR(level),
             CompressionStrategy::Cascaded(level),
@@ -437,7 +431,6 @@ impl CompressionStrategy {
             "offset-joint" => Ok(CompressionStrategy::OffsetJoint(level)),
             "xor-delta" => Ok(CompressionStrategy::XORDelta(level)),
             "dictionary" | "dict" => Ok(CompressionStrategy::Dictionary(level)),
-            "simple8" => Ok(CompressionStrategy::Simple8(level)),
             "stream-vbyte" | "streamvbyte" => Ok(CompressionStrategy::StreamVByte(level)),
             "fastpfor" | "fast-pfor" => Ok(CompressionStrategy::FastPFOR(level)),
             "cascaded" => Ok(CompressionStrategy::Cascaded(level)),
@@ -468,7 +461,6 @@ impl CompressionStrategy {
             "offset-joint",
             "xor-delta",
             "dictionary",
-            "simple8",
             "stream-vbyte",
             "fastpfor",
             "cascaded",
@@ -480,6 +472,7 @@ impl CompressionStrategy {
     }
 
     /// Convert to strategy code for file header
+    /// Note: Strategy codes 0-10 unchanged, codes 11-17 are renumbered (Simple8 removed)
     fn to_code(&self) -> io::Result<u8> {
         match self {
             CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
@@ -497,18 +490,18 @@ impl CompressionStrategy {
             CompressionStrategy::OffsetJoint(_) => Ok(8),
             CompressionStrategy::XORDelta(_) => Ok(9),
             CompressionStrategy::Dictionary(_) => Ok(10),
-            CompressionStrategy::Simple8(_) => Ok(11),
-            CompressionStrategy::StreamVByte(_) => Ok(12),
-            CompressionStrategy::FastPFOR(_) => Ok(13),
-            CompressionStrategy::Cascaded(_) => Ok(14),
-            CompressionStrategy::Simple8bFull(_) => Ok(15),
-            CompressionStrategy::SelectiveRLE(_) => Ok(16),
-            CompressionStrategy::Rice(_) => Ok(17),
-            CompressionStrategy::Huffman(_) => Ok(18),
+            CompressionStrategy::StreamVByte(_) => Ok(11),
+            CompressionStrategy::FastPFOR(_) => Ok(12),
+            CompressionStrategy::Cascaded(_) => Ok(13),
+            CompressionStrategy::Simple8bFull(_) => Ok(14),
+            CompressionStrategy::SelectiveRLE(_) => Ok(15),
+            CompressionStrategy::Rice(_) => Ok(16),
+            CompressionStrategy::Huffman(_) => Ok(17),
         }
     }
 
     /// Parse from strategy code
+    /// Note: Strategy codes 0-10 unchanged, codes 11-17 are renumbered (Simple8 removed)
     fn from_code(code: u8) -> io::Result<Self> {
         match code {
             0 => Ok(CompressionStrategy::Raw(3)),
@@ -522,14 +515,13 @@ impl CompressionStrategy {
             8 => Ok(CompressionStrategy::OffsetJoint(3)),
             9 => Ok(CompressionStrategy::XORDelta(3)),
             10 => Ok(CompressionStrategy::Dictionary(3)),
-            11 => Ok(CompressionStrategy::Simple8(3)),
-            12 => Ok(CompressionStrategy::StreamVByte(3)),
-            13 => Ok(CompressionStrategy::FastPFOR(3)),
-            14 => Ok(CompressionStrategy::Cascaded(3)),
-            15 => Ok(CompressionStrategy::Simple8bFull(3)),
-            16 => Ok(CompressionStrategy::SelectiveRLE(3)),
-            17 => Ok(CompressionStrategy::Rice(3)),
-            18 => Ok(CompressionStrategy::Huffman(3)),
+            11 => Ok(CompressionStrategy::StreamVByte(3)),
+            12 => Ok(CompressionStrategy::FastPFOR(3)),
+            13 => Ok(CompressionStrategy::Cascaded(3)),
+            14 => Ok(CompressionStrategy::Simple8bFull(3)),
+            15 => Ok(CompressionStrategy::SelectiveRLE(3)),
+            16 => Ok(CompressionStrategy::Rice(3)),
+            17 => Ok(CompressionStrategy::Huffman(3)),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unsupported compression strategy code: {}", code),
@@ -537,7 +529,9 @@ impl CompressionStrategy {
         }
     }
 
-    /// Get zstd compression level for this strategy
+    /// Get zstd compression level for this strategy.
+    /// Note: This level is used for the final Zstd/Bgzip compression layer,
+    /// not for the pre-encoding step (which is strategy-specific).
     pub fn zstd_level(&self) -> i32 {
         match self {
             CompressionStrategy::Automatic(level, _) => *level,
@@ -552,7 +546,6 @@ impl CompressionStrategy {
             CompressionStrategy::OffsetJoint(level) => *level,
             CompressionStrategy::XORDelta(level) => *level,
             CompressionStrategy::Dictionary(level) => *level,
-            CompressionStrategy::Simple8(level) => *level,
             CompressionStrategy::StreamVByte(level) => *level,
             CompressionStrategy::FastPFOR(level) => *level,
             CompressionStrategy::Cascaded(level) => *level,
@@ -616,9 +609,6 @@ impl std::fmt::Display for CompressionStrategy {
             }
             CompressionStrategy::Dictionary(level) => {
                 write!(f, "Dictionary (level {})", level)
-            }
-            CompressionStrategy::Simple8(level) => {
-                write!(f, "Simple8 (level {})", level)
             }
             CompressionStrategy::StreamVByte(level) => {
                 write!(f, "StreamVByte (level {})", level)

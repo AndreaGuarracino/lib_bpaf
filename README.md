@@ -6,7 +6,7 @@ TracePoint Alignment (TPA) format - binary format for efficient storage and rand
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Automatic (default)**: Samples records and tests every concrete strategy × compression layer per stream (19×3 per stream), then locks in the best first/second pair; configurable sample size (default 1000, 0 = entire file)
+  - **Automatic (default)**: Samples records and tests every concrete strategy × compression layer per stream (18×3 per stream), then locks in the best first/second pair; configurable sample size (default 1000, 0 = entire file)
   - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
   - **Raw**: Plain varints + zstd
   - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, byte-aligned for random seeks
@@ -24,7 +24,7 @@ TracePoint Alignment (TPA) format - binary format for efficient storage and rand
 ### Header (metadata + strategy)
 - Magic: `TPA\0` (4 bytes)
 - Version: `1` (1 byte)
-- Strategy bytes (2): bits 7–6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5–0 = strategy code (`0-18`)
+- Strategy bytes (2): bits 7–6 = layer (`0=Zstd, 1=Bgzip, 2=Nocomp`), bits 5–0 = strategy code (`0-17`)
 - Record count: varint
 - String count: varint
 - Tracepoint type: `1` byte

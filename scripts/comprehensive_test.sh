@@ -533,7 +533,6 @@ BASE_STRATEGIES=(
     "offset-joint"
     "xor-delta"
     "dictionary"
-    "simple8"
     "stream-vbyte"
     "fastpfor"
     "cascaded"
