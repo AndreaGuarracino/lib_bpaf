@@ -118,7 +118,7 @@ impl TpaReader {
     pub fn get_tracepoints(
         &mut self,
         record_id: u64,
-    ) -> io::Result<(TracepointData, ComplexityMetric, u64)> {
+    ) -> io::Result<(TracepointData, ComplexityMetric, u32)> {
         let tracepoint_offset = self.get_tracepoint_offset(record_id)?;
         self.get_tracepoints_at_offset(tracepoint_offset)
     }
@@ -154,7 +154,7 @@ impl TpaReader {
     pub fn get_tracepoints_at_offset(
         &mut self,
         tracepoint_offset: u64,
-    ) -> io::Result<(TracepointData, ComplexityMetric, u64)> {
+    ) -> io::Result<(TracepointData, ComplexityMetric, u32)> {
         let tp_type = self.header.tracepoint_type;
         let complexity_metric = self.header.complexity_metric;
         let max_complexity = self.header.max_complexity;

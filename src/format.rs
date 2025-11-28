@@ -77,7 +77,7 @@ pub struct CompressionConfig {
     /// Tracepoint representation type
     pub tp_type: TracepointType,
     /// Maximum complexity/spacing parameter
-    pub max_complexity: u64,
+    pub max_complexity: u32,
     /// Metric used for complexity calculation
     pub complexity_metric: ComplexityMetric,
     /// Distance parameters for alignment
@@ -134,7 +134,7 @@ impl CompressionConfig {
     }
 
     /// Set maximum complexity/spacing
-    pub fn max_complexity(mut self, c: u64) -> Self {
+    pub fn max_complexity(mut self, c: u32) -> Self {
         self.max_complexity = c;
         self
     }
@@ -600,7 +600,7 @@ pub struct TpaHeader {
     pub(crate) num_strings: u64,
     pub(crate) tracepoint_type: TracepointType,
     pub(crate) complexity_metric: ComplexityMetric,
-    pub(crate) max_complexity: u64, // For Standard/Mixed/Variable: max_value; For FASTGA: trace_spacing
+    pub(crate) max_complexity: u32, // For Standard/Mixed/Variable: max_value; For FASTGA: trace_spacing
     pub(crate) distance: Distance,
 }
 
@@ -629,7 +629,7 @@ impl TpaHeader {
         second_layer: CompressionLayer,
         tracepoint_type: TracepointType,
         complexity_metric: ComplexityMetric,
-        max_complexity: u64,
+        max_complexity: u32,
         distance: Distance,
     ) -> io::Result<Self> {
         let first_strategy_code = first_strategy.to_code()?;
@@ -705,7 +705,7 @@ impl TpaHeader {
     }
 
     /// Get max complexity
-    pub fn max_complexity(&self) -> u64 {
+    pub fn max_complexity(&self) -> u32 {
         self.max_complexity
     }
 
@@ -735,7 +735,7 @@ impl TpaHeader {
         write_varint(writer, self.num_strings)?;
         writer.write_all(&[self.tracepoint_type.to_u8()])?;
         writer.write_all(&[self.complexity_metric.to_u8()])?;
-        write_varint(writer, self.max_complexity)?;
+        write_varint(writer, self.max_complexity as u64)?;
         write_distance(writer, &self.distance)?;
         Ok(())
     }
@@ -775,7 +775,7 @@ impl TpaHeader {
         let complexity_metric = ComplexityMetric::from_u8(metric_buf[0])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let max_complexity = read_varint(reader)?;
+        let max_complexity = read_varint(reader)? as u32;
 
         let distance = read_distance(reader)?;
 

@@ -162,7 +162,7 @@ fn compress_paf_internal(
     second_strategy: CompressionStrategy,
     user_specified_layer: format::CompressionLayer,
     tp_type: TracepointType,
-    max_complexity: u64,
+    max_complexity: u32,
     complexity_metric: ComplexityMetric,
     distance: Distance,
     use_cigar: bool,
@@ -199,7 +199,7 @@ fn compress_paf_internal(
                 table,
                 use_cigar,
                 tp_type,
-                max_complexity as usize,
+                max_complexity,
                 complexity_metric,
             ) {
                 Ok(r) => Some(r),
@@ -320,7 +320,7 @@ fn parse_paf(
     string_table: &mut StringTable,
     use_cigar: bool,
     tp_type: TracepointType,
-    max_complexity: usize,
+    max_complexity: u32,
     complexity_metric: ComplexityMetric,
 ) -> io::Result<AlignmentRecord> {
     let fields: Vec<&str> = line.split('\t').collect();

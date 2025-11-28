@@ -41,7 +41,7 @@ impl TpaSizeAnalysis {
         let num_strings_varint = varint_size(self.num_strings);
         let tp_type_size = 1u64; // TracepointType byte
         let complexity_metric_size = 1u64; // ComplexityMetric byte
-        let max_complexity_varint = varint_size(header.max_complexity());
+        let max_complexity_varint = varint_size(header.max_complexity() as u64);
         let distance_size = match header.distance() {
             tpa::Distance::Edit => 1u64,
             tpa::Distance::GapAffine { .. } => 1 + 3 * 4, // code + 3 i32 values
