@@ -1,6 +1,6 @@
+use std::time::Instant;
 /// Demo of seekable TPA reader with O(1) random access and performance profiling
 use tpa::{TpaReader, TracepointData};
-use std::time::Instant;
 
 /// Helper to display ComplexityMetric (doesn't implement Debug)
 fn complexity_metric_str(metric: tracepoints::ComplexityMetric) -> &'static str {

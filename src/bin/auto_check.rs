@@ -1,7 +1,5 @@
-use tpa::{
-    compress_paf_to_tpa, CompressionConfig, CompressionStrategy,
-};
 use lib_wfa2::affine_wavefront::Distance;
+use tpa::{compress_paf_to_tpa, CompressionConfig, CompressionStrategy};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();

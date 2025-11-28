@@ -19,25 +19,25 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 // Re-export public types
+pub use lib_wfa2::affine_wavefront::Distance;
 use tracepoints::{
     cigar_to_mixed_tracepoints, cigar_to_tracepoints, cigar_to_variable_tracepoints,
 };
-pub use lib_wfa2::affine_wavefront::Distance;
 
 pub use format::{
-    AlignmentRecord, TpaHeader, CompressionConfig, CompressionLayer, CompressionStrategy,
-    StringTable, Tag, TagValue, TPA_MAGIC,
+    AlignmentRecord, CompressionConfig, CompressionLayer, CompressionStrategy, StringTable, Tag,
+    TagValue, TpaHeader, TPA_MAGIC,
 };
 pub use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
-use crate::format::{parse_tag, open_with_footer, TpaFooter};
+use crate::format::{open_with_footer, parse_tag, TpaFooter};
 use crate::utils::{parse_u8, parse_usize};
 
 pub use index::{build_index, TpaIndex};
 pub use reader::{
     read_mixed_tracepoints_at_offset, read_standard_tracepoints_at_offset,
     read_standard_tracepoints_at_offset_with_strategies, read_variable_tracepoints_at_offset,
-    TpaReader, RecordIterator,
+    RecordIterator, TpaReader,
 };
 
 // Re-export utility functions for external tools
@@ -238,7 +238,8 @@ fn compress_paf_internal(
     // Choose strategy based on user's preference
     let (chosen_first, chosen_second, first_layer, second_layer) = match analyzer {
         Some(analyzer) => {
-            let (first_strat, first_layer, second_strat, second_layer) = analyzer.finalize_pair()?;
+            let (first_strat, first_layer, second_strat, second_layer) =
+                analyzer.finalize_pair()?;
             (first_strat, second_strat, first_layer, second_layer)
         }
         None => (
@@ -448,8 +449,12 @@ fn invalid_tracepoint_format(part: &str) -> io::Error {
 
 fn parse_tracepoint_pair(part: &str, strict: bool) -> io::Result<(usize, usize)> {
     let mut coords = part.split(',');
-    let first = coords.next().ok_or_else(|| invalid_tracepoint_format(part))?;
-    let second = coords.next().ok_or_else(|| invalid_tracepoint_format(part))?;
+    let first = coords
+        .next()
+        .ok_or_else(|| invalid_tracepoint_format(part))?;
+    let second = coords
+        .next()
+        .ok_or_else(|| invalid_tracepoint_format(part))?;
     if strict && coords.next().is_some() {
         return Err(invalid_tracepoint_format(part));
     }

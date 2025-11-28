@@ -1,7 +1,7 @@
-use tpa::{is_tpa_file, varint_size, TpaHeader, StringTable};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
+use tpa::{is_tpa_file, varint_size, StringTable, TpaHeader};
 
 /// Structure to hold detailed size analysis of a TPA file
 #[derive(Debug)]
@@ -74,7 +74,10 @@ impl TpaSizeAnalysis {
             strategy_size,
             header.strategies().unwrap_or_else(|e| {
                 eprintln!("Warning: failed to decode strategies: {}", e);
-                (tpa::CompressionStrategy::Raw(3), tpa::CompressionStrategy::Raw(3))
+                (
+                    tpa::CompressionStrategy::Raw(3),
+                    tpa::CompressionStrategy::Raw(3),
+                )
             })
         );
         println!(
@@ -188,8 +191,12 @@ fn analyze_tpa_size(path: &str) -> io::Result<(TpaSizeAnalysis, TpaHeader, [u8; 
     let mut sequence_length_varints = 0u64;
 
     for i in 0..string_table.len() {
-        let Some(name) = string_table.get(i as u64) else { continue };
-        let Some(seq_len) = string_table.get_length(i as u64) else { continue };
+        let Some(name) = string_table.get(i as u64) else {
+            continue;
+        };
+        let Some(seq_len) = string_table.get_length(i as u64) else {
+            continue;
+        };
 
         string_name_length_varints += varint_size(name.len() as u64);
         string_name_bytes += name.len() as u64;

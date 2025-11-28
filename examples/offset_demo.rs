@@ -1,6 +1,6 @@
+use std::time::Instant;
 /// Demo of offset-based access using direct file offsets
 use tpa::{TpaReader, TracepointData};
-use std::time::Instant;
 
 /// Helper to display ComplexityMetric (doesn't implement Debug)
 fn complexity_metric_str(metric: tracepoints::ComplexityMetric) -> &'static str {

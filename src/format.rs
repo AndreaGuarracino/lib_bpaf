@@ -1,16 +1,20 @@
 //! Data structures for TracePoint Alignment (TPA) format
 
 use crate::{utils::*, Distance};
-use tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use tracepoints::{ComplexityMetric, TracepointData, TracepointType};
 
 pub const TPA_VERSION: u8 = 1;
 pub const TPA_MAGIC: &[u8; 4] = b"TPA\0";
 
 /// Write the common prefix shared by header and footer: magic, version, record_count, string_count
-fn write_common_prefix<W: Write>(writer: &mut W, num_records: u64, num_strings: u64) -> io::Result<()> {
+fn write_common_prefix<W: Write>(
+    writer: &mut W,
+    num_records: u64,
+    num_strings: u64,
+) -> io::Result<()> {
     writer.write_all(TPA_MAGIC)?;
     writer.write_all(&[TPA_VERSION])?;
     write_varint(writer, num_records)?;
@@ -23,7 +27,10 @@ fn read_common_prefix<R: Read>(reader: &mut R) -> io::Result<(u8, u64, u64)> {
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
     if &magic != TPA_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid TPA magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid TPA magic",
+        ));
     }
 
     let mut version_buf = [0u8; 1];
@@ -148,7 +155,11 @@ impl CompressionConfig {
     }
 
     /// Set separate strategies for first and second values
-    pub fn dual_strategy(mut self, first: CompressionStrategy, second: CompressionStrategy) -> Self {
+    pub fn dual_strategy(
+        mut self,
+        first: CompressionStrategy,
+        second: CompressionStrategy,
+    ) -> Self {
         self.first_strategy = first;
         self.second_strategy = Some(second);
         self
@@ -198,7 +209,9 @@ impl CompressionConfig {
 
     /// Get the effective second strategy (first if not explicitly set)
     pub fn effective_second_strategy(&self) -> CompressionStrategy {
-        self.second_strategy.clone().unwrap_or_else(|| self.first_strategy.clone())
+        self.second_strategy
+            .clone()
+            .unwrap_or_else(|| self.first_strategy.clone())
     }
 }
 
@@ -316,7 +329,6 @@ pub enum CompressionStrategy {
 }
 
 impl CompressionStrategy {
-
     /// Return every concrete strategy variant (excludes meta-strategies such as Automatic)
     pub fn concrete_strategies(level: i32) -> Vec<Self> {
         vec![
@@ -361,7 +373,11 @@ impl CompressionStrategy {
             CompressionLayer::Zstd
         };
 
-        let default_level = if layer == CompressionLayer::Nocomp { 0 } else { 3 };
+        let default_level = if layer == CompressionLayer::Nocomp {
+            0
+        } else {
+            3
+        };
         let compression_level = Self::parse_level(&parts, default_level)?;
 
         // Special handling for automatic strategy with optional sample_size
@@ -646,8 +662,8 @@ fn encode_strategy_with_layer(code: u8, layer: CompressionLayer) -> u8 {
 
 fn decode_strategy_with_layer(value: u8) -> io::Result<(CompressionLayer, u8)> {
     let layer_bits = value >> LAYER_SHIFT;
-    let layer =
-        CompressionLayer::from_u8(layer_bits).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let layer = CompressionLayer::from_u8(layer_bits)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok((layer, value & STRATEGY_MASK))
 }
 
@@ -729,7 +745,7 @@ impl TpaHeader {
 
     /// Get distance mode
     pub fn distance(&self) -> Distance {
-        self.distance.clone()
+        self.distance
     }
 
     /// Get complexity metric
@@ -967,6 +983,12 @@ pub struct StringTable {
     strings: Vec<String>,
     lengths: Vec<u64>,
     index: HashMap<String, u64>,
+}
+
+impl Default for StringTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StringTable {

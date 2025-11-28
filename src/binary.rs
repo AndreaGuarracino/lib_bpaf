@@ -1,10 +1,10 @@
 //! Binary I/O operations for TPA format
 
-use tracepoints::{MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use tracepoints::{MixedRepresentation, TracepointData, TracepointType};
 
 use crate::ensure_tracepoints;
 use crate::format::*;
@@ -17,12 +17,8 @@ use crate::utils::*;
 /// Compress data using the specified compression layer
 fn compress_with_layer(data: &[u8], layer: CompressionLayer, level: i32) -> io::Result<Vec<u8>> {
     match layer {
-        CompressionLayer::Zstd => zstd::encode_all(data, level).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Zstd compression failed: {}", e),
-            )
-        }),
+        CompressionLayer::Zstd => zstd::encode_all(data, level)
+            .map_err(|e| io::Error::other(format!("Zstd compression failed: {}", e))),
         CompressionLayer::Bgzip => {
             // Use bgzip crate for BGZF compression
             use bgzip::write::BGZFWriter;
@@ -53,24 +49,16 @@ fn decompress_with_layer(data: &[u8], layer: CompressionLayer) -> io::Result<Vec
             if data.is_empty() {
                 return Ok(Vec::new());
             }
-            zstd::decode_all(data).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Zstd decompression failed: {}", e),
-                )
-            })
+            zstd::decode_all(data)
+                .map_err(|e| io::Error::other(format!("Zstd decompression failed: {}", e)))
         }
         CompressionLayer::Bgzip => {
             if data.is_empty() {
                 return Ok(Vec::new());
             }
             use bgzip::read::BGZFReader;
-            let mut reader = BGZFReader::new(data).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("BGZF decompression failed: {}", e),
-                )
-            })?;
+            let mut reader = BGZFReader::new(data)
+                .map_err(|e| io::Error::other(format!("BGZF decompression failed: {}", e)))?;
             let mut decompressed = Vec::new();
             reader.read_to_end(&mut decompressed)?;
             Ok(decompressed)
@@ -182,7 +170,7 @@ impl SmartDualAnalyzer {
                     &second_vals,
                     self.parallel,
                     "Second",
-                    |first, second, strategy| encode_second_stream(first, second, strategy),
+                    encode_second_stream,
                 );
             }
             _ => {
@@ -1125,7 +1113,7 @@ fn encode_rice_values(values: &[u64]) -> io::Result<Vec<u8>> {
         writer.write_bits(r, k);
     }
     let mut out = Vec::with_capacity(1 + values.len() / 2);
-    out.push(k as u8);
+    out.push(k);
     out.extend_from_slice(&writer.finish());
     Ok(out)
 }
@@ -1495,8 +1483,8 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
 
             // Build dictionary
             for &val in vals {
-                if !dict_map.contains_key(&val) {
-                    dict_map.insert(val, dict.len() as u32);
+                if let std::collections::hash_map::Entry::Vacant(e) = dict_map.entry(val) {
+                    e.insert(dict.len() as u32);
                     dict.push(val);
                 }
                 indices.push(*dict_map.get(&val).unwrap());
@@ -1531,7 +1519,7 @@ fn encode_tracepoint_values(vals: &[u64], strategy: CompressionStrategy) -> io::
                 let bytes_needed = if val == 0 {
                     1
                 } else {
-                    ((64 - val.leading_zeros() + 7) / 8) as usize
+                    (64 - val.leading_zeros()).div_ceil(8) as usize
                 };
                 // 2 bits per value: 00=1 byte, 01=2 bytes, 10=3 bytes, 11=4 bytes
                 let control = (bytes_needed - 1).min(3) as u8;
@@ -1914,12 +1902,10 @@ fn decode_tracepoint_values(
             }
             Ok(vals)
         }
-        CompressionStrategy::Automatic(_, _) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Automatic strategy must be resolved before decoding",
-            ));
-        }
+        CompressionStrategy::Automatic(_, _) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Automatic strategy must be resolved before decoding",
+        )),
     }
 }
 
@@ -1991,15 +1977,13 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
     // Decode directly to (usize, usize) tuples
     let mut tps = Vec::with_capacity(num_items);
 
-    let first_vals_u64 =
-        decode_tracepoint_values(&first_buf, num_items, first_strategy.clone())?;
+    let first_vals_u64 = decode_tracepoint_values(&first_buf, num_items, first_strategy.clone())?;
     let first_vals: Vec<usize> = first_vals_u64.iter().map(|v| *v as usize).collect();
 
     let second_vals_u64: Vec<u64> = match second_strategy {
-        CompressionStrategy::TwoDimDelta(_) => decode_2d_delta_second_values(
-            &second_buf,
-            &first_vals_u64,
-        )?,
+        CompressionStrategy::TwoDimDelta(_) => {
+            decode_2d_delta_second_values(&second_buf, &first_vals_u64)?
+        }
         CompressionStrategy::OffsetJoint(_) => {
             let mut reader = &second_buf[..];
             let mut vals = Vec::with_capacity(num_items);
@@ -2177,8 +2161,7 @@ impl AlignmentRecord {
                 let (first_vals, second_vals): (Vec<u64>, Vec<u64>) =
                     tps.iter().map(|(a, b)| (*a as u64, *b as u64)).unzip();
 
-                let first_val_buf =
-                    encode_tracepoint_values(&first_vals, first_strategy.clone())?;
+                let first_val_buf = encode_tracepoint_values(&first_vals, first_strategy.clone())?;
                 let second_val_buf = match &second_strategy {
                     CompressionStrategy::TwoDimDelta(_) => {
                         encode_2d_delta_second_values(&first_vals, &second_vals)?
@@ -2218,14 +2201,16 @@ impl AlignmentRecord {
                 };
 
                 // Use the explicitly passed layer parameter
-                let first_compressed =
-                    compress_with_layer(&first_val_buf[..], first_layer, first_strategy.zstd_level())?;
-                let second_compressed =
-                    compress_with_layer(
-                        &second_val_buf[..],
-                        second_layer,
-                        second_strategy.zstd_level(),
-                    )?;
+                let first_compressed = compress_with_layer(
+                    &first_val_buf[..],
+                    first_layer,
+                    first_strategy.zstd_level(),
+                )?;
+                let second_compressed = compress_with_layer(
+                    &second_val_buf[..],
+                    second_layer,
+                    second_strategy.zstd_level(),
+                )?;
 
                 write_varint(writer, first_compressed.len() as u64)?;
                 writer.write_all(&first_compressed)?;

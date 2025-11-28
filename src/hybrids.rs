@@ -84,7 +84,7 @@ pub fn encode_fastpfor(vals: &[u64]) -> io::Result<Vec<u8>> {
 
 pub fn decode_fastpfor(data: &[u8]) -> io::Result<Vec<u64>> {
     let mut result = Vec::new();
-    let mut reader = &data[..];
+    let mut reader = data;
 
     while !reader.is_empty() {
         // Read block header
@@ -324,7 +324,7 @@ pub fn encode_selective_rle(vals: &[u64]) -> io::Result<Vec<u8>> {
 
 pub fn decode_selective_rle(data: &[u8]) -> io::Result<Vec<u64>> {
     let mut result = Vec::new();
-    let mut reader = &data[..];
+    let mut reader = data;
 
     while !reader.is_empty() {
         // Read marker byte

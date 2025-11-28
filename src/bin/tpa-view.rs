@@ -1,7 +1,7 @@
-use tpa::TpaReader;
 use std::env;
 use std::io::{self, Write};
 use std::process;
+use tpa::TpaReader;
 
 fn print_usage() {
     eprintln!("Usage: tpa-view [OPTIONS] <tpa-file>");

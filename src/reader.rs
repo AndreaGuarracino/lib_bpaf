@@ -1,15 +1,15 @@
 use crate::binary::{read_record, read_tracepoints_at_offset};
 use crate::format::{
-    AlignmentRecord, TpaHeader, CompressionLayer, CompressionStrategy, StringTable,
-    open_with_footer,
+    open_with_footer, AlignmentRecord, CompressionLayer, CompressionStrategy, StringTable,
+    TpaHeader,
 };
 use crate::index::{build_index, TpaIndex};
 use crate::utils::read_varint;
-use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 use log::{debug, info};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use tracepoints::{ComplexityMetric, MixedRepresentation, TracepointData, TracepointType};
 
 pub struct TpaReader {
     file: File,
@@ -78,8 +78,7 @@ impl TpaReader {
         }
 
         self.file.seek(SeekFrom::Start(self.string_table_pos))?;
-        self.string_table =
-            StringTable::read(&mut self.file, self.header.num_strings())?;
+        self.string_table = StringTable::read(&mut self.file, self.header.num_strings())?;
         Ok(())
     }
 
