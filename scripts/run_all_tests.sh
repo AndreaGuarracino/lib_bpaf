@@ -11,47 +11,141 @@ fi
 # Wrapper script to run comprehensive tests on multiple PAF files
 # Aggregates results into a final report
 #
-# Usage: ./run_all_tests.sh [-t threads] [num_records] [output_base] [paf1] [paf2] ... [pafN]
+# Usage: ./run_all_tests.sh <num_records> <output_base> <num_threads> \
+#            --files FILE [FILE ...] --types TYPE [TYPE ...] [--auto ROWS]
 #
-# Options:
-#   -t threads   - Number of parallel threads (default: 1)
+# Arguments (all required):
+#   num_records  - Number of records to test per file (0 = all records)
+#   output_base  - Output directory for all test results
+#   num_threads  - Number of parallel threads
+#   --files      - Space-separated list of input PAF files
+#   --types      - Space-separated list of tracepoint types (standard, variable, mixed)
 #
-# Arguments:
-#   num_records  - Number of records to test per file (default: 50, 0 = all records)
-#   output_base  - Output directory for all test results (default: ./test/tpa_all_tests)
-#   paf1..pafN   - Input PAF files to test (default: 3 standard test files)
+# Optional flags:
+#   --auto ROWS  - Only test automatic mode with ROWS sample size
+#                  (default: 10000, use 0 for full file analysis)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPREHENSIVE_TEST="$SCRIPT_DIR/comprehensive_test.sh"
 
-# Parse options
-THREADS=1
-while getopts "t:" opt; do
-    case $opt in
-        t) THREADS="$OPTARG" ;;
-        *) echo "Usage: $0 [-t threads] [num_records] [output_base] [paf1] ... [pafN]"; exit 1 ;;
+usage() {
+    echo "Usage: $0 <num_records> <output_base> <num_threads> --files FILE [FILE ...] --types TYPE [TYPE ...] [--auto ROWS]"
+    echo ""
+    echo "Arguments (all required):"
+    echo "  num_records  - Number of records to test per file (0 = all records)"
+    echo "  output_base  - Output directory for all test results"
+    echo "  num_threads  - Number of parallel threads"
+    echo "  --files      - Space-separated list of input PAF files"
+    echo "  --types      - Space-separated list of tracepoint types"
+    echo ""
+    echo "Optional flags:"
+    echo "  --auto ROWS  - Only test automatic mode with ROWS sample size"
+    echo "                 (default: 10000, use 0 for full file analysis)"
+    echo ""
+    echo "Tracepoint types:"
+    echo "  standard  - Standard tracepoints (pairs of values)"
+    echo "  variable  - Variable tracepoints (optional second value)"
+    echo "  mixed     - Mixed tracepoints (interleaved tracepoints and CIGAR ops)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 100 /tmp/results 4 --files data1.paf data2.paf.gz --types standard"
+    echo "  $0 500 ./output 8 --files input.paf --types standard variable mixed"
+    echo "  $0 100 /tmp/auto 4 --files data.paf --types standard --auto 10000"
+    echo "  $0 100 /tmp/full 4 --files data.paf --types standard --auto 0"
+    exit 1
+}
+
+# Check minimum arguments
+if [ $# -lt 6 ]; then
+    echo "Error: Missing required arguments"
+    echo ""
+    usage
+fi
+
+# Parse positional arguments
+NUM_RECORDS="$1"
+OUTPUT_BASE="$2"
+THREADS="$3"
+shift 3
+
+# Validate numeric arguments
+if ! [[ "$NUM_RECORDS" =~ ^[0-9]+$ ]]; then
+    echo "Error: num_records must be a non-negative integer"
+    usage
+fi
+
+if ! [[ "$THREADS" =~ ^[0-9]+$ ]] || [ "$THREADS" -lt 1 ]; then
+    echo "Error: num_threads must be a positive integer"
+    usage
+fi
+
+# Parse --files, --types, and --auto
+TEST_FILES=()
+TP_TYPES=()
+AUTO_ROWS=""  # Empty means run dual mode (all strategies), set to number for auto-only
+PARSING_FILES=false
+PARSING_TYPES=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --files)
+            PARSING_FILES=true
+            PARSING_TYPES=false
+            shift
+            ;;
+        --types)
+            PARSING_FILES=false
+            PARSING_TYPES=true
+            shift
+            ;;
+        --auto)
+            PARSING_FILES=false
+            PARSING_TYPES=false
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --auto requires a number (sample size, 0 for full file)"
+                usage
+            fi
+            if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+                echo "Error: --auto requires a non-negative integer"
+                usage
+            fi
+            AUTO_ROWS="$1"
+            shift
+            ;;
+        *)
+            if $PARSING_FILES; then
+                TEST_FILES+=("$1")
+            elif $PARSING_TYPES; then
+                # Validate type
+                case "$1" in
+                    standard|variable|mixed)
+                        TP_TYPES+=("$1")
+                        ;;
+                    *)
+                        echo "Error: Invalid tracepoint type '$1'"
+                        echo "Valid types: standard, variable, mixed"
+                        exit 1
+                        ;;
+                esac
+            else
+                echo "Error: Unexpected argument '$1'"
+                usage
+            fi
+            shift
+            ;;
     esac
 done
-shift $((OPTIND-1))
 
-# Parse arguments
-NUM_RECORDS="${1:-100}"  # 0 means use ALL records
-OUTPUT_BASE="${2:-$SCRIPT_DIR/tpa_all_tests}"
+# Validate we have files and types
+if [ ${#TEST_FILES[@]} -eq 0 ]; then
+    echo "Error: No input files specified (use --files)"
+    usage
+fi
 
-# Default test files
-DEFAULT_FILES=(
-    "/home/guarracino/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.p95.Pinf.aln.paf.gz"
-    "/home/guarracino/git/_resources/hg002v1.1.pat.PanSN-vs-HG02818_mat_hprc_r2_v1.0.1.sweepga.paf.gz"
-    "/home/guarracino/git/_resources/big-from-fg.tp.20k.paf"
-)
-
-# Collect input files (from arg 3 onwards, or use defaults)
-if [ $# -le 2 ]; then
-    # No input files specified, use defaults
-    TEST_FILES=("${DEFAULT_FILES[@]}")
-else
-    # Use provided input files
-    TEST_FILES=("${@:3}")
+if [ ${#TP_TYPES[@]} -eq 0 ]; then
+    echo "Error: No tracepoint types specified (use --types)"
+    usage
 fi
 
 mkdir -p "$OUTPUT_BASE"
@@ -66,11 +160,21 @@ echo "###################################################################"
 echo "# tpa - Complete Test Suite"
 echo "###################################################################"
 echo ""
-echo "Running comprehensive tests on ${#TEST_FILES[@]} files..."
-echo "Output directory: $OUTPUT_BASE"
-echo "Records per file: $NUM_RECORDS"
-echo "Parallel threads: $THREADS"
-echo "Master TSV: $MASTER_TSV"
+echo "Configuration:"
+echo "  Records per file: $NUM_RECORDS"
+echo "  Output directory: $OUTPUT_BASE"
+echo "  Parallel threads: $THREADS"
+echo "  Tracepoint types: ${TP_TYPES[*]}"
+if [ -n "$AUTO_ROWS" ]; then
+    if [ "$AUTO_ROWS" -eq 0 ]; then
+        echo "  Automatic mode:   full file analysis"
+    else
+        echo "  Automatic mode:   ${AUTO_ROWS}-record sampling"
+    fi
+else
+    echo "  Automatic mode:   disabled (testing all strategies)"
+fi
+echo "  Master TSV:       $MASTER_TSV"
 echo ""
 
 # Track which files exist
@@ -90,28 +194,6 @@ done
 
 if [ ${#VALID_FILES[@]} -eq 0 ]; then
     echo "Error: No valid input files found"
-    echo ""
-    echo "Usage: $0 [-t threads] [num_records] [output_base] [paf1] [paf2] ... [pafN]"
-    echo ""
-    echo "Options:"
-    echo "  -t threads   - Number of parallel threads (default: 1)"
-    echo ""
-    echo "Arguments:"
-    echo "  num_records  - Number of records to test per file (default: 50)"
-    echo "  output_base  - Output directory (default: ./test/tpa_all_tests)"
-    echo "  paf1..pafN   - Input PAF files to test"
-    echo ""
-    echo "Default test files:"
-    echo "  1. p95 CIGAR PAF (compressed)"
-    echo "  2. sweepga CIGAR PAF (compressed)"
-    echo "  3. big-from-fg tracepoint PAF"
-    echo ""
-    echo "Examples:"
-    echo "  $0                                    # Use all defaults"
-    echo "  $0 -t 6                               # Use defaults with 6 threads"
-    echo "  $0 -t 6 100                           # 6 threads, 100 records per file"
-    echo "  $0 -t 6 200 /tmp/results              # 6 threads, custom output"
-    echo "  $0 -t 6 50 /tmp/out file1.paf file2.paf  # Custom files"
     exit 1
 fi
 
@@ -125,17 +207,26 @@ echo ""
 # Run tests on each file
 START_TIME=$(date +%s)
 
+# Convert types array to comma-separated string for comprehensive_test.sh
+TP_TYPES_STR=$(IFS=,; echo "${TP_TYPES[*]}")
+
 for i in "${!VALID_FILES[@]}"; do
     PAF="${VALID_FILES[$i]}"
     NAME="${FILE_NAMES[$i]}"
     OUT_DIR="$OUTPUT_BASE/$NAME"
-    
+
     echo "###################################################################"
     echo "# Test $((i+1))/${#VALID_FILES[@]}: $NAME"
     echo "###################################################################"
     echo ""
-    
-    $COMPREHENSIVE_TEST "$PAF" "$OUT_DIR" 32 edit-distance "$NUM_RECORDS" dual "$THREADS"
+
+    # Pass test mode to comprehensive_test.sh
+    if [ -n "$AUTO_ROWS" ]; then
+        TEST_MODE="auto:${AUTO_ROWS}"
+    else
+        TEST_MODE="dual"
+    fi
+    $COMPREHENSIVE_TEST "$PAF" "$OUT_DIR" 32 edit-distance "$NUM_RECORDS" "$TEST_MODE" "$THREADS" "$TP_TYPES_STR"
 
     # Append TSV data (skip header)
     if [ -f "$OUT_DIR/results.tsv" ]; then
@@ -153,12 +244,23 @@ TOTAL_TIME=$((END_TIME - START_TIME))
 # Aggregate results
 FINAL_REPORT="$OUTPUT_BASE/FINAL_REPORT.md"
 
+AUTO_DESC="disabled"
+if [ -n "$AUTO_ROWS" ]; then
+    if [ "$AUTO_ROWS" -eq 0 ]; then
+        AUTO_DESC="full file analysis"
+    else
+        AUTO_DESC="${AUTO_ROWS}-record sampling"
+    fi
+fi
+
 cat > "$FINAL_REPORT" << HEADER
 # tpa Complete Test Suite - Aggregated Results
 
 **Test Date:** $(date +%Y-%m-%d)
 **Total Files Tested:** ${#VALID_FILES[@]}
 **Records Per File:** $NUM_RECORDS
+**Tracepoint Types:** ${TP_TYPES[*]}
+**Automatic Mode:** $AUTO_DESC
 **Total Test Time:** ${TOTAL_TIME}s
 
 ---
@@ -170,20 +272,20 @@ HEADER
 for i in "${!VALID_FILES[@]}"; do
     NAME="${FILE_NAMES[$i]}"
     PAF="${VALID_FILES[$i]}"
-    
+
     # Detect type
     if [[ "$PAF" == *.gz ]]; then
         FIRST_LINE=$(gzip -cdq "$PAF" | head -1)
     else
         FIRST_LINE=$(head -1 "$PAF")
     fi
-    
+
     if echo "$FIRST_LINE" | grep -q "cg:Z:"; then
         TYPE="CIGAR PAF"
     else
         TYPE="Tracepoint PAF"
     fi
-    
+
     cat >> "$FINAL_REPORT" << FILE_ENTRY
 $((i+1)). **$NAME**
    - Path: \`$PAF\`
@@ -231,8 +333,9 @@ cat >> "$FINAL_REPORT" << FOOTER
 - **Max Complexity:** 32
 - **Complexity Metric:** edit-distance
 - **Distance Metric:** gap-affine (penalties: 5,8,2)
-- **Tracepoint Types Tested:** standard, variable, mixed (if CIGAR input)
-- **Compression Strategies:** raw, zigzag-delta, 2d-delta, rle, bit-packed, delta-of-delta, frame-of-reference, hybrid-rle, offset-joint, xor-delta, dictionary, stream-vbyte, fastpfor, cascaded, simple8b-full, selective-rle, rice, huffman, bgzip
+- **Tracepoint Types Tested:** ${TP_TYPES[*]}
+- **Automatic Mode:** $AUTO_DESC
+- **Compression Strategies:** raw, zigzag-delta, 2d-delta, rle, bit-packed, delta-of-delta, frame-of-reference, hybrid-rle, offset-joint, xor-delta, dictionary, stream-vbyte, fastpfor, cascaded, simple8b-full, selective-rle, rice, huffman
 - **Seek Modes:** Mode A (TpaReader), Mode B (standalone functions)
 
 ## What Was Tested
@@ -240,17 +343,16 @@ cat >> "$FINAL_REPORT" << FOOTER
 For each file and configuration:
 
 1. ✓ Compression time and memory
-2. ✓ Decompression time and memory  
+2. ✓ Decompression time and memory
 3. ✓ Compressed file size and ratio
 4. ✓ Seek performance (Mode A & B)
 5. ✓ Round-trip verification (input == decompress(compress(input)))
 
 ## Verification Method
 
-All tests use improved 3-decimal float normalization:
-- Normal decimals: \`0.993724\` → \`0.993\`
-- Leading dots: \`.0549\` → \`0.054\`
-- Integer floats: \`0\` → \`0.000\`, \`1\` → \`1.000\`
+All tests use 2-decimal float rounding for robust f32 comparison:
+- Floats rounded to 2 decimals: \`0.151999995112\` → \`0.15\`
+- Handles f32 precision loss correctly
 
 ---
 

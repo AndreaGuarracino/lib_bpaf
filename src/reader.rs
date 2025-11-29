@@ -235,24 +235,24 @@ pub fn read_standard_tracepoints_at_offset_with_strategies<R: Read + Seek>(
 }
 
 /// Fastest access: decode variable tracepoints directly from file at offset.
-/// Requires pre-computed offset.
-///
-/// Note: Variable tracepoints use fixed simple encoding (varint with optional second values),
-/// so compression strategies from the header are not applied. This is intentional as the
-/// variable format is already compact and strategy-specific encoding doesn't improve it.
+/// Requires pre-computed offset and compression strategies from header.
 #[inline]
 pub fn read_variable_tracepoints_at_offset<R: Read + Seek>(
     file: &mut R,
     offset: u64,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    first_layer: CompressionLayer,
+    second_layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, Option<usize>)>> {
     let data = read_tracepoints_at_offset(
         file,
         offset,
         TracepointType::Variable,
-        CompressionStrategy::Raw(0),
-        CompressionStrategy::Raw(0),
-        CompressionLayer::Nocomp,
-        CompressionLayer::Nocomp,
+        first_strategy,
+        second_strategy,
+        first_layer,
+        second_layer,
     )?;
     match data {
         TracepointData::Variable(tps) => Ok(tps),
@@ -264,24 +264,24 @@ pub fn read_variable_tracepoints_at_offset<R: Read + Seek>(
 }
 
 /// Fastest access: decode mixed tracepoints directly from file at offset.
-/// Requires pre-computed offset.
-///
-/// Note: Mixed tracepoints use fixed encoding (CIGAR ops + tracepoint pairs as varints),
-/// so compression strategies from the header are not applied. This is intentional as the
-/// mixed format interleaves different data types that don't benefit from uniform strategies.
+/// Requires pre-computed offset and compression strategies from header.
 #[inline]
 pub fn read_mixed_tracepoints_at_offset<R: Read + Seek>(
     file: &mut R,
     offset: u64,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    first_layer: CompressionLayer,
+    second_layer: CompressionLayer,
 ) -> io::Result<Vec<MixedRepresentation>> {
     let data = read_tracepoints_at_offset(
         file,
         offset,
         TracepointType::Mixed,
-        CompressionStrategy::Raw(0),
-        CompressionStrategy::Raw(0),
-        CompressionLayer::Nocomp,
-        CompressionLayer::Nocomp,
+        first_strategy,
+        second_strategy,
+        first_layer,
+        second_layer,
     )?;
     match data {
         TracepointData::Mixed(items) => Ok(items),

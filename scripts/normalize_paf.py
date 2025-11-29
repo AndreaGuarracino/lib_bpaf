@@ -1,46 +1,34 @@
 #!/usr/bin/env python3
 """
-Normalize PAF files by truncating float values to 3 decimal places.
-Equivalent to normalize_paf.pl but with explicit UTF-8 handling.
+Normalize PAF files by rounding float values to 3 decimal places.
+Adds a small epsilon before rounding to handle f32 precision noise where
+values like 0.939999997616 and 0.94000000 should both round to 0.940.
 """
 import sys
 import re
 
 def normalize_line(line):
     """
-    Normalize float fields in PAF format:
-    1. Normal decimal: :f:0.993724 → :f:0.993
-    2. Leading dot: :f:.0549 → :f:0.054
-    3. Integer: :f:0 → :f:0.000
+    Normalize float fields in PAF format by rounding to 3 decimal places.
+    Adds epsilon (1e-7) to handle f32 precision noise at boundaries.
     """
-    # Handle normal decimals: :f:0.993724 → :f:0.993
-    def truncate_decimal(match):
+    # Handle all float formats: :f:0.993724, :f:.0549, :f:.1500, :f:0
+    def round_float(match):
         prefix = match.group(1)
-        integer_part = match.group(2)
-        decimal_part = match.group(3)
-        # Pad with zeros if needed, then take first 3 digits
-        padded = (decimal_part + '000')[:3]
-        return f"{prefix}{integer_part}.{padded}"
+        value_str = match.group(2)
+        try:
+            value = float(value_str)
+            # Add small epsilon to push f32 boundary cases up before rounding
+            # f32 has ~7 significant digits, so 1e-7 is appropriate
+            adjusted = value + 1e-7
+            # Round to 3 decimal places
+            rounded = round(adjusted, 3)
+            return f"{prefix}{rounded:.3f}"
+        except Exception:
+            return match.group(0)
 
-    line = re.sub(r'(:f:)(\d+)\.(\d+)', truncate_decimal, line)
-
-    # Handle leading dots: :f:.0549 → :f:0.054
-    def truncate_leading_dot(match):
-        prefix = match.group(1)
-        decimal_part = match.group(2)
-        padded = (decimal_part + '000')[:3]
-        return f"{prefix}0.{padded}"
-
-    line = re.sub(r'(:f:)\.(\d+)', truncate_leading_dot, line)
-
-    # Handle integers: :f:0 → :f:0.000
-    def add_decimal(match):
-        prefix = match.group(1)
-        integer_part = match.group(2)
-        suffix = match.group(3)
-        return f"{prefix}{integer_part}.000{suffix}"
-
-    line = re.sub(r'(:f:)(\d+)(\s|\t|$)', add_decimal, line)
+    # Match floats with optional leading zero: 0.123, .123, 123, 123.456
+    line = re.sub(r'(:f:)(\.[0-9]+|[0-9]+\.?[0-9]*)', round_float, line)
 
     return line
 

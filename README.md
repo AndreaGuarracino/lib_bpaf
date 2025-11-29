@@ -110,8 +110,22 @@ let standard_tps = read_standard_tracepoints_at_offset_with_strategies(
     first_layer,
     second_layer,
 )?;
-let variable_tps = read_variable_tracepoints_at_offset(&mut file, offset)?;
-let mixed_tps = read_mixed_tracepoints_at_offset(&mut file, offset)?;
+let variable_tps = read_variable_tracepoints_at_offset(
+    &mut file,
+    offset,
+    first_strategy.clone(),
+    second_strategy.clone(),
+    first_layer,
+    second_layer,
+)?;
+let mixed_tps = read_mixed_tracepoints_at_offset(
+    &mut file,
+    offset,
+    first_strategy,
+    second_strategy,
+    first_layer,
+    second_layer,
+)?;
 ```
 
 **Use when**:

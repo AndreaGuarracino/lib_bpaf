@@ -99,11 +99,12 @@ OUTPUT_DIR="${2:-/tmp/tpa_test_output}"
 MAX_COMPLEXITY="${3:-32}"
 COMPLEXITY_METRIC="${4:-edit-distance}"
 NUM_RECORDS="${5:-20000}"
-TEST_MODE="${6:-single}"  # "single" or "dual" - controls strategy testing mode
+TEST_MODE="${6:-single}"  # "single", "dual", or "auto:ROWS" - controls strategy testing mode
 THREADS="${7:-1}"  # Number of parallel threads (default: 1)
+TP_TYPES_INPUT="${8:-standard}"  # Comma-separated list of tracepoint types
 
 if [ -z "$INPUT_PAF" ] || [ ! -f "$INPUT_PAF" ]; then
-    echo "Usage: $0 <input.paf[.gz]> [output_dir] [max_complexity] [complexity_metric] [num_records] [test_mode] [threads]"
+    echo "Usage: $0 <input.paf[.gz]> [output_dir] [max_complexity] [complexity_metric] [num_records] [test_mode] [threads] [tp_types]"
     echo ""
     echo "Automatically detects input type:"
     echo "  - CIGAR PAF (compressed or uncompressed)"
@@ -111,19 +112,29 @@ if [ -z "$INPUT_PAF" ] || [ ! -f "$INPUT_PAF" ]; then
     echo ""
     echo "Test Modes:"
     echo "  single (default) - Test each strategy symmetrically (first==second)"
-    echo "  dual             - Test all $((${#BASE_STRATEGIES[@]}*${#BASE_STRATEGIES[@]})) strategy combinations"
+    echo "  dual             - Test all strategy combinations (no automatic)"
+    echo "  auto:ROWS        - Only test automatic mode with ROWS sample size (0=full file)"
     echo ""
     echo "Threads:"
     echo "  Number of tests to run in parallel (default: 1)"
     echo "  Example: 6 for 6-core CPU"
     echo ""
+    echo "Tracepoint Types (comma-separated):"
+    echo "  standard  - Standard tracepoints (default)"
+    echo "  variable  - Variable tracepoints"
+    echo "  mixed     - Mixed tracepoints"
+    echo "  Example: standard,variable,mixed"
+    echo ""
     echo "Tests:"
-    echo "  - All tracepoint types (if CIGAR input)"
+    echo "  - Specified tracepoint types"
     echo "  - All compression strategies"
     echo "  - Seek performance (Mode A & B)"
     echo "  - Full verification"
     exit 1
 fi
+
+# Parse comma-separated tracepoint types into array
+IFS=',' read -ra TP_TYPES_FROM_ARG <<< "$TP_TYPES_INPUT"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -137,6 +148,7 @@ echo "Metric:      $COMPLEXITY_METRIC"
 echo "Records:     $NUM_RECORDS"
 echo "Test Mode:   $TEST_MODE"
 echo "Threads:     $THREADS"
+echo "TP Types:    ${TP_TYPES_FROM_ARG[*]}"
 echo "========================================="
 echo ""
 
@@ -210,29 +222,61 @@ use std::io::{BufRead, BufReader};
 use tpa::TpaReader;
 use tpa::TracepointData;
 
-fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
+// Reference type that can hold any tracepoint format
+enum Reference {
+    Standard(Vec<Vec<(usize, usize)>>),
+    Variable(Vec<Vec<(usize, Option<usize>)>>),
+}
+
+fn parse_reference(path: &str, limit: usize, tp_type: &str) -> Reference {
     let file = File::open(path).expect("reference PAF open failed");
     let reader = BufReader::new(file);
-    let mut refs = Vec::new();
 
-    for line in reader.lines().take(limit) {
-        let line = line.expect("line read");
-        if let Some(tp_idx) = line.find("tp:Z:") {
-            let tp_str = &line[tp_idx + 5..];
-            let tps: Vec<(usize, usize)> = tp_str
-                .split(';')
-                .filter(|s| !s.is_empty())
-                .map(|pair| {
-                    let mut it = pair.split(',');
-                    let a = it.next().unwrap().parse().unwrap();
-                    let b = it.next().unwrap().parse().unwrap();
-                    (a, b)
-                })
-                .collect();
-            refs.push(tps);
+    match tp_type {
+        "variable" => {
+            let mut refs = Vec::new();
+            for line in reader.lines().take(limit) {
+                let line = line.expect("line read");
+                if let Some(tp_idx) = line.find("tp:Z:") {
+                    let tp_str = &line[tp_idx + 5..];
+                    let tps: Vec<(usize, Option<usize>)> = tp_str
+                        .split(';')
+                        .filter(|s| !s.is_empty())
+                        .map(|pair| {
+                            let mut it = pair.split(',');
+                            let a: usize = it.next().unwrap().parse().unwrap();
+                            let b: Option<usize> = it.next().map(|s| s.parse().unwrap());
+                            (a, b)
+                        })
+                        .collect();
+                    refs.push(tps);
+                }
+            }
+            Reference::Variable(refs)
+        }
+        _ => {
+            // standard, mixed - parse as pairs
+            let mut refs = Vec::new();
+            for line in reader.lines().take(limit) {
+                let line = line.expect("line read");
+                if let Some(tp_idx) = line.find("tp:Z:") {
+                    let tp_str = &line[tp_idx + 5..];
+                    let tps: Vec<(usize, usize)> = tp_str
+                        .split(';')
+                        .filter(|s| !s.is_empty())
+                        .map(|pair| {
+                            let mut it = pair.split(',');
+                            let a: usize = it.next().unwrap().parse().unwrap();
+                            let b: usize = it.next().unwrap().parse().unwrap();
+                            (a, b)
+                        })
+                        .collect();
+                    refs.push(tps);
+                }
+            }
+            Reference::Standard(refs)
         }
     }
-    refs
 }
 
 fn main() {
@@ -241,14 +285,15 @@ fn main() {
     let num_records: u64 = args[2].parse().unwrap();
     let num_positions: usize = args[3].parse().unwrap();
     let iterations_per_pos: usize = args[4].parse().unwrap();
-    let reference_paf = &args[5];
+    let tp_type = &args[5];
+    let reference_paf = &args[6];
 
     let mut reader = TpaReader::open(tpa_path).unwrap();
-    let reference = parse_reference(reference_paf, num_records as usize);
+    let reference = parse_reference(reference_paf, num_records as usize, tp_type);
 
     // Generate random positions
     use std::collections::HashSet;
-    let mut rng = 12345u64;  // Simple LCG
+    let mut rng = 12345u64;
     let mut positions = HashSet::new();
     while positions.len() < num_positions {
         rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
@@ -274,15 +319,33 @@ fn main() {
                     sum_us += time_us;
                     sum_sq_us += time_us * time_us;
                     success += 1;
-                    if let TracepointData::Standard(tps) = tp {
-                        let expected = reference.get(pos as usize).expect("reference missing");
-                        if expected.as_slice() != tps.as_slice() {
-                            eprintln!("Tracepoint mismatch at record {}", pos);
+
+                    // Validate based on type
+                    match (&tp, &reference) {
+                        (TracepointData::Standard(tps), Reference::Standard(refs)) |
+                        (TracepointData::Fastga(tps), Reference::Standard(refs)) => {
+                            if let Some(expected) = refs.get(pos as usize) {
+                                if expected.as_slice() != tps.as_slice() {
+                                    eprintln!("Tracepoint mismatch at record {}", pos);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        (TracepointData::Variable(tps), Reference::Variable(refs)) => {
+                            if let Some(expected) = refs.get(pos as usize) {
+                                if expected.as_slice() != tps.as_slice() {
+                                    eprintln!("Variable tracepoint mismatch at record {}", pos);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        (TracepointData::Mixed(_), _) => {
+                            // Mixed validation is complex, just check decode succeeded
+                        }
+                        _ => {
+                            eprintln!("Tracepoint type mismatch");
                             std::process::exit(1);
                         }
-                    } else {
-                        eprintln!("Unexpected tracepoint type for validation");
-                        std::process::exit(1);
                     }
                 }
                 Err(_) => {}
@@ -310,29 +373,61 @@ use tpa::{
     read_variable_tracepoints_at_offset, TpaReader,
 };
 
-fn parse_reference(path: &str, limit: usize) -> Vec<Vec<(usize, usize)>> {
+// Reference type that can hold any tracepoint format
+enum Reference {
+    Standard(Vec<Vec<(usize, usize)>>),
+    Variable(Vec<Vec<(usize, Option<usize>)>>),
+}
+
+fn parse_reference(path: &str, limit: usize, tp_type: &str) -> Reference {
     let file = File::open(path).expect("reference PAF open failed");
     let reader = BufReader::new(file);
-    let mut refs = Vec::new();
 
-    for line in reader.lines().take(limit) {
-        let line = line.expect("line read");
-        if let Some(tp_idx) = line.find("tp:Z:") {
-            let tp_str = &line[tp_idx + 5..];
-            let tps: Vec<(usize, usize)> = tp_str
-                .split(';')
-                .filter(|s| !s.is_empty())
-                .map(|pair| {
-                    let mut it = pair.split(',');
-                    let a = it.next().unwrap().parse().unwrap();
-                    let b = it.next().unwrap().parse().unwrap();
-                    (a, b)
-                })
-                .collect();
-            refs.push(tps);
+    match tp_type {
+        "variable" => {
+            let mut refs = Vec::new();
+            for line in reader.lines().take(limit) {
+                let line = line.expect("line read");
+                if let Some(tp_idx) = line.find("tp:Z:") {
+                    let tp_str = &line[tp_idx + 5..];
+                    let tps: Vec<(usize, Option<usize>)> = tp_str
+                        .split(';')
+                        .filter(|s| !s.is_empty())
+                        .map(|pair| {
+                            let mut it = pair.split(',');
+                            let a: usize = it.next().unwrap().parse().unwrap();
+                            let b: Option<usize> = it.next().map(|s| s.parse().unwrap());
+                            (a, b)
+                        })
+                        .collect();
+                    refs.push(tps);
+                }
+            }
+            Reference::Variable(refs)
+        }
+        _ => {
+            // standard, mixed - parse as pairs
+            let mut refs = Vec::new();
+            for line in reader.lines().take(limit) {
+                let line = line.expect("line read");
+                if let Some(tp_idx) = line.find("tp:Z:") {
+                    let tp_str = &line[tp_idx + 5..];
+                    let tps: Vec<(usize, usize)> = tp_str
+                        .split(';')
+                        .filter(|s| !s.is_empty())
+                        .map(|pair| {
+                            let mut it = pair.split(',');
+                            let a: usize = it.next().unwrap().parse().unwrap();
+                            let b: usize = it.next().unwrap().parse().unwrap();
+                            (a, b)
+                        })
+                        .collect();
+                    refs.push(tps);
+                }
+            }
+            Reference::Standard(refs)
         }
     }
-    refs
 }
 
 fn main() {
@@ -348,7 +443,7 @@ fn main() {
     let (first_strategy, second_strategy) = reader.header().strategies().unwrap();
     let first_layer = reader.header().first_layer();
     let second_layer = reader.header().second_layer();
-    let reference = parse_reference(reference_paf, num_records as usize);
+    let reference = parse_reference(reference_paf, num_records as usize, tp_type);
 
     // Generate random positions and get their offsets
     use std::collections::HashSet;
@@ -374,56 +469,73 @@ fn main() {
     for (&offset, &record_id) in offsets.iter().zip(positions.iter()) {
         // Warmup
         for _ in 0..3 {
-            let _ = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset_with_strategies(
-                    &mut file,
-                    offset,
-                    first_strategy.clone(),
-                    second_strategy.clone(),
-                    first_layer,
-                    second_layer,
-                ),
-                "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
-                "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
+            match tp_type.as_str() {
+                "standard" => { let _ = read_standard_tracepoints_at_offset_with_strategies(
+                    &mut file, offset, first_strategy.clone(), second_strategy.clone(),
+                    first_layer, second_layer); }
+                "variable" => { let _ = read_variable_tracepoints_at_offset(
+                    &mut file, offset, first_strategy.clone(), second_strategy.clone(),
+                    first_layer, second_layer); }
+                "mixed" => { let _ = read_mixed_tracepoints_at_offset(
+                    &mut file, offset, first_strategy.clone(), second_strategy.clone(),
+                    first_layer, second_layer); }
                 _ => panic!("Invalid tp_type"),
-            };
+            }
         }
 
         // Benchmark this position
         for _ in 0..iterations_per_pos {
             let start = Instant::now();
-            let result = match tp_type.as_str() {
-                "standard" => read_standard_tracepoints_at_offset_with_strategies(
-                    &mut file,
-                    offset,
-                    first_strategy.clone(),
-                    second_strategy.clone(),
-                    first_layer,
-                    second_layer,
-                ),
-                "variable" => read_variable_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
-                "mixed" => read_mixed_tracepoints_at_offset(&mut file, offset).map(|_| Vec::new()),
+            let ok = match tp_type.as_str() {
+                "standard" => {
+                    match read_standard_tracepoints_at_offset_with_strategies(
+                        &mut file, offset, first_strategy.clone(), second_strategy.clone(),
+                        first_layer, second_layer) {
+                        Ok(tps) => {
+                            if let Reference::Standard(refs) = &reference {
+                                if let Some(expected) = refs.get(record_id as usize) {
+                                    if expected.as_slice() != tps.as_slice() {
+                                        eprintln!("Tracepoint mismatch at record {}", record_id);
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                "variable" => {
+                    match read_variable_tracepoints_at_offset(
+                        &mut file, offset, first_strategy.clone(), second_strategy.clone(),
+                        first_layer, second_layer) {
+                        Ok(tps) => {
+                            if let Reference::Variable(refs) = &reference {
+                                if let Some(expected) = refs.get(record_id as usize) {
+                                    if expected.as_slice() != tps.as_slice() {
+                                        eprintln!("Variable tracepoint mismatch at record {}", record_id);
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                "mixed" => {
+                    read_mixed_tracepoints_at_offset(
+                        &mut file, offset, first_strategy.clone(), second_strategy.clone(),
+                        first_layer, second_layer).is_ok()
+                }
                 _ => panic!("Invalid tp_type"),
             };
 
-            match result {
-                Ok(res) => {
-                    let time_us = start.elapsed().as_micros();
-                    sum_us += time_us;
-                    sum_sq_us += time_us * time_us;
-                    success += 1;
-                    match tp_type.as_str() {
-                        "standard" => {
-                            let expected = reference.get(record_id as usize).expect("reference missing");
-                            if expected.as_slice() != res.as_slice() {
-                                eprintln!("Tracepoint mismatch at record {}", record_id);
-                                std::process::exit(1);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Err(_) => {}
+            if ok {
+                let time_us = start.elapsed().as_micros();
+                sum_us += time_us;
+                sum_sq_us += time_us * time_us;
+                success += 1;
             }
         }
     }
@@ -465,11 +577,12 @@ declare -A BGZIP_TIME BGZIP_MEM BGZIP_SIZE
 declare -A STRATEGY_FIRST STRATEGY_SECOND
 declare -A LAYER_FIRST LAYER_SECOND
 
+# Use tracepoint types from argument
+TP_TYPES=("${TP_TYPES_FROM_ARG[@]}")
+
 # Determine tracepoint types to test
 if [ "$INPUT_TYPE" = "cigar" ]; then
-    #TP_TYPES=("standard" "variable" "mixed")
-    TP_TYPES=("standard") # Focus on standard for now
-    echo "=== Encoding CIGAR to all tracepoint types ==="
+    echo "=== Encoding CIGAR to tracepoint types: ${TP_TYPES[*]} ==="
     for TP_TYPE in "${TP_TYPES[@]}"; do
         echo "  Encoding $TP_TYPE..."
         /usr/bin/time -v $CIGZIP encode --paf "$OUTPUT_DIR/input_sample.paf" --threads 1 --type "$TP_TYPE" \
@@ -483,8 +596,11 @@ if [ "$INPUT_TYPE" = "cigar" ]; then
     echo "✓ All encodings complete"
     echo ""
 else
-    # Already tracepoints - detect which type
-    TP_TYPES=("standard")
+    # Already tracepoints - only standard is valid
+    if [ ${#TP_TYPES[@]} -gt 1 ] || [ "${TP_TYPES[0]}" != "standard" ]; then
+        echo "Warning: Input is already tracepoint PAF, only 'standard' type is valid"
+        TP_TYPES=("standard")
+    fi
     cp "$OUTPUT_DIR/input_sample.paf" "$OUTPUT_DIR/standard.tp.paf"
     # No encoding needed - use numeric zeroes to keep TSV fields valid
     ENCODE_TIME["standard"]="0"
@@ -558,15 +674,9 @@ for layer in "${LAYER_SUFFIXES[@]}"; do
     done
 done
 
-# Add automatic strategies: default (1000 samples) and full file (0 = all records)
-STRATEGIES+=("automatic")       # default: level=3, sample_size=1000
-STRATEGIES+=("automatic,3,0")   # full file: level=3, sample_size=0
-
-# Define AUTO_STRATEGIES for dual mode testing
-AUTO_STRATEGIES=(
-    "automatic"
-    "automatic,3,0"
-)
+# Add automatic strategies: default (2000 samples) and full file (0 = all records)
+# Note: automatic strategies are added dynamically based on TEST_MODE
+# When TEST_MODE is "auto:ROWS", we use "automatic,3,ROWS" strategy
 
 # Test function
 test_configuration() {
@@ -680,7 +790,7 @@ test_configuration() {
     fi
     
     # Seek Mode A: 10 positions × 10 iterations (for quick testing)
-    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_paf" || echo "0 0 0")
+    local seek_a_result=$(/tmp/seek_mode_a "$OUTPUT_DIR/${key}.tpa" "$EXTRACTED" 10 10 "$tp_type" "$tp_paf" || echo "0 0 0")
     read -r seek_a_avg seek_a_std seek_a_ratio <<< "$seek_a_result"
     SEEK_A[$key]="$seek_a_avg"
     SEEK_A_STDDEV[$key]="$seek_a_std"
@@ -902,7 +1012,7 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
         # Clean up
         rm -rf "$TEMP_DIR"
 
-        # Also test automatic modes (which internally test every strategy×layer per stream and select best)
+        # Also test automatic modes (works for all tracepoint types)
         for auto_name in "${AUTO_STRATEGIES[@]}"; do
             echo ""
             echo "Testing ${auto_name} meta-strategy (selects best per stream from $((${#BASE_STRATEGIES[@]} * ${#LAYER_SUFFIXES[@]})) combinations)..."
@@ -923,7 +1033,36 @@ for TP_TYPE in "${TP_TYPES[@]}"; do
         done
 
         echo ""
-        echo "✓ Completed $((total_combos + ${#AUTO_STRATEGIES[@]})) tests: ${total_combos} explicit dual combinations + ${#AUTO_STRATEGIES[@]} automatic"
+        echo "✓ Completed ${total_combos} explicit dual combinations (no automatic)"
+    elif [[ "$TEST_MODE" == auto:* ]]; then
+        # Extract sample size from TEST_MODE (format: auto:ROWS)
+        AUTO_SAMPLE_SIZE="${TEST_MODE#auto:}"
+        AUTO_STRATEGY="automatic,3,${AUTO_SAMPLE_SIZE}"
+
+        if [ "$AUTO_SAMPLE_SIZE" -eq 0 ]; then
+            echo "Testing automatic mode with full file analysis..."
+        else
+            echo "Testing automatic mode with ${AUTO_SAMPLE_SIZE}-record sampling..."
+        fi
+
+        echo ""
+        echo "Testing ${AUTO_STRATEGY} meta-strategy (selects best per stream from $((${#BASE_STRATEGIES[@]} * ${#LAYER_SUFFIXES[@]})) combinations)..."
+        test_configuration "$TP_TYPE" "$AUTO_STRATEGY"
+
+        # Extract the strategies that automatic mode selected from the TPA header
+        auto_tpa="$OUTPUT_DIR/${TP_TYPE}_${AUTO_STRATEGY}.tpa"
+        selected_strategies=$("$REPO_DIR/target/release/tpa-view" --strategies "$auto_tpa")
+        first_selected=$(echo "$selected_strategies" | cut -f1)
+        second_selected=$(echo "$selected_strategies" | cut -f2)
+        first_layer_selected=$(echo "$selected_strategies" | cut -f3)
+        second_layer_selected=$(echo "$selected_strategies" | cut -f4)
+
+        echo "  → Selected: ${first_selected}[${first_layer_selected}] → ${second_selected}[${second_layer_selected}]"
+
+        # Output TSV row for the automatic run
+        output_tsv_row "$TP_TYPE" "$AUTO_STRATEGY"
+        echo ""
+        echo "✓ Completed automatic strategy test"
     else
         # Single mode: test each strategy symmetrically (first==second)
         for STRATEGY in "${STRATEGIES[@]}"; do
@@ -966,6 +1105,33 @@ DUAL_NOTE
     for TP_TYPE in "${TP_TYPES[@]}"; do
         tp_size_bytes=${TP_SIZE[$TP_TYPE]}
             tp_size_mb=$(safe_ratio "$tp_size_bytes" 1048576 2)
+        echo "- $TP_TYPE: $tp_size_bytes bytes ($tp_size_mb MB)" >> "$REPORT"
+    done
+    echo "" >> "$REPORT"
+elif [[ "$TEST_MODE" == auto:* ]]; then
+    # Extract sample size from TEST_MODE
+    AUTO_SAMPLE_SIZE="${TEST_MODE#auto:}"
+    if [ "$AUTO_SAMPLE_SIZE" -eq 0 ]; then
+        AUTO_DESC="full file analysis"
+    else
+        AUTO_DESC="${AUTO_SAMPLE_SIZE}-record sampling"
+    fi
+
+    cat >> "$REPORT" << AUTO_NOTE
+## Automatic Strategy Testing Mode
+
+Testing automatic mode with ${AUTO_DESC}.
+
+**Results are available in:** \`results.tsv\`
+
+**Automatic Strategy Tested:**
+- \`automatic,3,${AUTO_SAMPLE_SIZE}\`
+AUTO_NOTE
+    echo "" >> "$REPORT"
+    echo "**Baseline Sizes:**" >> "$REPORT"
+    for TP_TYPE in "${TP_TYPES[@]}"; do
+        tp_size_bytes=${TP_SIZE[$TP_TYPE]}
+        tp_size_mb=$(safe_ratio "$tp_size_bytes" 1048576 2)
         echo "- $TP_TYPE: $tp_size_bytes bytes ($tp_size_mb MB)" >> "$REPORT"
     done
     echo "" >> "$REPORT"

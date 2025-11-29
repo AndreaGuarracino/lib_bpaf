@@ -141,9 +141,10 @@ impl SmartDualAnalyzer {
             }
         }
 
+        ensure_tracepoints(&record.tracepoints)?;
+
         match &record.tracepoints {
             TracepointData::Standard(tps) | TracepointData::Fastga(tps) => {
-                ensure_tracepoints(&record.tracepoints)?;
                 self.processed_records += 1;
                 self.processed_tracepoints += tps.len();
 
@@ -173,11 +174,90 @@ impl SmartDualAnalyzer {
                     encode_second_stream,
                 );
             }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Automatic strategy analysis requires standard or FASTGA tracepoints",
-                ));
+            TracepointData::Variable(tps) => {
+                self.processed_records += 1;
+                self.processed_tracepoints += tps.len();
+
+                // For Variable: first values are always present, second values are optional
+                let first_vals: Vec<u64> = tps.iter().map(|(a, _)| *a as u64).collect();
+                // Only include present second values for analysis
+                let second_vals: Vec<u64> = tps
+                    .iter()
+                    .filter_map(|(_, b)| b.map(|v| v as u64))
+                    .collect();
+
+                process_stream_states(
+                    &mut self.first_states,
+                    &self.layers,
+                    &first_vals,
+                    &second_vals,
+                    self.parallel,
+                    "First",
+                    |first, _second, strategy| encode_first_stream(first, strategy),
+                );
+                // Only analyze second stream if there are any second values
+                if !second_vals.is_empty() {
+                    process_stream_states(
+                        &mut self.second_states,
+                        &self.layers,
+                        &first_vals,
+                        &second_vals,
+                        self.parallel,
+                        "Second",
+                        encode_second_stream,
+                    );
+                }
+            }
+            TracepointData::Mixed(items) => {
+                self.processed_records += 1;
+                self.processed_tracepoints += items.len();
+
+                // For Mixed: separate tracepoint values from CIGAR op lengths
+                // First stream: tracepoint first values + CIGAR lengths
+                // Second stream: tracepoint second values only
+                let (tp_first, tp_second): (Vec<u64>, Vec<u64>) = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        tracepoints::MixedRepresentation::Tracepoint(a, b) => {
+                            Some((*a as u64, *b as u64))
+                        }
+                        _ => None,
+                    })
+                    .unzip();
+
+                let cigar_lens: Vec<u64> = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        tracepoints::MixedRepresentation::CigarOp(len, _) => Some(*len as u64),
+                        _ => None,
+                    })
+                    .collect();
+
+                // Combine tp_first and cigar_lens for first stream analysis
+                let mut first_vals = tp_first;
+                first_vals.extend(cigar_lens);
+
+                process_stream_states(
+                    &mut self.first_states,
+                    &self.layers,
+                    &first_vals,
+                    &tp_second,
+                    self.parallel,
+                    "First",
+                    |first, _second, strategy| encode_first_stream(first, strategy),
+                );
+                // Only analyze second stream if there are tracepoint second values
+                if !tp_second.is_empty() {
+                    process_stream_states(
+                        &mut self.second_states,
+                        &self.layers,
+                        &first_vals,
+                        &tp_second,
+                        self.parallel,
+                        "Second",
+                        encode_second_stream,
+                    );
+                }
             }
         }
         Ok(())
@@ -807,11 +887,25 @@ pub(crate) fn read_tracepoints<R: Read>(
             })
         }
         TracepointType::Variable => {
-            let tps = decode_variable_tracepoints(reader, num_items)?;
+            let tps = decode_variable_tracepoints(
+                reader,
+                num_items,
+                first_strategy,
+                second_strategy,
+                first_layer,
+                second_layer,
+            )?;
             Ok(TracepointData::Variable(tps))
         }
         TracepointType::Mixed => {
-            let items = decode_mixed_tracepoints(reader, num_items)?;
+            let items = decode_mixed_tracepoints(
+                reader,
+                num_items,
+                first_strategy,
+                second_strategy,
+                first_layer,
+                second_layer,
+            )?;
             Ok(TracepointData::Mixed(items))
         }
     }
@@ -908,61 +1002,41 @@ pub(crate) fn skip_record<R: Read + Seek>(
 }
 
 fn skip_tracepoints<R: Read + Seek>(reader: &mut R, tp_type: TracepointType) -> io::Result<()> {
-    let num_items = read_varint(reader)? as usize;
+    let _num_items = read_varint(reader)?;
+
+    // Helper to read length and skip that many bytes
+    let skip_block = |reader: &mut R| -> io::Result<()> {
+        let len = read_varint(reader)?;
+        let len = i64::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Compressed block too large to skip",
+            )
+        })?;
+        reader.seek(SeekFrom::Current(len))?;
+        Ok(())
+    };
+
     match tp_type {
         TracepointType::Standard | TracepointType::Fastga => {
-            // Read first_len and skip first_data
-            let first_len = read_varint(reader)?;
-            let first_len = i64::try_from(first_len).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Compressed block too large to skip",
-                )
-            })?;
-            reader.seek(SeekFrom::Current(first_len))?;
-
-            // Read second_len and skip second_data
-            let second_len = read_varint(reader)?;
-            let second_len = i64::try_from(second_len).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Compressed block too large to skip",
-                )
-            })?;
-            reader.seek(SeekFrom::Current(second_len))?;
+            // Format: [first_len][first_data][second_len][second_data]
+            skip_block(reader)?;
+            skip_block(reader)?;
         }
         TracepointType::Variable => {
-            for _ in 0..num_items {
-                read_varint(reader)?;
-                let mut flag = [0u8; 1];
-                reader.read_exact(&mut flag)?;
-                if flag[0] == 1 {
-                    read_varint(reader)?;
-                }
-            }
+            // Format: [presence_bitmap_len][presence_bitmap][first_len][first_data][second_len][second_data]
+            skip_block(reader)?; // presence bitmap
+            skip_block(reader)?; // first values
+            skip_block(reader)?; // second values
         }
         TracepointType::Mixed => {
-            for _ in 0..num_items {
-                let mut item_type = [0u8; 1];
-                reader.read_exact(&mut item_type)?;
-                match item_type[0] {
-                    0 => {
-                        read_varint(reader)?;
-                        read_varint(reader)?;
-                    }
-                    1 => {
-                        read_varint(reader)?;
-                        let mut op = [0u8; 1];
-                        reader.read_exact(&mut op)?;
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Invalid mixed item type",
-                        ))
-                    }
-                }
-            }
+            // Format: [type_bitmap_len][type_bitmap][tp_first_len][tp_first][tp_second_len][tp_second]
+            //         [cigar_lens_len][cigar_lens][cigar_ops_len][cigar_ops]
+            skip_block(reader)?; // type bitmap
+            skip_block(reader)?; // tp first values
+            skip_block(reader)?; // tp second values
+            skip_block(reader)?; // cigar lengths
+            skip_block(reader)?; // cigar ops
         }
     }
     Ok(())
@@ -2041,57 +2115,138 @@ pub(crate) fn decode_standard_tracepoints<R: Read>(
     Ok(tps)
 }
 
-/// Variable tracepoint decoding (only raw varints)
+/// Variable tracepoint decoding with strategy support
 #[inline(always)]
 pub(crate) fn decode_variable_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    first_layer: CompressionLayer,
+    second_layer: CompressionLayer,
 ) -> io::Result<Vec<(usize, Option<usize>)>> {
-    let mut tps = Vec::with_capacity(num_items);
-    for _ in 0..num_items {
-        let a = read_varint(reader)? as usize;
-        let mut flag = [0u8; 1];
-        reader.read_exact(&mut flag)?;
-        let b_opt = if flag[0] == 1 {
-            Some(read_varint(reader)? as usize)
-        } else {
-            None
-        };
-        tps.push((a, b_opt));
-    }
+    // Read presence bitmap
+    let bitmap_len = read_varint(reader)? as usize;
+    let mut presence_bytes = vec![0u8; bitmap_len];
+    reader.read_exact(&mut presence_bytes)?;
+    let presence = crate::utils::unpack_bitmap(&presence_bytes, num_items);
+
+    // Read first stream
+    let first_len = read_varint(reader)? as usize;
+    let mut first_compressed = vec![0u8; first_len];
+    reader.read_exact(&mut first_compressed)?;
+    let first_buf = decompress_with_layer(&first_compressed, first_layer)?;
+    let first_vals = decode_tracepoint_values(&first_buf, num_items, first_strategy)?;
+
+    // Count how many have second values
+    let second_count = presence.iter().filter(|&&b| b).count();
+
+    // Read second stream
+    let second_len = read_varint(reader)? as usize;
+    let second_vals = if second_len == 0 || second_count == 0 {
+        Vec::new()
+    } else {
+        let mut second_compressed = vec![0u8; second_len];
+        reader.read_exact(&mut second_compressed)?;
+        let second_buf = decompress_with_layer(&second_compressed, second_layer)?;
+        decode_tracepoint_values(&second_buf, second_count, second_strategy)?
+    };
+
+    // Reconstruct
+    let mut second_iter = second_vals.into_iter();
+    let tps: Vec<(usize, Option<usize>)> = first_vals
+        .into_iter()
+        .zip(presence)
+        .map(|(first, has_second)| {
+            let second = if has_second {
+                second_iter.next().map(|v| v as usize)
+            } else {
+                None
+            };
+            (first as usize, second)
+        })
+        .collect();
+
     Ok(tps)
 }
 
-/// Mixed tracepoint decoding (only raw varints)
+/// Mixed tracepoint decoding with strategy support
 #[inline(always)]
 pub(crate) fn decode_mixed_tracepoints<R: Read>(
     reader: &mut R,
     num_items: usize,
+    first_strategy: CompressionStrategy,
+    second_strategy: CompressionStrategy,
+    first_layer: CompressionLayer,
+    second_layer: CompressionLayer,
 ) -> io::Result<Vec<MixedRepresentation>> {
-    let mut items = Vec::with_capacity(num_items);
-    for _ in 0..num_items {
-        let mut item_type = [0u8; 1];
-        reader.read_exact(&mut item_type)?;
-        match item_type[0] {
-            0 => {
-                let a = read_varint(reader)? as usize;
-                let b = read_varint(reader)? as usize;
-                items.push(MixedRepresentation::Tracepoint(a, b));
-            }
-            1 => {
-                let len = read_varint(reader)? as usize;
-                let mut op = [0u8; 1];
-                reader.read_exact(&mut op)?;
-                items.push(MixedRepresentation::CigarOp(len, op[0] as char));
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid mixed item type",
-                ))
-            }
-        }
+    // Read type bitmap
+    let bitmap_len = read_varint(reader)? as usize;
+    let mut type_bytes = vec![0u8; bitmap_len];
+    reader.read_exact(&mut type_bytes)?;
+    let types = crate::utils::unpack_bitmap(&type_bytes, num_items);
+
+    // Count tracepoints and CIGARs
+    let cigar_count = types.iter().filter(|&&is_cigar| is_cigar).count();
+    let tp_count = num_items - cigar_count;
+
+    // Read tracepoint first stream
+    let tp_first_len = read_varint(reader)? as usize;
+    let tp_first_vals = if tp_first_len == 0 || tp_count == 0 {
+        Vec::new()
+    } else {
+        let mut tp_first_compressed = vec![0u8; tp_first_len];
+        reader.read_exact(&mut tp_first_compressed)?;
+        let tp_first_buf = decompress_with_layer(&tp_first_compressed, first_layer)?;
+        decode_tracepoint_values(&tp_first_buf, tp_count, first_strategy.clone())?
+    };
+
+    // Read tracepoint second stream
+    let tp_second_len = read_varint(reader)? as usize;
+    let tp_second_vals = if tp_second_len == 0 || tp_count == 0 {
+        Vec::new()
+    } else {
+        let mut tp_second_compressed = vec![0u8; tp_second_len];
+        reader.read_exact(&mut tp_second_compressed)?;
+        let tp_second_buf = decompress_with_layer(&tp_second_compressed, second_layer)?;
+        decode_tracepoint_values(&tp_second_buf, tp_count, second_strategy)?
+    };
+
+    // Read CIGAR lengths stream
+    let cigar_len_len = read_varint(reader)? as usize;
+    let cigar_lens = if cigar_len_len == 0 || cigar_count == 0 {
+        Vec::new()
+    } else {
+        let mut cigar_len_compressed = vec![0u8; cigar_len_len];
+        reader.read_exact(&mut cigar_len_compressed)?;
+        let cigar_len_buf = decompress_with_layer(&cigar_len_compressed, first_layer)?;
+        decode_tracepoint_values(&cigar_len_buf, cigar_count, first_strategy)?
+    };
+
+    // Read CIGAR ops (raw bytes)
+    let cigar_ops_len = read_varint(reader)? as usize;
+    let mut cigar_ops = vec![0u8; cigar_ops_len];
+    if cigar_ops_len > 0 {
+        reader.read_exact(&mut cigar_ops)?;
     }
+
+    // Reconstruct items in original order
+    let mut tp_iter = tp_first_vals.into_iter().zip(tp_second_vals);
+    let mut cigar_iter = cigar_lens.into_iter().zip(cigar_ops);
+
+    let items: Vec<MixedRepresentation> = types
+        .into_iter()
+        .map(|is_cigar| {
+            if is_cigar {
+                let (len, op) = cigar_iter.next().unwrap_or((0, b'?'));
+                MixedRepresentation::CigarOp(len as usize, op as char)
+            } else {
+                let (a, b) = tp_iter.next().unwrap_or((0, 0));
+                MixedRepresentation::Tracepoint(a as usize, b as usize)
+            }
+        })
+        .collect();
+
     Ok(items)
 }
 
@@ -2205,32 +2360,126 @@ impl AlignmentRecord {
             }
             TracepointData::Variable(tps) => {
                 write_varint(writer, tps.len() as u64)?;
-                for (a, b_opt) in tps {
-                    write_varint(writer, *a as u64)?;
-                    if let Some(b) = b_opt {
-                        writer.write_all(&[1])?;
-                        write_varint(writer, *b as u64)?;
-                    } else {
-                        writer.write_all(&[0])?;
-                    }
-                }
+
+                // Build presence bitmap (1 bit per item: has_second)
+                let presence: Vec<bool> = tps.iter().map(|(_, b)| b.is_some()).collect();
+                let presence_bytes = crate::utils::pack_bitmap(&presence);
+                write_varint(writer, presence_bytes.len() as u64)?;
+                writer.write_all(&presence_bytes)?;
+
+                // Collect first values (all items have first)
+                let first_vals: Vec<u64> = tps.iter().map(|(a, _)| *a as u64).collect();
+
+                // Collect second values (only present ones)
+                let second_vals: Vec<u64> = tps
+                    .iter()
+                    .filter_map(|(_, b)| b.map(|v| v as u64))
+                    .collect();
+
+                // Encode with strategies
+                let first_buf = encode_tracepoint_values(&first_vals, first_strategy.clone())?;
+                let second_buf = if second_vals.is_empty() {
+                    Vec::new()
+                } else {
+                    encode_tracepoint_values(&second_vals, second_strategy.clone())?
+                };
+
+                // Compress with layers
+                let first_compressed = compress_with_layer(
+                    &first_buf,
+                    first_layer,
+                    first_strategy.zstd_level(),
+                )?;
+                let second_compressed = if second_buf.is_empty() {
+                    Vec::new()
+                } else {
+                    compress_with_layer(
+                        &second_buf,
+                        second_layer,
+                        second_strategy.zstd_level(),
+                    )?
+                };
+
+                write_varint(writer, first_compressed.len() as u64)?;
+                writer.write_all(&first_compressed)?;
+                write_varint(writer, second_compressed.len() as u64)?;
+                writer.write_all(&second_compressed)?;
             }
             TracepointData::Mixed(items) => {
                 write_varint(writer, items.len() as u64)?;
-                for item in items {
-                    match item {
-                        MixedRepresentation::Tracepoint(a, b) => {
-                            writer.write_all(&[0])?;
-                            write_varint(writer, *a as u64)?;
-                            write_varint(writer, *b as u64)?;
-                        }
-                        MixedRepresentation::CigarOp(len, op) => {
-                            writer.write_all(&[1])?;
-                            write_varint(writer, *len as u64)?;
-                            writer.write_all(&[*op as u8])?;
-                        }
-                    }
-                }
+
+                // Build type bitmap (0=Tracepoint, 1=CigarOp)
+                let types: Vec<bool> = items
+                    .iter()
+                    .map(|i| matches!(i, MixedRepresentation::CigarOp(_, _)))
+                    .collect();
+                let type_bytes = crate::utils::pack_bitmap(&types);
+                write_varint(writer, type_bytes.len() as u64)?;
+                writer.write_all(&type_bytes)?;
+
+                // Separate by type
+                let (tp_first, tp_second): (Vec<u64>, Vec<u64>) = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        MixedRepresentation::Tracepoint(a, b) => Some((*a as u64, *b as u64)),
+                        _ => None,
+                    })
+                    .unzip();
+
+                let (cigar_lens, cigar_ops): (Vec<u64>, Vec<u8>) = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        MixedRepresentation::CigarOp(len, op) => Some((*len as u64, *op as u8)),
+                        _ => None,
+                    })
+                    .unzip();
+
+                // Encode tracepoint streams with strategies (if any tracepoints)
+                let tp_first_buf = if tp_first.is_empty() {
+                    Vec::new()
+                } else {
+                    encode_tracepoint_values(&tp_first, first_strategy.clone())?
+                };
+                let tp_second_buf = if tp_second.is_empty() {
+                    Vec::new()
+                } else {
+                    encode_tracepoint_values(&tp_second, second_strategy.clone())?
+                };
+
+                // Encode CIGAR lengths with first strategy (if any CIGARs)
+                let cigar_len_buf = if cigar_lens.is_empty() {
+                    Vec::new()
+                } else {
+                    encode_tracepoint_values(&cigar_lens, first_strategy.clone())?
+                };
+
+                // Compress all streams
+                let tp_first_compressed = if tp_first_buf.is_empty() {
+                    Vec::new()
+                } else {
+                    compress_with_layer(&tp_first_buf, first_layer, first_strategy.zstd_level())?
+                };
+                let tp_second_compressed = if tp_second_buf.is_empty() {
+                    Vec::new()
+                } else {
+                    compress_with_layer(&tp_second_buf, second_layer, second_strategy.zstd_level())?
+                };
+                let cigar_len_compressed = if cigar_len_buf.is_empty() {
+                    Vec::new()
+                } else {
+                    compress_with_layer(&cigar_len_buf, first_layer, first_strategy.zstd_level())?
+                };
+
+                // Write all streams
+                write_varint(writer, tp_first_compressed.len() as u64)?;
+                writer.write_all(&tp_first_compressed)?;
+                write_varint(writer, tp_second_compressed.len() as u64)?;
+                writer.write_all(&tp_second_compressed)?;
+                write_varint(writer, cigar_len_compressed.len() as u64)?;
+                writer.write_all(&cigar_len_compressed)?;
+                // CIGAR ops are raw bytes (no strategy)
+                write_varint(writer, cigar_ops.len() as u64)?;
+                writer.write_all(&cigar_ops)?;
             }
         }
         Ok(())

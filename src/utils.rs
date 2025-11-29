@@ -186,6 +186,30 @@ pub(crate) fn read_distance<R: Read>(reader: &mut R) -> io::Result<Distance> {
 }
 
 // ============================================================================
+// BITMAP ENCODING
+// ============================================================================
+
+/// Pack booleans into bitmap bytes (little-endian bit order)
+#[inline]
+pub(crate) fn pack_bitmap(bits: &[bool]) -> Vec<u8> {
+    let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+    for (i, &bit) in bits.iter().enumerate() {
+        if bit {
+            bytes[i / 8] |= 1 << (i % 8);
+        }
+    }
+    bytes
+}
+
+/// Unpack bitmap bytes into booleans (little-endian bit order)
+#[inline]
+pub(crate) fn unpack_bitmap(bytes: &[u8], count: usize) -> Vec<bool> {
+    (0..count)
+        .map(|i| (bytes[i / 8] >> (i % 8)) & 1 == 1)
+        .collect()
+}
+
+// ============================================================================
 // HELPERS
 // ============================================================================
 

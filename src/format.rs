@@ -130,7 +130,7 @@ pub struct CompressionConfig {
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
-            first_strategy: CompressionStrategy::Automatic(3, 1000),
+            first_strategy: CompressionStrategy::Automatic(3, 10000),
             second_strategy: None,
             layer: CompressionLayer::Zstd,
             tp_type: TracepointType::Standard,
@@ -221,7 +221,7 @@ pub enum CompressionStrategy {
     /// Automatic strategy selection
     /// - Tests every concrete strategy × layer on sampled records
     /// - Parameters: (zstd_level, sample_size) where 0 = entire file
-    /// - Default: level=3, sample_size=1000
+    /// - Default: level=3, sample_size=10000
     Automatic(i32, usize),
     /// Raw encoding (no preprocessing) + Zstd
     /// - Optimal for low complexity data
@@ -384,7 +384,7 @@ impl CompressionStrategy {
                         raw
                     )
                 })?,
-                None => 1000, // Default sample size
+                None => 10000, // Default sample size
             };
             CompressionStrategy::Automatic(compression_level, sample_size)
         } else {
@@ -419,7 +419,7 @@ impl CompressionStrategy {
     /// Parse a single strategy name into a CompressionStrategy enum
     fn parse_single_strategy(name: &str, level: i32) -> Result<CompressionStrategy, String> {
         match name {
-            "automatic" => Ok(CompressionStrategy::Automatic(level, 1000)),
+            "automatic" => Ok(CompressionStrategy::Automatic(level, 10000)),
             "raw" => Ok(CompressionStrategy::Raw(level)),
             "zigzag-delta" => Ok(CompressionStrategy::ZigzagDelta(level)),
             "2d-delta" => Ok(CompressionStrategy::TwoDimDelta(level)),
@@ -1179,7 +1179,9 @@ pub fn format_tag(tag: &Tag) -> String {
     let tag_type = tag.tag_type as char;
     match &tag.value {
         TagValue::Int(v) => format!("{}:{}:{}", key, tag_type, v),
-        TagValue::Float(v) => format!("{}:{}:{}", key, tag_type, v),
+        // Use enough precision to round-trip f32 values correctly
+        // f32 has ~7 significant digits, so we use 8 to ensure round-trip
+        TagValue::Float(v) => format!("{}:{}:{:.8}", key, tag_type, v),
         TagValue::String(s) => format!("{}:Z:{}", key, s),
     }
 }
