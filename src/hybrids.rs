@@ -239,7 +239,10 @@ pub fn decode_cascaded(data: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
         }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Cascaded decode: empty data but expected {} items", num_items),
+            format!(
+                "Cascaded decode: empty data but expected {} items",
+                num_items
+            ),
         ));
     }
 
@@ -281,7 +284,10 @@ pub fn decode_cascaded(data: &[u8], num_items: usize) -> io::Result<Vec<u64>> {
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Cascaded delta mode: empty data but expected {} items", num_items),
+                    format!(
+                        "Cascaded delta mode: empty data but expected {} items",
+                        num_items
+                    ),
                 ));
             }
 

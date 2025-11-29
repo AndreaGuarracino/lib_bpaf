@@ -2385,19 +2385,12 @@ impl AlignmentRecord {
                 };
 
                 // Compress with layers
-                let first_compressed = compress_with_layer(
-                    &first_buf,
-                    first_layer,
-                    first_strategy.zstd_level(),
-                )?;
+                let first_compressed =
+                    compress_with_layer(&first_buf, first_layer, first_strategy.zstd_level())?;
                 let second_compressed = if second_buf.is_empty() {
                     Vec::new()
                 } else {
-                    compress_with_layer(
-                        &second_buf,
-                        second_layer,
-                        second_strategy.zstd_level(),
-                    )?
+                    compress_with_layer(&second_buf, second_layer, second_strategy.zstd_level())?
                 };
 
                 write_varint(writer, first_compressed.len() as u64)?;

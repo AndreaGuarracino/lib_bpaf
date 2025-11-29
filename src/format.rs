@@ -445,7 +445,6 @@ impl CompressionStrategy {
         }
     }
 
-
     /// Get all available strategies
     pub fn variants() -> &'static [&'static str] {
         &[
