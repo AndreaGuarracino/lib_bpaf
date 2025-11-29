@@ -6,7 +6,7 @@ TracePoint Alignment (TPA) format - binary format for efficient storage and rand
 
 - **O(1) random access**: External index for instant record lookup
 - **Fast varint compression**:
-  - **Automatic (default)**: Samples records and tests every concrete strategy × compression layer per stream (18×3 per stream), then locks in the best first/second pair; configurable sample size (default 1000, 0 = entire file)
+  - **Automatic (default)**: Samples records and tests every concrete strategy × compression layer per stream (18×3 per stream), then locks in the best first/second pair; configurable sample size (default 10000, 0 = entire file)
   - **ZigzagDelta**: Delta + zigzag transform + varint + zstd
   - **Raw**: Plain varints + zstd
   - **Rice / Huffman**: Block-local entropy coding over zigzag deltas, byte-aligned for random seeks
@@ -147,7 +147,7 @@ for record in reader.iter_records() {
 ```rust
 use tpa::{compress_paf_to_tpa, CompressionConfig, CompressionStrategy, CompressionLayer};
 
-// Automatic (default): samples 1000 records to find best strategy
+// Automatic (default): samples 10000 records to find best strategy
 compress_paf_to_tpa("alignments.paf", "alignments.tpa", CompressionConfig::new())?;
 
 // Automatic with custom sample size (500 records)
@@ -188,7 +188,7 @@ compress_paf_to_tpa(
 ```
 
 **Strategy guide:**
-- **Automatic (default)**: Best for most use cases. Parameters: `(level, sample_size)` where sample_size=1000 is default, 0 = analyze entire file
+- **Automatic (default)**: Best for most use cases. Parameters: `(level, sample_size)` where sample_size=10000 is default, 0 = analyze entire file
 - **ZigzagDelta**: Use when tracepoint values are mostly increasing
 - **TwoDimDelta**: Best for CIGAR-derived alignments (exploits query/target correlation)
 - **Raw**: Use when tracepoint values jump frequently

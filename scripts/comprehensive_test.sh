@@ -14,7 +14,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-CIGZIP_DIR="${CIGZIP_DIR:-/home/guarracino/git/cigzip}"
+CIGZIP_DIR="${CIGZIP_DIR:-}"
 CIGZIP="$CIGZIP_DIR/target/release/cigzip"
 NORMALIZE="python3 $SCRIPT_DIR/normalize_paf.py"
 
@@ -198,6 +198,18 @@ echo ""
 
 # Build tools if needed
 if [ ! -f "$CIGZIP" ]; then
+    if [ -z "$CIGZIP_DIR" ]; then
+        echo "ERROR: CIGZIP_DIR environment variable not set."
+        echo "Please set it to the path of your cigzip repository:"
+        echo "  export CIGZIP_DIR=/path/to/cigzip"
+        echo "  # or"
+        echo "  CIGZIP_DIR=/path/to/cigzip $0 $*"
+        exit 1
+    fi
+    if [ ! -d "$CIGZIP_DIR" ]; then
+        echo "ERROR: CIGZIP_DIR=$CIGZIP_DIR does not exist."
+        exit 1
+    fi
     echo "=== Building cigzip ==="
     cd "$CIGZIP_DIR"
     cargo build --release 2>&1 | tail -3
@@ -662,6 +674,11 @@ LAYER_SUFFIXES=(
     ""
     "-bgzip"
     "-nocomp"
+)
+
+AUTO_STRATEGIES=(
+    "automatic"
+    "automatic,3,0"
 )
 
 # Build full strategy list

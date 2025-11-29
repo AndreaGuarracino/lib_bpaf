@@ -29,16 +29,3 @@ path = "src/bin/tpa-analyze.rs"
 name = "tpa-view"
 path = "src/bin/tpa-view.rs"
 
-[[bin]]
-name = "tpa-viz"
-path = "src/bin/tpa-viz.rs"
-required-features = ["viz"]
-
-[features]
-viz = ["eframe"]
-
-[dependencies.eframe]
-version = "0.33"
-optional = true
-default-features = false
-features = ["default_fonts", "glow", "wayland", "x11"]
