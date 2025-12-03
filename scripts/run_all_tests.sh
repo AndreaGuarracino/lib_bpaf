@@ -12,34 +12,39 @@ set -e
 #
 # USAGE:
 #   ./run_all_tests.sh <num_records> <output_base> <num_threads> \
-#       --files FILE [FILE ...] --types TYPE [TYPE ...] [--auto ROWS]
+#       --files <file_list.txt> --types TYPE [TYPE ...] [--auto ROWS]
 #
 # ARGUMENTS:
 #   num_records  - Number of records to test per file (0 = all records)
 #   output_base  - Output directory for all test results
 #   num_threads  - Number of parallel threads
-#   --files      - Space-separated list of input PAF files
+#   --files      - Path to a text file containing one PAF file path per line
 #   --types      - Space-separated list of tracepoint types (standard, variable, mixed)
 #
 # OPTIONAL:
 #   --auto ROWS  - Only test automatic mode with ROWS sample size (0 = full file)
 #
 # EXAMPLES:
-#   # Test 2 files with standard tracepoints, 100 records each, 4 threads
-#   CIGZIP=/path/to/cigzip/target/release/cigzip ./run_all_tests.sh 100 /tmp/results 4 \
-#       --files data1.paf.gz data2.paf.gz --types standard
+#   # Create a file list
+#   echo "/path/to/data1.paf.gz" > files.txt
+#   echo "/path/to/data2.paf.gz" >> files.txt
 #
-#   # Test all tracepoint types on one file
+#   # Test files from list with standard tracepoints, 100 records each, 4 threads
+#   CIGZIP=/path/to/cigzip/target/release/cigzip ./run_all_tests.sh 100 /tmp/results 4 \
+#       --files files.txt --types standard
+#
+#   # Test all tracepoint types using glob pattern to create file list
+#   ls /data/*.paf.gz > my_files.txt
 #   CIGZIP=/path/to/cigzip/target/release/cigzip ./run_all_tests.sh 500 ./output 8 \
-#       --files input.paf --types standard variable mixed
+#       --files my_files.txt --types standard variable mixed
 #
 #   # Test automatic mode only (10000-record sampling)
 #   CIGZIP_DIR=/path/to/cigzip ./run_all_tests.sh 1000 /tmp/auto 4 \
-#       --files data.paf --types standard --auto 10000
+#       --files files.txt --types standard --auto 10000
 #
 #   # Test automatic mode with full file analysis
 #   CIGZIP_DIR=/path/to/cigzip ./run_all_tests.sh 0 /tmp/full 4 \
-#       --files data.paf --types standard --auto 0
+#       --files files.txt --types standard --auto 0
 #
 # OUTPUT:
 #   output_base/
@@ -61,13 +66,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPREHENSIVE_TEST="$SCRIPT_DIR/comprehensive_test.sh"
 
 usage() {
-    echo "Usage: $0 <num_records> <output_base> <num_threads> --files FILE [FILE ...] --types TYPE [TYPE ...] [--auto ROWS]"
+    echo "Usage: $0 <num_records> <output_base> <num_threads> --files <file_list.txt> --types TYPE [TYPE ...] [--auto ROWS]"
     echo ""
     echo "Arguments (all required):"
     echo "  num_records  - Number of records to test per file (0 = all records)"
     echo "  output_base  - Output directory for all test results"
     echo "  num_threads  - Number of parallel threads"
-    echo "  --files      - Space-separated list of input PAF files"
+    echo "  --files      - Path to a text file containing one PAF file path per line"
     echo "  --types      - Space-separated list of tracepoint types"
     echo ""
     echo "Optional flags:"
@@ -80,10 +85,13 @@ usage() {
     echo "  mixed     - Mixed tracepoints (interleaved tracepoints and CIGAR ops)"
     echo ""
     echo "Examples:"
-    echo "  $0 100 /tmp/results 4 --files data1.paf data2.paf.gz --types standard"
-    echo "  $0 500 ./output 8 --files input.paf --types standard variable mixed"
-    echo "  $0 100 /tmp/auto 4 --files data.paf --types standard --auto 10000"
-    echo "  $0 100 /tmp/full 4 --files data.paf --types standard --auto 0"
+    echo "  # Create file list"
+    echo "  ls /data/*.paf.gz > files.txt"
+    echo ""
+    echo "  $0 100 /tmp/results 4 --files files.txt --types standard"
+    echo "  $0 500 ./output 8 --files files.txt --types standard variable mixed"
+    echo "  $0 100 /tmp/auto 4 --files files.txt --types standard --auto 10000"
+    echo "  $0 100 /tmp/full 4 --files files.txt --types standard --auto 0"
     exit 1
 }
 
@@ -115,23 +123,26 @@ fi
 TEST_FILES=()
 TP_TYPES=()
 AUTO_ROWS=""  # Empty means run dual mode (all strategies), set to number for auto-only
-PARSING_FILES=false
+FILE_LIST=""
 PARSING_TYPES=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --files)
-            PARSING_FILES=true
             PARSING_TYPES=false
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: --files requires a file path"
+                usage
+            fi
+            FILE_LIST="$1"
             shift
             ;;
         --types)
-            PARSING_FILES=false
             PARSING_TYPES=true
             shift
             ;;
         --auto)
-            PARSING_FILES=false
             PARSING_TYPES=false
             shift
             if [ $# -eq 0 ]; then
@@ -146,9 +157,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         *)
-            if $PARSING_FILES; then
-                TEST_FILES+=("$1")
-            elif $PARSING_TYPES; then
+            if $PARSING_TYPES; then
                 # Validate type
                 case "$1" in
                     standard|variable|mixed)
@@ -169,9 +178,31 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Validate file list
+if [ -z "$FILE_LIST" ]; then
+    echo "Error: No file list specified (use --files <file_list.txt>)"
+    usage
+fi
+
+if [ ! -f "$FILE_LIST" ]; then
+    echo "Error: File list not found: $FILE_LIST"
+    exit 1
+fi
+
+# Read file paths from the list file (one per line, skip empty lines and comments)
+while IFS= read -r line || [ -n "$line" ]; do
+    # Skip empty lines and lines starting with #
+    line="${line%%#*}"  # Remove comments
+    line="${line%"${line##*[![:space:]]}"}"  # Trim trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"  # Trim leading whitespace
+    if [ -n "$line" ]; then
+        TEST_FILES+=("$line")
+    fi
+done < "$FILE_LIST"
+
 # Validate we have files and types
 if [ ${#TEST_FILES[@]} -eq 0 ]; then
-    echo "Error: No input files specified (use --files)"
+    echo "Error: No files found in $FILE_LIST"
     usage
 fi
 
@@ -196,6 +227,7 @@ echo "Configuration:"
 echo "  Records per file: $NUM_RECORDS"
 echo "  Output directory: $OUTPUT_BASE"
 echo "  Parallel threads: $THREADS"
+echo "  File list:        $FILE_LIST (${#TEST_FILES[@]} files)"
 echo "  Tracepoint types: ${TP_TYPES[*]}"
 if [ -n "$AUTO_ROWS" ]; then
     if [ "$AUTO_ROWS" -eq 0 ]; then
