@@ -38,7 +38,8 @@ fn parse_reference(path: &str, limit: usize, tp_type: &str) -> Reference {
             for line in reader.lines().take(limit) {
                 let line = line.expect("line read");
                 if let Some(tp_idx) = line.find("tp:Z:") {
-                    let tp_str = &line[tp_idx + 5..];
+                    let tp_str_full = &line[tp_idx + 5..];
+                    let tp_str = tp_str_full.split('\t').next().unwrap_or(tp_str_full);
                     let tps: Vec<(usize, Option<usize>)> = tp_str
                         .split(';')
                         .filter(|s| !s.is_empty())
@@ -59,7 +60,8 @@ fn parse_reference(path: &str, limit: usize, tp_type: &str) -> Reference {
             for line in reader.lines().take(limit) {
                 let line = line.expect("line read");
                 if let Some(tp_idx) = line.find("tp:Z:") {
-                    let tp_str = &line[tp_idx + 5..];
+                    let tp_str_full = &line[tp_idx + 5..];
+                    let tp_str = tp_str_full.split('\t').next().unwrap_or(tp_str_full);
                     let items: Vec<MixedRepresentation> = tp_str
                         .split(';')
                         .filter(|s| !s.is_empty())
@@ -89,7 +91,8 @@ fn parse_reference(path: &str, limit: usize, tp_type: &str) -> Reference {
             for line in reader.lines().take(limit) {
                 let line = line.expect("line read");
                 if let Some(tp_idx) = line.find("tp:Z:") {
-                    let tp_str = &line[tp_idx + 5..];
+                    let tp_str_full = &line[tp_idx + 5..];
+                    let tp_str = tp_str_full.split('\t').next().unwrap_or(tp_str_full);
                     let tps: Vec<(usize, usize)> = tp_str
                         .split(';')
                         .filter(|s| !s.is_empty())
